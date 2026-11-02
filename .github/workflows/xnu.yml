@@ -1,0 +1,146 @@
+name: xnu
+
+# Builds the DOHA kernel: xnu-8796.141.3 (macOS 13.5, iOS 16 generation) with
+# blacktop/darwin-xnu-build, the ios-sweet + ios-a5xelte (herolte) patch
+# series fetched at a pinned commit, and our xnu/patches/04xx-doha-* on top.
+# The upstream series is fetched, not vendored: that branch carries no license.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_config:
+        description: RELEASE / DEVELOPMENT / DEBUG
+        default: DEVELOPMENT
+      keep_going:
+        description: make -k (collect all compile errors in one run)
+        default: "true"
+  push:
+    branches: [main]
+    paths:
+      - "xnu/patches/**"
+      - ".github/workflows/xnu.yml"
+
+concurrency:
+  group: xnu-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+  SERIES_REPO: https://github.com/wardevsa/ios-a5xelte
+  SERIES_SHA: 1fc7467e9730bd01fb32a9b5ea3faced434b0be2   # herolte branch, 2026-11-02
+  MACOS_VERSION: "13.5"
+  KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+  MACHINE_CONFIG: DOHA
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch build script and patch series
+        run: |
+          fetch() { git init -q "$1"; git -C "$1" fetch -q --depth 1 "$2" "$3"; git -C "$1" checkout -q FETCH_HEAD; }
+          fetch dxb "$DXB_REPO" "$DXB_SHA"
+          fetch series "$SERIES_REPO" "$SERIES_SHA"
+          # 12.5-14.3 use the top-level patches dir
+          cp series/xnu/patches/*.patch series/xnu/patches/*.sh dxb/patches/
+          # The staging scripts (libpthread, BearSSL, HFS) run only for listed boards.
+          for s in dxb/patches/*.sh; do
+            grep -q 'SWEET|A5XELTE|HEROLTE)' "$s" || { echo "::error::$s: board list changed"; exit 1; }
+            sed -i '' 's/SWEET|A5XELTE|HEROLTE)/SWEET|A5XELTE|HEROLTE|DOHA)/' "$s"
+          done
+          cp xnu/patches/*.patch dxb/patches/
+          # libfirehose_kernel is built arm64e-only; DOHA is plain arm64 on
+          # ARMv8.0 cores (no LSE atomics), like A5XELTE/HEROLTE.
+          python3 - dxb/build.sh <<'PY'
+          import sys
+          from pathlib import Path
+          path = Path(sys.argv[1])
+          old = 'ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"'
+          new = ('ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-mkernel -nostdinc '
+                 '-Wno-packed -mcpu=cortex-a53 -march=armv8-a+crypto"')
+          text = path.read_text()
+          assert text.count(old) == 1, 'darwin-xnu-build firehose line changed'
+          path.write_text(text.replace(old, new))
+          PY
+          ls dxb/patches
+
+      - name: Deps
+        run: |
+          brew install jq gum bash cmake ninja
+          # build.sh only checks that xcodes exists; Xcode is preinstalled
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          # Prefer an Xcode 15.x (iig output this xnu understands), else the oldest.
+          XC=$(ls -d /Applications/Xcode_15*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+
+      - name: Build
+        working-directory: dxb
+        env:
+          MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee ../build.log
+
+      # Job logs need a sign-in; check-run annotations can be read through the API.
+      - name: Report build errors as annotations
+        if: always()
+        run: |
+          test -f build.log || exit 0
+          kernel="dxb/fakeroot/System/Library/Kernels/kernel.$(echo "$KERNEL_CONFIG" | tr A-Z a-z).doha"
+          if [ -f "$kernel" ]; then echo "kernel built: $kernel"; exit 0; fi
+          python3 - build.log <<'PY'
+          import re, sys
+          lines = [re.sub(r'\x1b\[[0-9;]*m', '', l) for l in open(sys.argv[1], errors='replace')]
+          cc = re.compile(r'(:\d+:\d+: (fatal )?error:|^ld: (?!warning)|Undefined symbols|clang: error|^make.*Error|Skipping patch .*0400)')
+          hits = [l.strip() for l in lines if cc.search(l)]
+          esc = lambda s: s.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
+          for l in hits[:20]:
+              print('::error title=build::' + esc(l[:900]))
+          print('::error title=build log tail::' + esc(''.join(l[:300] for l in lines[-60:])[-30000:]))
+          PY
+          exit 1
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          cp build.log out/ 2>/dev/null || true
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-kernel-doha
+          path: out/
+          if-no-files-found: warn
+
+      - name: Check ARMv8.0 compatibility (no LSE atomics)
+        run: |
+          kernel="out/kernel.$(echo "$KERNEL_CONFIG" | tr A-Z a-z).doha"
+          xcrun llvm-objdump -d --no-show-raw-insn "$kernel" > lse-scan.txt
+          python3 - lse-scan.txt <<'PY'
+          import re, sys
+          lse = re.compile(r'\s(cas|casp|ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|stadd|stclr|steor|stset|stsmax|stsmin|stumax|stumin|swp)[a-z]*\s')
+          func, funcs = '?', {}
+          for line in open(sys.argv[1], errors='replace'):
+              m = re.match(r'^[0-9a-f]+ <(.+)>:', line)
+              if m:
+                  func = m.group(1)
+              elif lse.search(line) and func != 'K256':   # SHA-256 constants, data
+                  funcs[func] = funcs.get(func, 0) + 1
+          print('LSE instructions in code:', sum(funcs.values()))
+          if funcs:
+              top = sorted(funcs.items(), key=lambda kv: -kv[1])[:30]
+              print('::error title=LSE in kernel::' + '%0A'.join(f'{n} {f}' for f, n in top))
+              sys.exit(1)
+          PY

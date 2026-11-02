@@ -1,7 +1,13 @@
 /*
- * doha milestone 1: one boot answers the questions that decide the XNU port
- * on the Moto G8 Plus (SM6125 "trinket"). Derived from ios-sweet's
- * milestone 2 shim; addresses come from the live FDT (dtb/doha-live.dts.txt).
+ * doha boot shim for the Moto G8 Plus (SM6125 "trinket"), derived from
+ * ios-sweet's milestone 2 and 4 shims; addresses come from the live FDT
+ * (dtb/doha-live.dts.txt).
+ *
+ * Milestone 2: with an XNU payload (tools/mkpayload.py) in the ramdisk,
+ * loader.c places kernel + ADT + boot_args and jumps to XNU.
+ *
+ * Milestone 1 (no payload): one boot answers the questions that decide the
+ * XNU port; the answers are in NOTES.md.
  *   - splash framebuffer format, read back from the MDP source pipe
  *   - CPU feature registers (16K granule, LSE, PAN, GIC sysreg interface)
  *   - PSCI/SMCCC version and which PSCI calls the Qualcomm TZ offers
@@ -12,6 +18,7 @@
  */
 #include <stdint.h>
 #include "console.h"
+#include "loader.h"
 
 #define IMEM_RESTART_REASON	0x0c12565cUL	/* qcom,msm-imem@c125000 restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
@@ -205,7 +212,7 @@ static void setup_fb(void)
 	}
 	con_setup(addr, w, h, stride, bpp);
 	con_clear(GREEN);
-	con_str("SHIM", "doha milestone 1");
+	con_str("SHIM", "doha milestone 2");
 	con_skip();
 	con_hex2("MDP", "pipe=", (uint32_t)pipe, "addr=", addr);
 	con_hex2(" size", "w=", w, "h=", h);
@@ -227,14 +234,11 @@ static void test_cpu(uint64_t dtb)
 	con_hex2("EL", "cur=", rsr("currentel") >> 2, "frq=", rsr("cntfrq_el0"));
 	con_hex2("MIDR", "boot=", rsr("midr_el1"), "rev=", rsr("revidr_el1"));
 	con_hex("MPIDR", rsr("mpidr_el1"));
+	/* Full milestone 1 register dump (MMFR2, ISAR1, CTR, SCTLR) is in NOTES.md. */
 	con_hex("MMFR0", mmfr0);
 	con_hex("MMFR1", mmfr1);
-	con_hex("MMFR2", rsr("s3_0_c0_c7_2"));	/* ID_AA64MMFR2_EL1: unnamed for armv8-a */
 	con_hex("ISAR0", isar0);
-	con_hex("ISAR1", rsr("id_aa64isar1_el1"));
 	con_hex("PFR0", rsr("id_aa64pfr0_el1"));
-	con_hex("CTR", rsr("ctr_el0"));
-	con_hex("SCTLR", rsr("sctlr_el1"));
 	/* TGran16 [23:20]: 1 = supported. TGran4 [31:28]: 0 = supported. */
 	con_str("16K", ((mmfr0 >> 20) & 0xf) ? "YES" : "NO -> 4K hw pages");
 	con_str("4K", ((mmfr0 >> 28) & 0xf) == 0 ? "YES" : "NO");
@@ -398,6 +402,13 @@ static void test_gic(void)
 void shim_main(uint64_t dtb)
 {
 	setup_fb();
+
+	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
+	stage = "loader";
+	const char *why = loader_boot(dtb);
+	con_str("LOADER", why);
+	con_skip();
+
 	test_cpu(dtb);
 
 	stage = "psci";

@@ -36,6 +36,36 @@ fastboot boot shim-boot.img
 
 `fastboot boot` só carrega na RAM. Se travar: segure Power + Volume para baixo ~10 s.
 
+## Milestone 2: XNU até o console (em andamento)
+
+Kernel `DOHA` = a porta ARMv8.0/4K do ios-a5xelte (config `A5XELTE`) com o caminho Qualcomm do
+ios-sweet: GICv3, vtimer INTID 19, framebuffer do ABL em `0x5c000000`, só a CPU 0, sem drivers
+Exynos. O patch é [`xnu/patches/0400-doha-board-target.patch`](xnu/patches/0400-doha-board-target.patch).
+
+### Kernel (GitHub Actions)
+
+O workflow [`xnu`](.github/workflows/xnu.yml) roda a cada push em `xnu/patches/`, ou à mão:
+
+```sh
+gh workflow run xnu.yml
+gh run download -n xnu-kernel-doha -D xnu/out
+```
+
+Ele baixa o darwin-xnu-build e a série de patches do ios-sweet/ios-a5xelte em commits fixos (a
+branch `herolte` não tem licença, então não fica copiada aqui) e aplica os `04xx-doha-*` por cima.
+
+### ADT, payload e boot.img
+
+```sh
+python3 tools/mkadt_doha.py out/doha.adt          # 1 GiB em 0xc0000000, GICv3, fbcon
+python3 tools/mkpayload.py xnu/out/kernel.development.doha out/doha.adt out/payload.bin \
+    --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress wdt=-1'
+bash shim/build.sh ../out/payload.bin             # payload vira o ramdisk do boot.img
+```
+
+O shim acha o payload no ramdisk, copia kernel + ADT + boot_args para `0xc0000000` e pula para o
+XNU com o MMU desligado. A meta deste milestone é o log do XNU aparecer na tela.
+
 ## Fora do git
 
 `dtb/` (o `/chosen` do DTB ao vivo tem serial e MACs), backups de partições, imagens da Apple.

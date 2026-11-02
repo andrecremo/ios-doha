@@ -11,6 +11,7 @@
 #define FB_W		1080
 #define FB_H		2280
 #define FB_BPP		4
+#define FB_STRIDE	(FB_W * FB_BPP)
 
 #define RED	0xffff0000U
 #define BLUE	0xff0000a0U

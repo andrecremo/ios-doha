@@ -1,4 +1,7 @@
 dtb/
 backup/
 shim/out/
+xnu/out/
+out/
+research/
 *.img
