@@ -285,6 +285,19 @@ index 00b0198..abbede0 100644
  	/* Permit ICC_SRE_EL1 and GIC CPU interface system-register access. */
  	mrs		x1, ICC_SRE_EL2
  	orr		x1, x1, #1
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index 9004f2b..04f5e7a 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -36,7 +36,7 @@ void uart_putc_options(char, bool);
+ int uart_getc(void);
+ 
+ void pe_init_fiq(void);
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_DOHA)
+ extern uint32_t sweet_vtimer_intid;
+ #endif
+ 
 diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
 index 8f9c8a2..f52ad2e 100644
 --- a/pexpert/pexpert/arm64/A5XELTE.h
