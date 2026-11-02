@@ -45,11 +45,26 @@ Conclusões:
 
 Correção: o padrão `FB_BPP` do console passou de 3 para 4 (só usado se a leitura do MDP falhar).
 
-## Próximo: milestone 2
+## 2026-11-02: milestone 2, kernel DOHA compila
 
-Kernel XNU com config de máquina `DOHA` até o console no framebuffer:
-- base: série do branch `herolte` (sweet 0001–0081 + ARMv8.0/4K), separando o que é Exynos
-  (GICv2, DECON, UFS Exynos, Mali, PMIC Samsung) do que é genérico
-- trazer de volta do sweet: GICv3 (`HAS_GIC_V3 1`), PSCI, timer, console no framebuffer
-- `tools/mkadt.py` para o doha: RAM `0xc0000000` + 1 GiB, GIC, FB, timer
-- testar primeiro em QEMU (`-cpu cortex-a53`, `gic-version=3`)
+`xnu/patches/0400-doha-board-target.patch` sobre a série herolte de ios-a5xelte
+(`1fc7467e`). DOHA = `ARM64_BOARD_CONFIG_A5XELTE` + `ARM64_BOARD_CONFIG_DOHA`:
+- 4K hw/16K VM, `-mcpu=cortex-a53`, sem PAN, commpage LL/SC (herdado de A5XELTE)
+- `HAS_GIC_V3 1` e as definições GICv3 de SWEET.h; os caminhos GICv2 de sleh.c e SweetCPU.cpp
+  passaram a `A5XELTE && !HAS_GIC_V3`; `ICC_SRE_EL2` liberado no caminho EL2 de start.s
+- framebuffer `0x5c000000` 1080×2280 stride 4320 (5 blocos de 2 MiB), marcador inicial em
+  `0xaf000100` (região ramoops), boot MPIDR `0x0`, `SWEET_SMP_MAX_CPUS 1`
+- teclas/touch/eMMC/UFS/GPU do Exynos desligados em IOKitBSDInit
+- correção de commpage 16K do HEROLTE também para DOHA
+
+CI: run 41497994045 falhou só em `sleh.c` (`sweet_vtimer_intid` declarado apenas para
+`ARM64_BOARD_CONFIG_SWEET` em protos.h). Corrigido; run 41500864255 OK em 17 min, sem LSE.
+`kernel.development.doha` sha256 `eafabe05…b81492d`.
+
+Payload: virt_base `0xfffffff006000000` → phys `0xc0000000`, entry `0xfffffff007424488`,
+kernel_end `0xfffffff0084a4000` (~36 MiB a partir da base). ADT: 1 GiB em `0xc0000000` menos
+1 MiB de `/pram` (`0xfff00000`). Sem `/product` (falta o d22ap.adt), o que não importa até o
+userland. boot.img com payload: 17,9 MB.
+
+Próximo: `fastboot boot` desse boot.img. Esperado: tela do shim com `INITRD`/`PHYS`/`JUMP`,
+depois o console do XNU. Ainda não testado em QEMU (sem qemu no WSL).
