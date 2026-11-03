@@ -66,5 +66,26 @@ kernel_end `0xfffffff0084a4000` (~36 MiB a partir da base). ADT: 1 GiB em `0xc00
 1 MiB de `/pram` (`0xfff00000`). Sem `/product` (falta o d22ap.adt), o que não importa até o
 userland. boot.img com payload: 17,9 MB.
 
-Próximo: `fastboot boot` desse boot.img. Esperado: tela do shim com `INITRD`/`PHYS`/`JUMP`,
-depois o console do XNU. Ainda não testado em QEMU (sem qemu no WSL).
+Não testado em QEMU (sem qemu no WSL): foi direto para o aparelho.
+
+## 2026-11-03, boot 2: XNU no aparelho, milestone 2 atingido
+
+`fastboot boot doha-xnu-boot.img` (kernel sha256 `eafabe05…`, 1 GiB, `cpus=1`). O console do XNU
+aparece no painel, em 1080×2280 e legível. Lido da foto (a tela é circular: a parte de baixo é
+mais antiga):
+- VM e zonas sobem (`zone_init`, `kmem_large_ranges`, `vm_compressor_mode` 4, "VM bootstrap done")
+- `iBoot version: doha-shim`, ou seja, o ADT foi lido
+- PRNG, libpthread 514.100.2, AMFI embutido e vnguard registrados; trust caches indisponíveis (esperado)
+- `A5XELTE: platform expert registered`; AppleKeyStore, IOWatchdog, IOCoreSurfaceRoot e HID registrados
+- `SWEET FB: AppleCLCD 1080x2280 stride 4320 at 0x5c000000`
+- `ml_processor_register` no cluster 0; `A5XELTE CPU: requested=1 selected=1`
+- última linha: `cpu=0 entered initCPU mpidr=0x0 EL1 IRQs=1`
+
+Sem panic na foto. Observações:
+- Não há driver de armazenamento nem RAM disk, então nenhuma raiz é possível. Falta saber se o
+  kernel segue vivo esperando a raiz ou se travou depois de `initCPU`: a foto é um instante só.
+- A faixa verde no pé da tela é resto do shim, abaixo da última linha de texto do console.
+- As mensagens ainda dizem `A5XELTE`/`SWEET` porque o DOHA reaproveita esses caminhos.
+
+Próximo: confirmar se a tela muda depois de alguns minutos; depois, raiz (RAM disk `rd=md0` para
+testar o userland cedo, ou driver SDHCI só leitura).
