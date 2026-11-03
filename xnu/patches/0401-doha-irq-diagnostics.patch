@@ -1,0 +1,125 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index fd9070b..fa53001 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -166,6 +166,35 @@ SweetCPU::start(IOService *provider)
+ 	return true;
+ }
+ 
++#if defined(DOHA)
++extern "C" uint32_t doha_irq_counts[4], doha_irq_last;
++extern "C" void doha_gic_regs(uint32_t out[5]);
++
++/* Boot 2 stopped after initCPU with no "came alive" and no 5 s panic. Show
++ * why, then spin 1 s on the raw counter: needs no timer interrupt. */
++static void
++doha_dump(const char *where)
++{
++	uint32_t g[5];
++	doha_gic_regs(g);
++	kprintf("DOHA %s irq t=%u s=%u o=%u sp=%u last=%u IE=%u\n", where,
++	    doha_irq_counts[0], doha_irq_counts[1], doha_irq_counts[2], doha_irq_counts[3],
++	    doha_irq_last, ml_get_interrupts_enabled());
++	kprintf("DOHA ICC pmr=%llx rpr=%llx grp1=%llx hppi=%llx isr=%llx daif=%llx\n",
++	    __builtin_arm_rsr64("ICC_PMR_EL1"), __builtin_arm_rsr64("ICC_RPR_EL1"),
++	    __builtin_arm_rsr64("ICC_IGRPEN1_EL1"), __builtin_arm_rsr64("ICC_HPPIR1_EL1"),
++	    __builtin_arm_rsr64("ISR_EL1"), __builtin_arm_rsr64("DAIF"));
++	kprintf("DOHA CNTV ctl=%llx cval=%llx vct=%llx\n",
++	    __builtin_arm_rsr64("CNTV_CTL_EL0"), __builtin_arm_rsr64("CNTV_CVAL_EL0"),
++	    __builtin_arm_rsr64("CNTVCT_EL0"));
++	kprintf("DOHA GIC ctlr=%x waker=%x en=%x pend=%x act=%x\n", g[0], g[1], g[2], g[3], g[4]);
++	uint64_t end = __builtin_arm_rsr64("CNTVCT_EL0") + __builtin_arm_rsr64("CNTFRQ_EL0");
++	while (__builtin_arm_rsr64("CNTVCT_EL0") < end) {
++		__builtin_arm_isb(ISB_SY);
++	}
++}
++#endif
++
+ /* Do not wait in a nub's start(): matching can be asynchronous or serialized. */
+ void
+ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -200,12 +229,29 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		panic(CPU_PORT_NAME " CPU: expected boot MPIDR 0 and logical CPU 0");
+ #endif
+ 	}
++#if defined(DOHA)
++	doha_dump("pre1");
++	doha_dump("pre2");
++	kprintf("DOHA pre: IOSleep(1)\n");
++	IOSleep(1);
++	kprintf("DOHA pre: IOSleep returned\n");
++#endif
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
+ 		if (kr != KERN_SUCCESS) {
+ 			panic(CPU_PORT_NAME " CPU: cpu=%u processor_start failed: %d", i, kr);
+ 		}
++#if defined(DOHA)
++		kprintf("DOHA post: processor_start returned, init=%u sig=%u\n",
++		    __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
++		    sweet_cpu_signal_is_enabled(i));
++		doha_dump("post1");
++		doha_dump("post2");
++		kprintf("DOHA post: IOSleep(1)\n");
++		IOSleep(1);
++		kprintf("DOHA post: IOSleep returned\n");
++#endif
+ 		/* processor_start() is asynchronous for secondaries in this XNU. */
+ 		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 799315e..770d855 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1847,6 +1847,12 @@ handle_simd_trap(arm_saved_state_t *state, uint32_t esr)
+ 	__builtin_unreachable();
+ }
+ 
++#if defined(DOHA)
++/* timer, SGI, other, spurious: read by the bring-up dump in SweetCPU.cpp. */
++extern uint32_t doha_irq_counts[4], doha_irq_last;
++uint32_t doha_irq_counts[4], doha_irq_last;
++#endif
++
+ void
+ sleh_irq(arm_saved_state_t *state)
+ {
+@@ -1880,6 +1886,11 @@ sleh_irq(arm_saved_state_t *state)
+ 	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
+ #endif
+ 
++#if defined(DOHA)
++	doha_irq_counts[(intid >= 1020 && intid <= 1023) ? 3 :
++	    intid == timer_intid ? 0 : intid < 16 ? 1 : 2]++;
++	doha_irq_last = intid;
++#endif
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+ 	}
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index c37636f..9fd0aaf 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -73,6 +73,21 @@ find_gicr_pe_base()
+ 	panic("%s: cannot find GICR base for core %u", __func__, ml_get_cpu_number(phys_id));
+ }
+ 
++#if defined(DOHA)
++/* Bring-up dump: GICD_CTLR, and this CPU's WAKER, ISENABLER0, ISPENDR0, ISACTIVER0. */
++void doha_gic_regs(uint32_t out[5]);
++void
++doha_gic_regs(uint32_t out[5])
++{
++	vm_offset_t gicr_pe_base = find_gicr_pe_base();
++	out[0] = gicd_read32(GICD_CTLR);
++	out[1] = gicr_read32(GICR_WAKER);
++	out[2] = gicr_read32(GICR_ISENABLER0);
++	out[3] = gicr_read32(0x10200);
++	out[4] = gicr_read32(0x10300);
++}
++#endif
++
+ void
+ pe_init_fiq()
+ {
