@@ -36,11 +36,16 @@ fastboot boot shim-boot.img
 
 `fastboot boot` só carrega na RAM. Se travar: segure Power + Volume para baixo ~10 s.
 
-## Milestone 2: XNU até o console (em andamento)
+## Milestone 2: XNU até esperar a raiz (concluído em 2026-11-03)
+
+No aparelho, o kernel sobe VM, IOKit, BSD e rede e para em `Waiting on ... IOMedia ... Apple_HFS`,
+porque ainda não há armazenamento. Ainda não há userland do iOS. Detalhes em [`NOTES.md`](NOTES.md).
 
 Kernel `DOHA` = a porta ARMv8.0/4K do ios-a5xelte (config `A5XELTE`) com o caminho Qualcomm do
 ios-sweet: GICv3, vtimer INTID 19, framebuffer do ABL em `0x5c000000`, só a CPU 0, sem drivers
-Exynos. O patch é [`xnu/patches/0400-doha-board-target.patch`](xnu/patches/0400-doha-board-target.patch).
+Exynos. O patch é [`xnu/patches/0400-doha-board-target.patch`](xnu/patches/0400-doha-board-target.patch);
+o [`0402`](xnu/patches/0402-doha-gicd-are-before-gicr.patch) liga `ARE_NS` antes de configurar o
+redistribuidor, porque o ABL do doha deixa o `GICD_CTLR` zerado.
 
 ### Kernel (GitHub Actions)
 

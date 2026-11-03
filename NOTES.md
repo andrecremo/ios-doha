@@ -113,4 +113,22 @@ Hipótese (fortemente sugerida, ainda não confirmada): sem `ARE_NS`, os registr
 redistribuidor ignoram escritas. Correção em `0402-doha-gicd-are-before-gicr.patch`: ligar
 `ARE_NS` + Grp1 antes de configurar o GICR.
 
-Depois: raiz (RAM disk `rd=md0` para testar o userland cedo, ou driver SDHCI só leitura).
+## 2026-11-03, boot 4: milestone 2 concluído, XNU espera a raiz
+
+`fastboot boot doha-xnu-are.img` (kernel sha256 `11052f00…`, com 0401 + 0402). A hipótese do
+`ARE_NS` se confirmou. Lido da foto:
+- `en=80002` (vtimer + SGI1), `post2 irq t=386 s=1 o=0 sp=0 last=19`, IE=1, grp1=1
+- `DOHA post: IOSleep returned`, `cpu=0 mpidr=0x0 came alive; SGI1 OK`, `1/1 CPUs initialized`
+- AMFI e Sandbox substitutos e `hfs-627.100.6` registrados; `mcache: 1 CPU(s), 64 bytes`
+- `mbinit` (64 MB), `dlil_init`, self-tests do Skywalk `PASSED`, `lo0`/`gif0`/`stf0` anexados
+- `bsd_autoconf: calling kminit`
+- fim: `Waiting on <dict>...IOProviderClass IOMedia...Content Apple_HFS...` e
+  `Failed to write boot-picker-bringup-reason to NVRAM.` (não há NVRAM)
+
+Sem panic. A parada é a esperada: não há dispositivo de raiz. Nesta foto, o console ainda mostra
+os dumps do 0401.
+
+Próximo: raiz. Um RAM disk não comporta o shared cache do iOS (GBs) em 1 GiB de RAM; serviria só
+para testar um init mínimo. O caminho real é o driver SDHCI do eMMC, só leitura primeiro: listar
+a GPT sem gravar nada. Gravar a raiz em `userdata` apaga o Android e exige confirmação antes.
+O 0401 pode sair quando o próximo kernel for compilado (custa ~4 s de espera a cada boot).
