@@ -1,0 +1,25 @@
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 9fd0aaf..a7a6b39 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -158,6 +158,20 @@ pe_init_fiq()
+ 		gicr_size = gicr_size_prop;
+ 	}
+ 
++#if defined(DOHA)
++	/*
++	 * Unlike sweet, doha's ABL leaves GICD_CTLR at 0 (shim milestone 1), so
++	 * ARE_NS is off here. Without affinity routing the SGI_base registers of
++	 * the redistributor ignore writes: the enables below were lost and no
++	 * timer IRQ ever arrived (boot 3: en=0 with CNTV_CTL ISTATUS set).
++	 */
++	gicd_write32(GICD_CTLR, gicd_read32(GICD_CTLR) | GICD_CTLR_ARE_NS |
++	    GICD_CTLR_ENABLEGRP1A | GICD_CTLR_ENABLEGRP1);
++	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
++		;
++	}
++#endif
++
+ 	// Find the redistributor for this processor
+ 	vm_offset_t gicr_pe_base = find_gicr_pe_base();
+ 

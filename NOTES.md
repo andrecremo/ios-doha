@@ -87,5 +87,30 @@ Sem panic na foto. Observações:
 - A faixa verde no pé da tela é resto do shim, abaixo da última linha de texto do console.
 - As mensagens ainda dizem `A5XELTE`/`SWEET` porque o DOHA reaproveita esses caminhos.
 
-Próximo: confirmar se a tela muda depois de alguns minutos; depois, raiz (RAM disk `rd=md0` para
-testar o userland cedo, ou driver SDHCI só leitura).
+## 2026-11-03, boot 3: timer sem interrupção, kernel com diagnóstico (0401)
+
+A tela parou de vez depois do `initCPU`, sem `came alive` e sem o panic de 5 s. Com o 0401, a
+última linha é `DOHA pre: IOSleep(1)`, antes de `processor_start`. Valores lidos da foto:
+
+| | pre1 | pre2 (1 s depois) |
+|---|---|---|
+| irq | t=0 s=0 o=0 sp=0, IE=1 | igual |
+| ICC | pmr=f0 rpr=ff grp1=1 hppi=3ff isr=0 daif=200 | igual |
+| CNTV | ctl=1 cval=`1a4e034b` vct=`1a4b373d` | ctl=**5** cval igual vct=`1b7058ea` |
+| GIC | ctlr=12 waker=0 **en=0** pend=`8200000` act=0 | igual |
+
+Leitura:
+- O decrementer está armado certo: `cval` fica ~9,5 ms à frente em pre1, e em pre2 o timer disparou.
+- `en=0` e o bit 19 não pendente: o GIC não recebeu a configuração do timer. Nenhuma interrupção
+  de timer chegou desde o boot.
+- `ctlr=12` e `grp1=1` mostram que `pe_init_fiq` rodou até o fim, então a escrita em
+  `GICR_ISENABLER0` foi executada e não ficou.
+- O shim leu `GICD_CTLR` = 0 na entrada (boot 1) e escreve o GICD *antes* do GICR: lá funcionou.
+  O XNU escreve o GICR primeiro e o GICD no fim. O comentário de pe_fiq.c diz que no sweet o ABL
+  deixa `ARE_NS` ligado, o que não acontece no doha.
+
+Hipótese (fortemente sugerida, ainda não confirmada): sem `ARE_NS`, os registradores SGI_base do
+redistribuidor ignoram escritas. Correção em `0402-doha-gicd-are-before-gicr.patch`: ligar
+`ARE_NS` + Grp1 antes de configurar o GICR.
+
+Depois: raiz (RAM disk `rd=md0` para testar o userland cedo, ou driver SDHCI só leitura).
