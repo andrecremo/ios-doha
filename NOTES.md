@@ -192,7 +192,29 @@ nessa faixa, mas isso não foi lido, e `cr0` tem `USFCFG` ligado (stream sem SMR
 faixa `0xc0000000..0xc1100000` foi comprovada. Conferir o SCTLR do bank 0 se o DMA falhar em
 outro endereço, especialmente acima de 4 GiB.
 
-Próximo:
-1. Dispositivo de bloco só leitura sobre uma partição (modelo: `sweet_ufs.c`), com ADMA2.
+## 2026-11-04, boot 11: disco `emmcroot0` reinicia o aparelho antes do driver
+
+Kernel `82eadf1f…`, `emmcprobe=1 rd=emmcroot0 emmcroot=boot_a`. O aparelho reinicia. Última linha
+fotografada: `A5XELTE CPU: 1/1 CPUs initialized, SGI1 verified`. Nenhuma linha `DOHA EMMC`,
+que no boot 9 só vinham muito depois (MAC, mbinit, dlil, Skywalk). A foto é um instante, então o
+reset pode ter vindo um pouco depois da última linha, mas não há sinal de que o driver tenha rodado.
+
+Bug achado na revisão (no fonte local, ainda não compilado): `HC_ADMA_ADDR` era programado uma vez
+só, e o host o avança a cada transferência. Agora é programado em cada leitura.
+
+## 2026-11-04, boot 12: varredura de DMA no shim, DMA descartado como causa
+
+`SWEEP all addresses OK`: 64 KiB com a soma certa em `c8000000`, `d0000000`, `e0000000`,
+`f0000000` e `ffe00000`, com a tabela de ADMA no mesmo lugar.
+- SMMU: `cr0=002f0406` (no boot 10 era `00270406`: o bit 19 muda entre boots, sem explicação),
+  `smr=80000160`, `s2cr=0`.
+- **Bank 0: `sctlr=000000e0`, bit M = 0, desligado**; `tcr=0`, `ttbr=0`. Então não há tradução de
+  estágio 1 para o eMMC, ao menos neste estado.
+
+Próximo: separar a causa do boot 11 com o mesmo kernel e boot-args diferentes:
+`doha-bisect-a.img` (sem `emmcprobe` e sem `rd`) e `doha-bisect-b.img` (só `emmcprobe=1`).
+
+Depois:
+1. Dispositivo de bloco só leitura estável (`emmcroot0`).
 2. Raiz em `userdata`: apaga o LineageOS; confirmar antes. Possível teste intermediário: uma
    imagem HFS pequena em `system_b`, o slot inativo, o que mantém o LineageOS no `_a`.
