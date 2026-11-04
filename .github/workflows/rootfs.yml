@@ -6,6 +6,10 @@ name: rootfs
 
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: Hosted macOS runner; any of them works, so pick one with capacity
+        default: macos-15-intel
   push:
     branches: [main]
     paths:
@@ -15,7 +19,7 @@ on:
 
 jobs:
   image:
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner || 'macos-15-intel' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
