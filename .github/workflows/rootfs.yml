@@ -1,0 +1,58 @@
+name: rootfs
+
+# A small partition-less HFSX volume whose /sbin/launchd is userland/init.S.
+# Writing files into HFS needs macOS, so the volume is made here. Not journaled, because
+# the kernel's eMMC disk is read-only.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "userland/**"
+      - "tools/mkinit.py"
+      - ".github/workflows/rootfs.yml"
+
+jobs:
+  image:
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build init
+        run: |
+          set -euo pipefail
+          clang -target arm64-apple-ios16.0 -c userland/init.S -o init.o
+          python3 -I tools/mkinit.py init.o launchd
+          xcrun llvm-otool -lv launchd | grep -E 'cmd LC_|segname|filetype|magic' || true
+
+      - name: Create the volume
+        run: |
+          set -euo pipefail
+          hdiutil create -size 64m -fs "Case-sensitive HFS+" -volname DOHATEST \
+            -layout NONE -type UDIF -o doha-root
+          dev=$(hdiutil attach -nobrowse -owners on doha-root.dmg | awk '/DOHATEST/ {print $1}')
+          vol=/Volumes/DOHATEST
+          sudo mkdir -p "$vol/dev" "$vol/sbin"
+          sudo install -o root -g wheel -m 0755 launchd "$vol/sbin/launchd"
+          cmp launchd "$vol/sbin/launchd"
+          ls -la "$vol" "$vol/sbin"
+          hdiutil detach "$dev"
+          hdiutil convert doha-root.dmg -format UDTO -o doha-root
+          mv doha-root.cdr doha-root.img
+          sig=$(dd if=doha-root.img bs=1 skip=1024 count=2 2>/dev/null)
+          echo "signature: $sig"
+          test "$sig" = "HX"
+          test "$(stat -f %z doha-root.img)" -le $((64 * 1024 * 1024))
+          gzip -9 -k doha-root.img
+          shasum -a 256 launchd doha-root.img doha-root.img.gz | tee SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: doha-root
+          path: |
+            launchd
+            doha-root.img.gz
+            SHA256SUMS
+          if-no-files-found: error
