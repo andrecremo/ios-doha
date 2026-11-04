@@ -16,8 +16,11 @@
  *
  * No data is ever written. The only commands sent are CMD0, CMD1, CMD2, CMD3
  * and CMD7 (reset and select the card), CMD13 (status), CMD8 (read EXT_CSD),
- * CMD17 (read one block) and CMD6, only for the two mode fields BUS_WIDTH and
- * HS_TIMING of EXT_CSD, which return to their defaults on reset. No CMD24, CMD25.
+ * CMD17 and CMD18 (read blocks) and CMD6, only for the two mode fields BUS_WIDTH
+ * and HS_TIMING of EXT_CSD, which return to their defaults on reset. No CMD24, CMD25.
+ *
+ * The DMA test uses ADMA2 into free RAM, card to memory only. The live FDT binds
+ * no iommus to this host; the stream's real SMMU state is printed first.
  */
 #include <stdint.h>
 #include "console.h"
@@ -41,6 +44,9 @@
 #define HC_CTRL2		0x3c
 #define HC_CTRL2_HI		0x3e
 #define HC_CAPS			0x40
+#define HC_ADMA_ERR		0x54
+#define HC_ADMA_ADDR		0x58
+#define HC_ADMA_ADDR_HI		0x5c
 #define HC_VERSION		0xfe
 
 /* sdhci_msm_v5_offset */
@@ -111,6 +117,28 @@
 #define BUS_WIDTH_8		2
 #define HS_TIMING_HS		1
 #define DEVICE_TYPE_HS_52	(1U << 1)
+#define MMC_READ_MULTIPLE	18
+#define CTRL1_DMA_MASK		(3U << 3)
+#define CTRL1_ADMA2_32		(2U << 3)
+/* DMA on, count enable, auto CMD12 (Linux MULTIBLOCK_READ_ACMD12), read, multi-block */
+#define XFER_READ_DMA		((1U << 0) | (1U << 1) | (1U << 2) | (1U << 4) | (1U << 5))
+#define ADMA_VALID_TRAN		0x21
+#define ADMA_END		0x02
+#define ADMA_CHUNK		0x8000U
+/* The shim runs low in RAM and a boot without a payload leaves this range unused. */
+#define DMA_DESC_PA		0xc0000000UL
+#define DMA_BUF_PA		0xc0100000UL
+#define DMA_TEST_SECTORS	32768U	/* 16 MiB, the largest SDHCI block count */
+/* Sum of the first 16 MiB of the boot_a.img backup, as little-endian 32-bit words. */
+#define BOOT_A_SUM_16M		0x4ddcf87cU
+
+#define SMMU			0x0c600000UL
+#define SMMU_CR0		0x000
+#define SMMU_IDR0		0x020
+#define SMMU_SMR(n)		(0x800 + 4 * (n))
+#define SMMU_S2CR(n)		(0xc00 + 4 * (n))
+#define EMMC_SID		0x160U	/* mainline sm6125.dtsi sdhc_1 */
+
 #define SPEED_TEST_SECTORS	2048	/* 1 MiB */
 /* Sum of the first 1 MiB of the boot_a.img backup, as little-endian 32-bit words. */
 #define BOOT_A_SUM		0xfa62bcb9U
@@ -171,9 +199,9 @@ static void reset_lines(void)
 }
 
 /* 0 when a bit of mask latched (and acked); -1 on a controller error, -2 on timeout. */
-static int wait_int(uint32_t mask)
+static int wait_int_s(uint32_t mask, unsigned seconds)
 {
-	uint64_t end = now() + ticks_per_s();
+	uint64_t end = now() + ticks_per_s() * seconds;
 
 	for (;;) {
 		uint32_t st = rd32(HC_INT);
@@ -192,6 +220,11 @@ static int wait_int(uint32_t mask)
 			return -2;
 		}
 	}
+}
+
+static int wait_int(uint32_t mask)
+{
+	return wait_int_s(mask, 1);
 }
 
 static int send(unsigned index, uint32_t arg, unsigned flags, uint32_t xfer)
@@ -266,7 +299,6 @@ static void test_gpt(void)
 	}
 	uint32_t entries_lba = sec[72 / 4], count = sec[80 / 4], size = sec[84 / 4];
 	con_hex2("GPT", "my=", sec[24 / 4], "alt=", sec[32 / 4]);
-	con_hex2(" ent", "lba=", entries_lba, "n=", count);
 	if (size != GPT_ENTRY_SIZE || count > 128) {
 		con_hex2("GPT", "bad size=", size, 0, 0);
 		return;
@@ -304,9 +336,6 @@ static void test_gpt(void)
 	/* End-to-end check: the same bytes as the boot_a.img backup. */
 	con_str("BOOT_A", sec[0] == 0x52444e41 && sec[1] == 0x2144494f ?
 		"ANDROID! magic OK" : "magic MISMATCH");
-	/* w2 is the kernel size in the header: 00d7e5f1 in the boot_a backup. */
-	con_hex2(" head", "w0=", sec[0], "w1=", sec[1]);
-	con_hex2(" head", "w2=", sec[2], 0, 0);
 }
 
 /* CMD6, write-byte access to one EXT_CSD mode field; R1b, so wait out the busy. */
@@ -374,6 +403,75 @@ static void speed_test(void)
 	con_str(" sum", sum == BOOT_A_SUM ? "1 MiB MATCHES backup" : "MISMATCH");
 }
 
+static inline uint32_t smmu_rd(unsigned r)
+{
+	return *(volatile uint32_t *)(SMMU + r);
+}
+
+/* How does the SMMU treat the eMMC stream? S2CR type: 0 translate, 1 bypass, 2 fault. */
+static void smmu_report(void)
+{
+	uint32_t cr0 = smmu_rd(SMMU_CR0), smrs = smmu_rd(SMMU_IDR0) & 0xff;
+
+	con_hex2("SMMU", "cr0=", cr0, "smrs=", smrs);
+	for (uint32_t n = 0; n < smrs; n++) {
+		uint32_t smr = smmu_rd(SMMU_SMR(n));
+		uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
+
+		if ((smr >> 31) && !((id ^ EMMC_SID) & ~mask)) {
+			con_hex2(" sid", "smr=", smr, "s2cr=", smmu_rd(SMMU_S2CR(n)));
+			return;
+		}
+	}
+	con_str(" sid", "no SMR matches 0x160");
+}
+
+static void test_dma(void)
+{
+	volatile uint32_t *desc = (volatile uint32_t *)DMA_DESC_PA;
+	uint32_t bytes = DMA_TEST_SECTORS * SECTOR, chunks = bytes / ADMA_CHUNK;
+
+	smmu_report();
+	/* A bad DMA can reset the phone at once: leave time to photograph the above. */
+	con_str("DMA", "16 MiB read in 8 s");
+	delay_ms(8000);
+
+	for (uint32_t i = 0; i < chunks; i++) {
+		desc[2 * i] = (ADMA_CHUNK << 16) | ADMA_VALID_TRAN | (i == chunks - 1 ? ADMA_END : 0);
+		desc[2 * i + 1] = DMA_BUF_PA + i * ADMA_CHUNK;
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	wr8(HC_CTRL1, (rd8(HC_CTRL1) & ~CTRL1_DMA_MASK) | CTRL1_ADMA2_32);
+	wr32(HC_ADMA_ADDR, DMA_DESC_PA);
+	wr32(HC_ADMA_ADDR_HI, 0);
+	while (rd32(HC_PRESENT) & PRESENT_INHIBIT)
+		;
+	wr32(HC_INT, 0xffffffff);
+	wr32(HC_BLOCK, (DMA_TEST_SECTORS << 16) | SECTOR);
+	wr32(HC_ARG, boot_lba);
+
+	uint64_t start = now();
+	wr32(HC_XFER_CMD, ((MMC_READ_MULTIPLE << 8 | CMD_R1_DATA) << 16) | XFER_READ_DMA);
+	int rc = wait_int(INT_CMD);
+	if (!rc)
+		rc = wait_int_s(INT_XFER, 20);
+	uint64_t ticks = now() - start;
+	if (rc) {
+		con_hex2("DMA", "rc=", (uint32_t)rc, "int=", last_int);
+		con_hex2(" adma", "err=", rd32(HC_ADMA_ERR), "addr=", rd32(HC_ADMA_ADDR));
+		return;
+	}
+	con_hex2("DMA", "ms=", (uint32_t)(ticks * 1000 / ticks_per_s()), "kib=", bytes / 1024);
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	uint32_t sum = 0;
+	for (uint32_t i = 0; i < bytes / 4; i++)
+		sum += ((volatile uint32_t *)DMA_BUF_PA)[i];
+	con_hex2(" sum", "got=", sum, "want=", BOOT_A_SUM_16M);
+	con_str(" sum", sum == BOOT_A_SUM_16M ? "16 MiB MATCHES backup" : "MISMATCH");
+}
+
 static void go_fast(void)
 {
 	int rc = read_data(MMC_READ_EXT_CSD, 0);
@@ -410,6 +508,7 @@ static void go_fast(void)
 	}
 	con_hex2(" hs50", "hs=", byte_at(EXT_CSD_HS_TIMING), "sec=", sec[212 / 4]);
 	speed_test();
+	test_dma();
 }
 
 /* Linux sdhci_msm_handle_pwr_irq, polled: clear the request and report success. */
@@ -420,7 +519,6 @@ static void ack_power(uint32_t ack)
 
 	while (!(st = rd32(MSM_PWRCTL_STATUS)) && now() < end)
 		;
-	con_hex2(" pwrctl", "st=", st, "ack=", ack);
 	if (st) {
 		wr32(MSM_PWRCTL_CLEAR, st);
 		wr32(MSM_PWRCTL_CTL, ack);
@@ -429,10 +527,6 @@ static void ack_power(uint32_t ack)
 
 static int host_init(void)
 {
-	con_hex2("GCC", "apps=", gcc_rd(GCC_SDCC1_APPS_CBCR), "ahb=", gcc_rd(GCC_SDCC1_AHB_CBCR));
-	con_hex2(" rcg", "cmd=", gcc_rd(GCC_SDCC1_RCG_CMD), "cfg=", gcc_rd(GCC_SDCC1_RCG_CFG));
-	con_hex2("VENDOR", "spec=", rd32(MSM_VENDOR_SPEC), "caps=", rd32(MSM_VENDOR_CAPS0));
-
 	/* The SD clock is off while the root clock changes. */
 	gcc_wr(GCC_SDCC1_RCG_M, (gcc_rd(GCC_SDCC1_RCG_M) & ~0xffU) | 1);
 	gcc_wr(GCC_SDCC1_RCG_N, (gcc_rd(GCC_SDCC1_RCG_N) & ~0xffU) | (~(4U - 1) & 0xff));
@@ -449,7 +543,6 @@ static int host_init(void)
 		if (gcc_rd(r) & CBCR_OFF)
 			gcc_wr(r, gcc_rd(r) | 1);
 	delay_ms(1);
-	con_hex2("RCG", "cmd=", gcc_rd(GCC_SDCC1_RCG_CMD), "apps=", gcc_rd(GCC_SDCC1_APPS_CBCR));
 
 	/* Status bits must be enabled to latch; the signal lines stay off (no IRQs). */
 	wr32(HC_SIG_EN, 0);
@@ -464,7 +557,6 @@ static int host_init(void)
 	wr8(HC_TIMEOUT, 0xe);
 	wr16(HC_CLOCK, rd16(HC_CLOCK) | CLOCK_SD_ON);
 	delay_ms(2);	/* at least 74 clocks before the first command */
-	con_hex2(" host", "clk=", rd32(HC_CLOCK), "pres=", rd32(HC_PRESENT));
 	return 0;
 }
 
@@ -513,8 +605,6 @@ void test_sdhci(void)
 {
 	con_str("SDHCI", "doha milestone 3, read only");
 	con_hex2(" ver", "ver=", rd16(HC_VERSION), "caps=", rd32(HC_CAPS));
-	con_hex2(" state", "pres=", rd32(HC_PRESENT), "ctl1=", rd32(HC_CTRL1));
-	con_hex2(" clk", "clk=", rd32(HC_CLOCK), "ctl2=", rd32(HC_CTRL2));
 	if (rd32(HC_CAPS) == 0xffffffff) {
 		con_str("SDHCI", "host not responding, stop");
 		return;
