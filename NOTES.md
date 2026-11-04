@@ -164,7 +164,24 @@ kernel, então a leitura de dados pelo eMMC está certa. Só o início de um set
 1 MiB do início do `boot_a`, um `CMD17` por setor, em PIO e com MMU desligado: `ms=1f0` (496 ms,
 ~2 MiB/s). Soma de 32 bits `fa62bcb9`, igual à do `boot_a.img`.
 
+## 2026-11-04, boot 9: XNU lê o eMMC (0403)
+
+`fastboot boot doha-xnu-emmc.img` (kernel sha256 `91399a70…`, `emmcprobe=1`, sem o 0401). Lido
+da foto, sem panic, antes de `Waiting on ... IOMedia ... Apple_HFS`:
+- `probe, no writes; ver=0x7202 clk=0x3`, `OCR 0xc0ff8080`, `122142720 sectors`
+- `8-bit HS 50 MHz, width=2 hs=1`
+- `GPT entries at LBA 2, 80 of 128 bytes`, `77 partitions`
+- `p46 persist LBA 1065472..1131007` (32 MiB, o tamanho do backup)
+- `p53 boot_a LBA 1230592..1361663` (64 MiB, o tamanho do backup)
+- `p80 userdata LBA 17924096..122142686` (~49,7 GiB)
+- `1 MiB of boot_a in 438 ms, sum32 0xfa62bcb9`, igual ao backup
+
+O driver roda sob o MMU, com os mesmos registradores do shim, e o hipervisor não reclamou. Ele
+ainda é só uma sonda: não há dispositivo de bloco.
+
 Próximo:
-1. Driver no XNU, só leitura, listando a GPT, e tirar o `0401`.
-2. Desempenho: `CMD18` e ADMA2 (o SMMU pode exigir o mesmo cuidado que no USB dos forks).
-3. Raiz em `userdata`: apaga o LineageOS; confirmar antes.
+1. Dispositivo de bloco só leitura sobre uma partição (modelo: `sweet_ufs.c`).
+2. Desempenho: `CMD18` e ADMA2 (o SMMU pode exigir o mesmo cuidado que no USB dos forks). PIO a
+   ~2,4 MiB/s é pouco para o shared cache.
+3. Raiz em `userdata`: apaga o LineageOS; confirmar antes. Possível teste intermediário: uma
+   imagem HFS pequena em `system_b`, o slot inativo, o que mantém o LineageOS no `_a`.
