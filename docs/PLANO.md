@@ -272,3 +272,63 @@ OpenGL ES e Metal, USB. Não funciona: Wi-Fi, bateria e rede móvel. Os Gold fic
 
 Decisão pendente: seguir com a nossa base e trazer peças, ou mudar para a base HackiOS/willow. Antes: ler
 como o eMMC e o boot dependem da UEFI, o tamanho do volume e o que o toolchain pede.
+
+## Estudo da troca para a base do willow (2026-11-04, só leitura do código)
+
+Não executei nada do repositório, e os resultados dele continuam sendo afirmações do README.
+
+### Como a base funciona
+
+- **Boot:** `fastboot boot` de Mu-Silicium UEFI + loader + kernel. Nada é gravado no boot.
+- **A UEFI nunca sai.** O loader continua no núcleo 0, e o kernel roda nos outros.
+- **Armazenamento:** o kernel pede blocos ao loader, que usa o driver da própria UEFI. No willow, o kernel não
+  fala com o controlador de armazenamento.
+- **Também dependem da UEFI ou do loader:** RPM (o kernel escreve no canal GLINK que a UEFI abriu), clocks das
+  CPUs (OSM), bateria, device tree e retorno do log depois de um panic.
+- **Kernel:** xnu-8796.121.2 com config BCM2837, compila em Linux com clang e theos. Medem ~45 s em 12 threads.
+- **Volume:** gerado por ferramentas próprias em Python (`mkapfs.py`), sem `sudo`, macOS ou HFS no WSL.
+- **Tamanho:** o volume inteiro mais os cryptexes ocupam 8,4 GB; no willow, a partição `system` tem 10 GiB e o
+  `userdata` foi apagado. A imagem reduzida `system.apfs` tem 2,5 GB e foi feita para rodar na RAM.
+
+### Riscos que achei
+
+1. **O loader escolhe o aparelho pelo endereço do framebuffer, e o do doha é igual ao do willow (`0x5C000000`).**
+   Sem cuidado, o doha seria tratado como willow, inclusive em tensões do RPM, GPIO e toque. O doha precisa de
+   `platform` e `device=` próprios antes de qualquer boot.
+2. `common/build.sh` e `mkxnuimg.py` usam `prebuilt/` em silêncio se faltar ferramenta. Tirar esse caminho.
+3. `tools/userdata-carve.py` e os GUIDs fixos pertencem a outro aparelho. Não rodar; a trava por GUID deve recusar no
+   doha, e isso precisa ser conferido.
+4. O log vai para a partição `logdump`, que o doha não tem. Precisa de outro destino.
+5. Os drivers da UEFI vêm do `xbl` do próprio aparelho e são código da Motorola. Podem tocar em `uefivarstore`.
+   Fazer backup antes, incluindo as partições que ainda não copiamos.
+
+### Comparação
+
+| | Manter a nossa base | Base do willow com UEFI | Base do willow sem UEFI |
+|---|---|---|---|
+| O que já provamos | Mantido | eMMC e escrita viram referência | eMMC e shim mantidos |
+| Novo a fazer | Quase tudo do hardware | Port do Mu, `platform`, toque e tela | Tudo da coluna do meio menos a UEFI, mais RPM, OSM e device tree |
+| Compilação | CI, ~18 min | Linux, local | Linux, local |
+| Licença | Série herolte sem licença | APSL 2.0, restante a conferir | APSL 2.0, restante a conferir |
+| Núcleo 0 | Livre | Fica com o loader | Livre |
+| Principal incerteza | Volume de trabalho | A UEFI subir na Motorola | RPM sem a sessão da UEFI |
+
+### Recomendação
+
+Tentar a coluna do meio, com um teste que decide: subir só a Mu-Silicium no doha, pela RAM, sem kernel nem iOS.
+
+- Se subir, migrar para essa base. A nossa fica no repositório como reserva, com o driver de eMMC.
+- Se não subir, manter a nossa base e trazer as peças.
+
+Etapas:
+
+1. Ampliar o backup (`xbl`, `abl`, `tz`, `uefivarstore` e demais partições fixas), só com leitura.
+2. Extrair os drivers da UEFI do `xbl` do doha e criar `dohaPkg` a partir de `willowPkg`.
+3. Compilar a UEFI da fonte e testar por `fastboot boot`.
+4. Só depois: kernel com `device=doha` e sem os recursos do willow ligados.
+
+### Volume no doha
+
+8,4 GB não cabem no `system_b`. Para evitar apagar o `userdata`, a hipótese é a imagem reduzida de 2,5 GB no
+`system_b`; isso não foi testado, e o código espera outra organização. Caso contrário, o volume vai para o
+`userdata`, depois de confirmação específica.
