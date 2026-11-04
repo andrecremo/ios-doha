@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include "console.h"
 #include "loader.h"
+#include "sdhci.h"
 
 #define IMEM_RESTART_REASON	0x0c12565cUL	/* qcom,msm-imem@c125000 restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
@@ -409,16 +410,22 @@ void shim_main(uint64_t dtb)
 	con_str("LOADER", why);
 	con_skip();
 
-	test_cpu(dtb);
+	/* Milestone 1 answered these (NOTES.md); flip to repeat them. */
+	if (0) {
+		test_cpu(dtb);
 
-	stage = "psci";
-	con_hex2("PSCI", "ver=", smc(PSCI_VERSION, 0, 0, 0), "smccc=", smc(SMCCC_VERSION, 0, 0, 0));
-	con_hex2(" feat", "on=", smc(PSCI_FEATURES, PSCI_CPU_ON, 0, 0),
-		 "rst2=", smc(PSCI_FEATURES, PSCI_SYSTEM_RESET2, 0, 0));
-	con_skip();
+		stage = "psci";
+		con_hex2("PSCI", "ver=", smc(PSCI_VERSION, 0, 0, 0), "smccc=", smc(SMCCC_VERSION, 0, 0, 0));
+		con_hex2(" feat", "on=", smc(PSCI_FEATURES, PSCI_CPU_ON, 0, 0),
+			 "rst2=", smc(PSCI_FEATURES, PSCI_SYSTEM_RESET2, 0, 0));
+		con_skip();
 
-	test_smp();
-	test_gic();
+		test_smp();
+		test_gic();
+	}
+
+	stage = "sdhci";
+	test_sdhci();
 
 	stage = "done";
 	con_skip();

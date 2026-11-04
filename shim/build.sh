@@ -10,7 +10,7 @@ CC=aarch64-linux-gnu-gcc
 OBJCOPY=aarch64-linux-gnu-objcopy
 DTB=${DTB:-../dtb/boot_a_unpacked/dtb}
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
-SRCS="start.S shim.c console.c fdt.c loader.c"
+SRCS="start.S shim.c console.c fdt.c loader.c sdhci.c"
 mkdir -p out
 objs=""
 for f in $SRCS; do
@@ -19,7 +19,7 @@ for f in $SRCS; do
 done
 # The image runs wherever ABL puts it with no relocation pass: only the
 # header's image_size (start.o, linked at 0) may be an absolute address.
-abs=$(aarch64-linux-gnu-readelf -r out/shim.o out/console.o out/fdt.o out/loader.o | grep -c ABS64 || true)
+abs=$(aarch64-linux-gnu-readelf -r out/shim.o out/console.o out/fdt.o out/loader.o out/sdhci.o | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
 $CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
 	$objs -o out/shim.elf
