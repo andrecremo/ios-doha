@@ -250,3 +250,32 @@ Depois:
    eMMC: confirmar antes; conferir o tamanho e o uso de `system_b` pelo LineageOS).
 2. Caminho de escrita limitado à partição escolhida (`CMD25`).
 3. Raiz em `userdata`: apaga o LineageOS; confirmar antes.
+
+## 2026-11-04, boot 16: raiz HFS real montada; o kernel procura o launchd
+
+`system_b` (p79) não é espaço livre: é a cópia do sistema do slot `_b`, com hash igual ao de
+`system_a` (prefixo `4ab9d8d9f0be0245`) e sem dynamic partitions. Restaurável a partir do `system_a`.
+
+`fastboot flash system_b` recusou: `(bootloader) Preflash validation failed`. Causa não
+identificada. A imagem de teste (64 MiB, HFSX vazio, `mkfs.hfsplus -s -v DOHATEST`, sha256
+`631c24576920aac7…`) foi gravada com `dd` pelo LineageOS, com `adb root`.
+
+Enquanto o teste estiver gravado, o slot `_b` não inicia. Para restaurar, no LineageOS:
+`dd if=/dev/block/by-name/system_a of=/dev/block/by-name/system_b bs=4M`, e conferir o hash.
+
+`doha-xnu-hfs.img`, kernel `b8d99f33c55c0e39…`, `rd=emmcroot0 emmcroot=system_b`. Lido da foto:
+
+    panic(cpu 0 ...): Process 1 exec of /sbin/launchd failed, errno 2 @kern_exec.c:6973
+
+com a tarefa `pid 1: init`. `errno 2` é `ENOENT`, o resultado esperado para um volume vazio: não há
+`/sbin/launchd`. Isso indica que a montagem passou, pois o XNU só tenta o processo 1 depois dela e
+o loop `mount(N) failed` do boot 15 não apareceu. A foto mostra só a tela do panic, sem as linhas
+de montagem. `handshake structure not initialized`, na mesma tela, não foi investigado.
+
+Milestone 3: leitura e montagem de raiz HFS read-only cumpridas. Escrita ainda não testada.
+
+Depois:
+1. Volume de teste com um `/sbin/launchd` mínimo nosso, para o primeiro processo de usuário. Não
+   precisa do caminho de escrita.
+2. Caminho de escrita limitado à partição escolhida (`CMD25`).
+3. Raiz em `userdata`: apaga o LineageOS; confirmar antes.
