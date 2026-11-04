@@ -172,3 +172,48 @@ Fonte: `sm6125.dtsi` do Linux mainline. ⚠ = confirmar no DTB do próprio apare
 2. O texto do post do Redmi 5 Plus (ou o link do código dele), se você conseguir copiar.
 3. Um PC Linux (ou WSL2) para `aarch64-linux-gnu-gcc`, `mkbootimg` e `dtc`, e uma conta no GitHub
    para o build do XNU no CI macOS.
+
+## Raiz do iOS: levantamento de 2026-11-04
+
+Nada abaixo foi executado. Os números vêm do aparelho (`/proc/iomem`, `blockdev`) e dos documentos do
+port do Galaxy S7.
+
+### O que medimos
+
+| Item | Valor | Consequência |
+|---|---|---|
+| `userdata` | 53.359.918.592 bytes (49,7 GiB), 2,5 GiB em uso, sem criptografia | Cabe a raiz de 20 GiB do S7 |
+| `system_b` | 3 GiB | Pequena para a raiz inteira do S7, que usa 20 GiB |
+| Disco C: do PC | 26 GiB livres | Não dá para ter a imagem inteira e o IPSW com folga: gravar por partes, sem descomprimir tudo |
+| WSL | Sem `hfsplus` no kernel, `sudo` com senha | Não monta HFS com escrita sem kernel próprio |
+| RAM | 3,6 GiB no Linux; `af0c0000..13fffffff` contínua | O XNU usa só 1 GiB hoje |
+| Recovery | Sem partição própria (A/B): fica no `boot` | Ainda não testamos se ela dá `adb` com root |
+
+### Etapas
+
+1. **Testar o recovery** (`adb reboot recovery`). Precisa de shell root com `/data` desmontado. Sem isso:
+   TWRP por `fastboot boot`, se houver para o doha, ou um ramdisk de resgate nosso com o kernel do Lineage.
+2. **Repositório privado para a raiz**, separado deste, com workflow próprio em macOS: baixa do site da
+   Apple os membros do IPSW do iPhone X 16.7.16, monta um HFSX e publica em release privada. Os scripts
+   são nossos, porque a branch `herolte` não tem licença. O workflow se recusa a rodar em repositório público.
+   Também rende o `d22ap.adt`, que falta ao `mkadt_doha.py`.
+3. **Kernel**, sem risco para o aparelho:
+   - `userdata` em `writable_parts[]`, LBA 17924096..122142686, conferido no GPT.
+   - Auditar o que está só sob `ARM64_BOARD_CONFIG_HEROLTE` ou `ARM64_BOARD_CONFIG_SWEET`, que o DOHA não
+     define. Candidatos: `0257` (commpage), `0059` (identidade do iPhone), `0035`, `0246`, `0263`.
+   - Mais RAM: até 2 GiB em `0xc0000000`, com os limites de DMA abaixo de 4 GiB do driver (ADMA de 32 bits).
+   - Log persistente no fim do `userdata`, porque a tela para de mostrar o console.
+4. **Gravar**, só depois de confirmação específica: pelo recovery, em blocos conferidos por hash, com zeros
+   gerados no próprio aparelho. Apaga o `userdata` e os dados do LineageOS. `boot_a` não é gravado: o kernel
+   continua indo por `fastboot boot`, e o recovery segue disponível.
+5. **Primeiro boot do launchd real.** Meta: `Early boot complete` e os serviços subindo.
+
+### Volta ao Android
+
+Formatar os dados pelo recovery, se a etapa 1 confirmar que dá. Fotos e apps não voltam.
+
+### O que este plano não entrega
+
+Um aparelho usável. Depois da etapa 5 ainda faltam mais de um núcleo, tela pelo backboardd, toque, botões,
+bateria e rede. No S7, com um só núcleo A53, o primeiro frame não terminava, e a tela inicial veio com GPU
+Mali por Panfrost. O doha tem Adreno 610, sem esse trabalho pronto.
