@@ -11,9 +11,13 @@
  *   - VCCQ is 1.8 V (live FDT qcom,vdd-io-voltage-level), so set the pads for it
  *   - standard eMMC identification: 1-bit at 400 kHz, the power-on default
  *
- * READ ONLY by construction. The only commands sent are CMD0, CMD1, CMD2, CMD3
- * and CMD7 (reset and select the card, nothing reaches the flash), CMD13
- * (status), CMD8 (read EXT_CSD) and CMD17 (read one block). No CMD6, CMD24, CMD25.
+ * Then raise the speed: 8-bit bus and HS timing at 50 MHz, single data rate.
+ * No DLL or tuning, which Linux only uses above 100 MHz.
+ *
+ * No data is ever written. The only commands sent are CMD0, CMD1, CMD2, CMD3
+ * and CMD7 (reset and select the card), CMD13 (status), CMD8 (read EXT_CSD),
+ * CMD17 (read one block) and CMD6, only for the two mode fields BUS_WIDTH and
+ * HS_TIMING of EXT_CSD, which return to their defaults on reset. No CMD24, CMD25.
  */
 #include <stdint.h>
 #include "console.h"
@@ -40,6 +44,9 @@
 #define HC_VERSION		0xfe
 
 /* sdhci_msm_v5_offset */
+#define MSM_DLL_CONFIG		0x200
+#define DLL_PDN			(1U << 29)
+#define DLL_RST			(1U << 30)
 #define MSM_VENDOR_SPEC		0x20c
 #define MSM_VENDOR_CAPS0	0x21c
 #define MSM_PWRCTL_STATUS	0x240
@@ -61,11 +68,14 @@
 #define CBCR_OFF		(1U << 31)
 #define RCG_UPDATE		(1U << 0)
 #define RCG_CFG_400K		((23U << 0) | (0U << 8) | (2U << 12))	/* TCXO / 12, M/N 1/4 */
+#define RCG_CFG_50M		((11U << 0) | (2U << 8))		/* GPLL0_OUT_AUX2 / 6, no M/N */
 
 #define PRESENT_INHIBIT		0x3	/* command and data lines */
 #define CLOCK_SD_ON		(1U << 2)
 #define POWER_ON_3V0		0x0d	/* bus on, 3.0 V: vdd is 2.95 V */
 #define CTRL2_1V8		(1U << 3)
+#define CTRL1_HS		(1U << 2)
+#define CTRL1_8BIT		(1U << 5)
 #define RESET_CMD_DAT		0x6
 #define INT_CMD			(1U << 0)
 #define INT_XFER		(1U << 1)
@@ -85,6 +95,7 @@
 #define MMC_SEND_OP_COND	1
 #define MMC_ALL_SEND_CID	2
 #define MMC_SET_RCA		3
+#define MMC_SWITCH		6
 #define MMC_SELECT		7
 #define MMC_READ_EXT_CSD	8
 #define MMC_STATUS		13
@@ -93,6 +104,16 @@
 #define OCR_SECTOR_DUAL		0x40ff8080	/* sector addressing, 1.8 V and 2.7-3.6 V */
 #define OCR_READY		(1U << 31)
 #define CARD_RCA		1
+#define R1_SWITCH_ERROR		(1U << 7)
+#define EXT_CSD_BUS_WIDTH	183
+#define EXT_CSD_HS_TIMING	185
+#define EXT_CSD_DEVICE_TYPE	196
+#define BUS_WIDTH_8		2
+#define HS_TIMING_HS		1
+#define DEVICE_TYPE_HS_52	(1U << 1)
+#define SPEED_TEST_SECTORS	2048	/* 1 MiB */
+/* Sum of the first 1 MiB of the boot_a.img backup, as little-endian 32-bit words. */
+#define BOOT_A_SUM		0xfa62bcb9U
 
 #define SECTOR			512
 #define GPT_ENTRY_SIZE		128
@@ -225,11 +246,12 @@ static int name_is(unsigned entry, const char *want)
 	return 0;
 }
 
+static uint32_t boot_lba;
+
 static void test_gpt(void)
 {
 	/* Names only: string tables of pointers would be absolute relocations. */
 	static const char want[3][10] = { "boot_a", "persist", "userdata" };
-	uint32_t boot_lba = 0;
 	unsigned used = 0;
 	int rc;
 
@@ -285,6 +307,109 @@ static void test_gpt(void)
 	/* w2 is the kernel size in the header: 00d7e5f1 in the boot_a backup. */
 	con_hex2(" head", "w0=", sec[0], "w1=", sec[1]);
 	con_hex2(" head", "w2=", sec[2], 0, 0);
+}
+
+/* CMD6, write-byte access to one EXT_CSD mode field; R1b, so wait out the busy. */
+static int mmc_switch(unsigned index, unsigned value)
+{
+	uint64_t end;
+	int rc = send(MMC_SWITCH, (3U << 24) | (index << 16) | (value << 8), CMD_R1B, 0);
+
+	if (rc)
+		return report_fail("CMD6", rc);
+	for (end = now() + ticks_per_s(); rd32(HC_PRESENT) & PRESENT_INHIBIT;) {
+		if (now() > end) {
+			last_int = rd32(HC_PRESENT);
+			reset_lines();
+			return report_fail("CMD6 busy", -3);
+		}
+	}
+	rc = send(MMC_STATUS, CARD_RCA << 16, CMD_R1, 0);
+	if (rc)
+		return report_fail("CMD6 st", rc);
+	uint32_t r1 = rd32(HC_RESP0);
+	con_hex2(" cmd6", "idx=", index, "r1=", r1);
+	return (r1 & R1_SWITCH_ERROR) ? -1 : 0;
+}
+
+/* The SD clock must be off while the root clock changes. */
+static int set_50mhz(void)
+{
+	wr16(HC_CLOCK, rd16(HC_CLOCK) & ~CLOCK_SD_ON);
+	/* DLL off below 100 MHz (Linux sdhci_msm_set_uhs_signaling). */
+	wr32(MSM_DLL_CONFIG, rd32(MSM_DLL_CONFIG) | DLL_RST);
+	wr32(MSM_DLL_CONFIG, rd32(MSM_DLL_CONFIG) | DLL_PDN);
+	gcc_wr(GCC_SDCC1_RCG_CFG, RCG_CFG_50M);
+	gcc_wr(GCC_SDCC1_RCG_CMD, gcc_rd(GCC_SDCC1_RCG_CMD) | RCG_UPDATE);
+	for (uint64_t end = now() + ticks_per_s() / 10; gcc_rd(GCC_SDCC1_RCG_CMD) & RCG_UPDATE;) {
+		if (now() > end) {
+			con_hex2("RCG", "stuck=", gcc_rd(GCC_SDCC1_RCG_CMD), 0, 0);
+			return -1;
+		}
+	}
+	wr16(HC_CLOCK, rd16(HC_CLOCK) | CLOCK_SD_ON);
+	delay_ms(1);
+	con_hex2("RCG", "50M cfg=", gcc_rd(GCC_SDCC1_RCG_CFG), "apps=", gcc_rd(GCC_SDCC1_APPS_CBCR));
+	return 0;
+}
+
+static void speed_test(void)
+{
+	uint64_t start = now();
+	uint32_t sum = 0;
+
+	for (uint32_t s = 0; s < SPEED_TEST_SECTORS; s++) {
+		int rc = read_data(MMC_READ_BLOCK, boot_lba + s);
+		if (rc) {
+			con_hex2("SPEED", "fail at=", s, "int=", last_int);
+			return;
+		}
+		for (unsigned i = 0; i < SECTOR / 4; i++)
+			sum += sec[i];
+	}
+	uint64_t ticks = now() - start;
+	/* Reports the whole loop: PIO through Device memory, one command per block. */
+	con_hex2("SPEED", "ms=", (uint32_t)(ticks * 1000 / ticks_per_s()), "kib=", SPEED_TEST_SECTORS / 2);
+	con_hex2(" sum", "got=", sum, "want=", BOOT_A_SUM);
+	con_str(" sum", sum == BOOT_A_SUM ? "1 MiB MATCHES backup" : "MISMATCH");
+}
+
+static void go_fast(void)
+{
+	int rc = read_data(MMC_READ_EXT_CSD, 0);
+
+	if (rc) {
+		report_fail("EXTCSD", rc);
+		return;
+	}
+	if (!(byte_at(EXT_CSD_DEVICE_TYPE) & DEVICE_TYPE_HS_52)) {
+		con_hex2("CARD", "no HS52 type=", byte_at(EXT_CSD_DEVICE_TYPE), 0, 0);
+		return;
+	}
+
+	/* 8-bit first, still at 400 kHz, so a wiring or pad problem shows up slowly. */
+	if (mmc_switch(EXT_CSD_BUS_WIDTH, BUS_WIDTH_8))
+		return;
+	wr8(HC_CTRL1, rd8(HC_CTRL1) | CTRL1_8BIT);
+	rc = read_data(MMC_READ_EXT_CSD, 0);
+	if (rc) {
+		report_fail("8BIT", rc);
+		return;
+	}
+	con_hex2(" 8bit", "width=", byte_at(EXT_CSD_BUS_WIDTH), "sec=", sec[212 / 4]);
+
+	if (mmc_switch(EXT_CSD_HS_TIMING, HS_TIMING_HS))
+		return;
+	wr8(HC_CTRL1, rd8(HC_CTRL1) | CTRL1_HS);
+	if (set_50mhz())
+		return;
+	rc = read_data(MMC_READ_EXT_CSD, 0);
+	if (rc) {
+		report_fail("HS50", rc);
+		return;
+	}
+	con_hex2(" hs50", "hs=", byte_at(EXT_CSD_HS_TIMING), "sec=", sec[212 / 4]);
+	speed_test();
 }
 
 /* Linux sdhci_msm_handle_pwr_irq, polled: clear the request and report success. */
@@ -409,4 +534,6 @@ void test_sdhci(void)
 		return;
 	}
 	test_gpt();
+	if (boot_lba)
+		go_fast();
 }
