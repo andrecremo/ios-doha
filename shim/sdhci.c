@@ -280,8 +280,11 @@ static void test_gpt(void)
 		return;
 	}
 	/* End-to-end check: the same bytes as the boot_a.img backup. */
-	con_str("BOOT_A", sec[0] == 0x52444e41 && sec[1] == 0x21444f49 ?
+	con_str("BOOT_A", sec[0] == 0x52444e41 && sec[1] == 0x2144494f ?
 		"ANDROID! magic OK" : "magic MISMATCH");
+	/* w2 is the kernel size in the header: 00d7e5f1 in the boot_a backup. */
+	con_hex2(" head", "w0=", sec[0], "w1=", sec[1]);
+	con_hex2(" head", "w2=", sec[2], 0, 0);
 }
 
 /* Linux sdhci_msm_handle_pwr_irq, polled: clear the request and report success. */

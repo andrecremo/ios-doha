@@ -132,3 +132,23 @@ Próximo: raiz. Um RAM disk não comporta o shared cache do iOS (GBs) em 1 GiB d
 para testar um init mínimo. O caminho real é o driver SDHCI do eMMC, só leitura primeiro: listar
 a GPT sem gravar nada. Gravar a raiz em `userdata` apaga o Android e exige confirmação antes.
 O 0401 pode sair quando o próximo kernel for compilado (custa ~4 s de espera a cada boot).
+
+## 2026-11-03, boots 5 e 6: eMMC lido no shim (milestone 3, primeira etapa)
+
+Boot 5 (só leitura de registradores): `ver=7202`, `caps=742dc8b2`, `pres=01f800f0`, `ctl1=0`,
+`ctl2=0`, `clk=3`, `en=0`. O ABL deixa o host resetado: clock interno ligado, clock do cartão e
+energia do barramento desligados.
+
+Boot 6 (`shim/sdhci.c`, inicialização completa, sem comando de escrita):
+- GCC antes: `apps=4221`, `ahb=1`, RCG `cfg=401` (GPLL6 / 1 = 384 MHz, a taxa de HS400).
+  `spec=00300a0c`. A escrita do RCG para 400 kHz foi aceita, sem reset do hipervisor.
+- Pedidos de energia confirmados: `st=2` (bus on) e `st=4` (IO low).
+- `clk=000e0005`, `pres=03f800f0`, `OCR=c0ff8080` (pronto, setores), `r1=900`, estado 4 (tran).
+- `EXT_CSD`: `sectors=0747c000` = 58,24 GiB, partição de usuário. Bate com os 58,2 GiB do Linux.
+- GPT: `my=1`, `alt=0747bfff` (último setor), entradas em LBA 2, `n=80`, `used=77`.
+  Os 3 vazios são p69, p70 e p71, justamente os que faltam no `/dev/block/by-name`.
+- Partições, batendo com o Linux: `persist` p46 LBA `104200`, `boot_a` p53 LBA `12c700`,
+  `userdata` p80 LBA `1118000`.
+
+`BOOT_A magic MISMATCH` no boot 6 veio de um erro meu na constante de `OID!`, ou de uma leitura
+errada: corrigido e com os valores impressos, a confirmar no próximo boot.
