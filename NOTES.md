@@ -211,8 +211,21 @@ só, e o host o avança a cada transferência. Agora é programado em cada leitu
 - **Bank 0: `sctlr=000000e0`, bit M = 0, desligado**; `tcr=0`, `ttbr=0`. Então não há tradução de
   estágio 1 para o eMMC, ao menos neste estado.
 
-Próximo: separar a causa do boot 11 com o mesmo kernel e boot-args diferentes:
-`doha-bisect-a.img` (sem `emmcprobe` e sem `rd`) e `doha-bisect-b.img` (só `emmcprobe=1`).
+## 2026-11-04, boots 13 e 14: causa do boot 11
+
+Mesmo kernel `82eadf1f…`, só mudando boot-args:
+- Sem `emmcprobe` e sem `rd`: para em `Waiting on`, sem reset.
+- Só `emmcprobe=1`: `DMA at 0xc3e64000`, `8-bit HS 50 MHz`, e então
+  `read lba 2 n 20 failed: 5 int=0x2008100 adma=0x0`, `probe failed: 5`. Para em `Waiting on`,
+  sem reset. A leitura da LBA 1, a primeira por DMA sob o MMU, passou na checagem do GPT.
+
+`int` tem o bit 25 (erro de ADMA) e `lba 2` é a segunda transferência: é o bug do `HC_ADMA_ADDR`.
+
+Causa provável do boot 11 (dedução, a confirmar): com `rd=emmcroot0` o mesmo erro faz
+`doha_emmc_rootdev` falhar, e o `panic` em `IOFindBSDRoot` reinicia o aparelho. Era errado concluir
+pela foto do boot 11 que o reset vinha antes do driver: a foto era só um instante do boot.
+
+Correções no 0403: `HC_ADMA_ADDR` em cada leitura, e 30 s na tela antes desse panic.
 
 Depois:
 1. Dispositivo de bloco só leitura estável (`emmcroot0`).

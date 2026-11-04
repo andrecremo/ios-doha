@@ -12,10 +12,10 @@ index a16d8e0..ef521e3 100644
  bsd/dev/herolte_battery.c		standard
 diff --git a/bsd/dev/doha_emmc.c b/bsd/dev/doha_emmc.c
 new file mode 100755
-index 0000000..0c62ca2
+index 0000000..2391f77
 --- /dev/null
 +++ b/bsd/dev/doha_emmc.c
-@@ -0,0 +1,938 @@
+@@ -0,0 +1,939 @@
 +/*
 + * DOHA internal eMMC: sdhci@4744000 (qcom,sdhci-msm-v5), read-only BSD disk.
 + *
@@ -379,6 +379,9 @@ index 0000000..0c62ca2
 +		return rc;
 +	}
 +	wr32(HC_INT, 0xffffffff);
++	/* The host advances this register as it walks the table: set it every time. */
++	wr32(HC_ADMA_ADDR, (uint32_t)(em.dma_pa + DMA_DESC));
++	wr32(HC_ADMA_ADDR_HI, 0);
 +	wr32(HC_BLOCK, (sectors << 16) | SECTOR);
 +	wr32(HC_ARG, (uint32_t)lba);
 +	__builtin_arm_dsb(0xf);         /* SY: descriptors are visible before the command */
@@ -594,8 +597,6 @@ index 0000000..0c62ca2
 +	    ext_csd_byte(EXT_CSD_HS_TIMING));
 +
 +	wr8(HC_CTRL1, (rd8(HC_CTRL1) & (uint8_t)~CTRL1_DMA_MASK) | CTRL1_ADMA2_32);
-+	wr32(HC_ADMA_ADDR, (uint32_t)(em.dma_pa + DMA_DESC));
-+	wr32(HC_ADMA_ADDR_HI, 0);
 +	return 0;
 +}
 +
@@ -955,10 +956,10 @@ index 0000000..0c62ca2
 +}
 +#endif /* ARM64_BOARD_CONFIG_DOHA */
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
-index 5175bb3..e6bf80b 100644
+index 5175bb3..a89c5a5 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -828,6 +828,32 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+@@ -828,6 +828,35 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  	}
  #endif
  
@@ -979,6 +980,9 @@ index 5175bb3..e6bf80b 100644
 +		OSSafeReleaseNULL(matching);
 +		int emmc_error = doha_emmc_rootdev(root);
 +		if (emmc_error) {
++			/* A panic resets the phone: leave the reason on the panel first. */
++			IOLog("DOHA EMMC: root unavailable: %d; panic in 30 s\n", emmc_error);
++			IOSleep(30000);
 +			panic("IOFindBSDRoot: DOHA eMMC root %s unavailable: %d", rdBootVar, emmc_error);
 +		}
 +		strlcpy(rootName, rdBootVar, rootNameSize);
