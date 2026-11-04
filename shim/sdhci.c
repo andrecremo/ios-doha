@@ -131,6 +131,7 @@
 #define DMA_TEST_SECTORS	32768U	/* 16 MiB, the largest SDHCI block count */
 /* Sum of the first 16 MiB of the boot_a.img backup, as little-endian 32-bit words. */
 #define BOOT_A_SUM_16M		0x4ddcf87cU
+#define BOOT_A_SUM_64K		0xa5528332U
 
 #define SMMU			0x0c600000UL
 #define SMMU_CR0		0x000
@@ -426,7 +427,64 @@ static void smmu_report(void)
 	con_str(" sid", "no SMR matches 0x160");
 }
 
-static void test_dma(void)
+/*
+ * Boot 11: the kernel driver reset the phone. Where can DMA go? Stream 0x160 is
+ * "translate" through bank 0, so show that bank, then read 64 KiB of boot_a to a
+ * few places in the kernel's RAM. The last TRY on screen is the one that reset.
+ */
+static void dma_sweep(void)
+{
+	static const uint32_t pa[] = { 0xc8000000, 0xd0000000, 0xe0000000, 0xf0000000, 0xffe00000 };
+	uint32_t idr1 = smmu_rd(0x024);
+	unsigned page = (idr1 >> 31) ? 0x10000 : 0x1000, pages = 1U << (((idr1 >> 28) & 7) + 1);
+	unsigned cb0 = page * pages;
+
+	smmu_report();
+	con_hex2(" cb0", "sctlr=", smmu_rd(cb0), "tcr=", smmu_rd(cb0 + 0x30));
+	con_hex2(" cb0", "ttbr=", smmu_rd(cb0 + 0x20), "hi=", smmu_rd(cb0 + 0x24));
+	delay_ms(5000);
+
+	for (unsigned t = 0; t < sizeof(pa) / sizeof(pa[0]); t++) {
+		volatile uint32_t *desc = (volatile uint32_t *)(uintptr_t)pa[t];
+		volatile uint32_t *buf = (volatile uint32_t *)(uintptr_t)(pa[t] + 0x1000);
+
+		con_hex2("TRY", "pa=", pa[t], 0, 0);
+		delay_ms(3000);
+		desc[0] = (ADMA_CHUNK << 16) | ADMA_VALID_TRAN;
+		desc[1] = pa[t] + 0x1000;
+		desc[2] = (ADMA_CHUNK << 16) | ADMA_VALID_TRAN | ADMA_END;
+		desc[3] = pa[t] + 0x1000 + ADMA_CHUNK;
+		__asm__ volatile("dsb sy" ::: "memory");
+
+		wr8(HC_CTRL1, (rd8(HC_CTRL1) & ~CTRL1_DMA_MASK) | CTRL1_ADMA2_32);
+		wr32(HC_ADMA_ADDR, pa[t]);
+		wr32(HC_ADMA_ADDR_HI, 0);
+		while (rd32(HC_PRESENT) & PRESENT_INHIBIT)
+			;
+		wr32(HC_INT, 0xffffffff);
+		wr32(HC_BLOCK, (128U << 16) | SECTOR);
+		wr32(HC_ARG, boot_lba);
+		wr32(HC_XFER_CMD, ((MMC_READ_MULTIPLE << 8 | CMD_R1_DATA) << 16) | XFER_READ_DMA);
+		int rc = wait_int(INT_CMD);
+		if (!rc)
+			rc = wait_int_s(INT_XFER, 5);
+		if (rc) {
+			con_hex2(" fail", "rc=", (uint32_t)rc, "int=", last_int);
+			return;
+		}
+		__asm__ volatile("dsb sy" ::: "memory");
+		uint32_t sum = 0;
+		for (uint32_t i = 0; i < (2 * ADMA_CHUNK) / 4; i++)
+			sum += buf[i];
+		if (sum != BOOT_A_SUM_64K) {
+			con_hex2(" bad", "got=", sum, "want=", BOOT_A_SUM_64K);
+			return;
+		}
+	}
+	con_str("SWEEP", "all addresses OK");
+}
+
+static void __attribute__((unused)) test_dma(void)
 {
 	volatile uint32_t *desc = (volatile uint32_t *)DMA_DESC_PA;
 	uint32_t bytes = DMA_TEST_SECTORS * SECTOR, chunks = bytes / ADMA_CHUNK;
@@ -508,7 +566,7 @@ static void go_fast(void)
 	}
 	con_hex2(" hs50", "hs=", byte_at(EXT_CSD_HS_TIMING), "sec=", sec[212 / 4]);
 	speed_test();
-	test_dma();
+	dma_sweep();
 }
 
 /* Linux sdhci_msm_handle_pwr_irq, polled: clear the request and report success. */
