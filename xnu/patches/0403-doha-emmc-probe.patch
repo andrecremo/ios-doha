@@ -12,12 +12,12 @@ index a16d8e0..ef521e3 100644
  bsd/dev/herolte_battery.c		standard
 diff --git a/bsd/dev/doha_emmc.c b/bsd/dev/doha_emmc.c
 new file mode 100755
-index 0000000..2391f77
+index 0000000..b959d79
 --- /dev/null
 +++ b/bsd/dev/doha_emmc.c
-@@ -0,0 +1,939 @@
+@@ -0,0 +1,1252 @@
 +/*
-+ * DOHA internal eMMC: sdhci@4744000 (qcom,sdhci-msm-v5), read-only BSD disk.
++ * DOHA internal eMMC: sdhci@4744000 (qcom,sdhci-msm-v5), BSD disk, read-only by default.
 + *
 + * The sequence was proven on the phone by shim/sdhci.c (NOTES.md, boots 5-10).
 + * ABL leaves the host reset: set the GCC root clock to 400 kHz, power the bus
@@ -31,13 +31,20 @@ index 0000000..2391f77
 + * and exposes it as the BSD disk emmcroot0 (remmcroot0). Root on it with
 + * rd=emmcroot0. Boot-arg emmcprobe=1 times the first 16 MiB of boot_a.
 + *
-+ * READ ONLY: no data write path exists. The only commands sent are CMD0, CMD1,
-+ * CMD2, CMD3 and CMD7 (reset and select the card), CMD13 (status), CMD8 (read
-+ * EXT_CSD), CMD18 (read blocks, with auto CMD12) and CMD6, only for the two mode
-+ * fields BUS_WIDTH and HS_TIMING of EXT_CSD. No CMD24, CMD25. Opening for writing
-+ * fails with EROFS.
++ * READ ONLY unless boot-arg emmcwrite= names the partition in emmcroot= and that
++ * partition is in writable_parts[] with the same LBA range in the GPT. Then
++ * emmc_write() is the only code that sends CMD25, and it refuses anything outside
++ * that range before touching the host (write_allowed). The first failed write
++ * disables writes until the next boot. Boot-arg emmcwritetest=1 runs write_selftest.
++ *
++ * The only commands sent are CMD0, CMD1, CMD2, CMD3 and CMD7 (reset and select the
++ * card), CMD13 (status), CMD8 (read EXT_CSD), CMD18 (read blocks, with auto CMD12),
++ * CMD6, only for the two mode fields BUS_WIDTH and HS_TIMING of EXT_CSD, and for
++ * writes CMD25 with auto CMD12 and CMD12 to recover from a failed one. No erase, no
++ * partition switch. CMD0 leaves the card cache off, so a finished write is on flash.
 + */
 +#if defined(ARM64_BOARD_CONFIG_DOHA)
++#include <stdint.h>
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <sys/buf.h>
@@ -48,6 +55,7 @@ index 0000000..2391f77
 +#include <sys/uio.h>
 +#include <miscfs/devfs/devfs.h>
 +#include <kern/clock.h>
++#include <kern/kalloc.h>
 +#include <kern/locks.h>
 +#include <mach/mach_time.h>
 +#include <machine/machine_routines.h>
@@ -133,6 +141,8 @@ index 0000000..2391f77
 +#define CMD_R2                  0x09
 +#define CMD_R3                  0x02
 +#define XFER_READ_ONE_PIO       ((1u << 4) | (1u << 1))  /* card to host, count enable, no DMA */
++/* DMA on, count enable, auto CMD12, host to card, multi-block */
++#define XFER_WRITE_DMA          ((1u << 0) | (1u << 1) | (1u << 2) | (1u << 5))
 +/* DMA on, count enable, auto CMD12 (Linux MULTIBLOCK_READ_ACMD12), read, multi-block */
 +#define XFER_READ_DMA           ((1u << 0) | (1u << 1) | (1u << 2) | (1u << 4) | (1u << 5))
 +#define ADMA_VALID_TRAN         0x21
@@ -146,13 +156,17 @@ index 0000000..2391f77
 +#define MMC_SWITCH              6
 +#define MMC_SELECT              7
 +#define MMC_READ_EXT_CSD        8
++#define MMC_STOP                12
 +#define MMC_STATUS              13
 +#define MMC_READ_MULTIPLE       18
++#define MMC_WRITE_MULTIPLE      25
 +#define MMC_STATE_TRAN          4
 +#define OCR_SECTOR_DUAL         0x40ff8080      /* sector addressing, 1.8 V and 2.7-3.6 V */
 +#define OCR_READY               (1u << 31)
 +#define CARD_RCA                1
 +#define R1_SWITCH_ERROR         (1u << 7)
++#define R1_READY_FOR_DATA       (1u << 8)
++#define R1_ERRORS               0xfdf98080u     /* every error bit of the R1 card status */
 +
 +#define EXT_CSD_PART_CONFIG     179
 +#define EXT_CSD_BUS_WIDTH       183
@@ -172,6 +186,18 @@ index 0000000..2391f77
 +#define TIMEOUT_NS              (1000ull * NSEC_PER_MSEC)
 +#define TIMEOUT_DMA_NS          (5000ull * NSEC_PER_MSEC)
 +#define PROBE_BYTES             (16u << 20)
++#define WRITE_TEST_OFFSET       (262144u)       /* sectors into the partition: 128 MiB */
++
++/*
++ * The partitions writes may be enabled on, with their LBA range on this phone. A
++ * partition is added here by hand, after confirming it can be lost.
++ */
++static const struct {
++	const char *name;
++	uint64_t first, last;
++} writable_parts[] = {
++	{ "system_b", 11599872, 17924095 },
++};
 +
 +/* Layout of the contiguous DMA allocation. */
 +#define DMA_DESC                0x0000
@@ -185,6 +211,8 @@ index 0000000..2391f77
 +	uint32_t ext_csd[SECTOR / 4];
 +	uint32_t last_int;
 +	uint64_t first_lba, nsectors;   /* partition, in 512-byte sectors */
++	uint64_t write_first, write_count;      /* the only sectors CMD25 may reach */
++	bool writable;
 +	uint32_t secsize;               /* logical sector size for the BSD layer */
 +	int bmajor, cmajor;
 +	dev_t bdev;
@@ -398,6 +426,123 @@ index 0000000..2391f77
 +	/* Drop any line the CPU pulled in speculatively during the transfer. */
 +	flush_dcache64((addr64_t)bounce_pa, bytes, TRUE);
 +	return 0;
++}
++
++/* GUARD-BEGIN (also compiled by itself in an offline test) */
++static bool
++write_allowed(uint64_t lba, uint32_t sectors, uint64_t first, uint64_t count)
++{
++	if (sectors == 0 || count == 0 || lba < first) {
++		return false;
++	}
++	uint64_t off = lba - first;     /* no addition, so nothing here can wrap */
++	return off < count && sectors <= count - off;
++}
++/* GUARD-END */
++
++/* After a data write: wait out the busy line, then the card must be ready and error free. */
++static int
++write_finish(void)
++{
++	uint64_t end = deadline_ns(TIMEOUT_DMA_NS);
++	uint32_t r1;
++
++	for (;;) {
++		if (!(rd32(HC_PRESENT) & PRESENT_INHIBIT)) {
++			int rc = send_cmd(MMC_STATUS, CARD_RCA << 16, CMD_R1, 0);
++			if (rc) {
++				return rc;
++			}
++			r1 = rd32(HC_RESP0);
++			if (r1 & R1_ERRORS) {
++				em.last_int = r1;
++				return EIO;
++			}
++			if (((r1 >> 9) & 0xf) == MMC_STATE_TRAN && (r1 & R1_READY_FOR_DATA)) {
++				return 0;
++			}
++		}
++		if (mach_absolute_time() > end) {
++			em.last_int = rd32(HC_PRESENT);
++			return ETIMEDOUT;
++		}
++	}
++}
++
++/*
++ * Sectors from the bounce buffer to the whole device; caller holds the lock.
++ * The only sender of CMD25. Any refusal or failure ends writes until the next boot.
++ */
++static int
++emmc_write(uint64_t lba, uint32_t sectors)
++{
++	uint32_t *desc = (uint32_t *)(em.dma + DMA_DESC);
++	uint32_t bytes, chunks;
++	uint64_t bounce_pa = em.dma_pa + DMA_BOUNCE;
++	int rc;
++
++	if (!em.writable) {
++		return EROFS;
++	}
++	if (sectors > BOUNCE_SECTORS || !write_allowed(lba, sectors, em.write_first, em.write_count)) {
++		em.writable = false;
++		printf("DOHA EMMC: WRITE REFUSED lba %llu n %u, writes off\n", lba, sectors);
++		return EPERM;
++	}
++	bytes = sectors * SECTOR;
++	chunks = (bytes + ADMA_CHUNK - 1) / ADMA_CHUNK;
++
++	/* Also clears any error bit left from before, so the status afterwards is about this write. */
++	rc = send_cmd(MMC_STATUS, CARD_RCA << 16, CMD_R1, 0);
++	if (!rc && ((rd32(HC_RESP0) >> 9) & 0xf) != MMC_STATE_TRAN) {
++		em.last_int = rd32(HC_RESP0);
++		rc = EIO;
++	}
++	if (rc) {
++		goto fail;
++	}
++
++	for (uint32_t i = 0; i < chunks; i++) {
++		uint32_t len = (i == chunks - 1) ? bytes - i * ADMA_CHUNK : ADMA_CHUNK;
++
++		desc[2 * i] = (len << 16) | ADMA_VALID_TRAN | (i == chunks - 1 ? ADMA_END : 0);
++		desc[2 * i + 1] = (uint32_t)(bounce_pa + i * ADMA_CHUNK);
++	}
++	clean_dcache64((addr64_t)(em.dma_pa + DMA_DESC), chunks * 8, TRUE);
++	/* The host reads this from memory, not from the CPU cache. */
++	clean_dcache64((addr64_t)bounce_pa, bytes, TRUE);
++
++	rc = wait_idle();
++	if (rc) {
++		goto fail;
++	}
++	wr32(HC_INT, 0xffffffff);
++	wr32(HC_ADMA_ADDR, (uint32_t)(em.dma_pa + DMA_DESC));
++	wr32(HC_ADMA_ADDR_HI, 0);
++	wr32(HC_BLOCK, (sectors << 16) | SECTOR);
++	wr32(HC_ARG, (uint32_t)lba);
++	__builtin_arm_dsb(0xf);         /* SY: descriptors and data are visible before the command */
++	wr32(HC_XFER_CMD, ((MMC_WRITE_MULTIPLE << 8 | CMD_R1_DATA) << 16) | XFER_WRITE_DMA);
++	rc = wait_int(INT_CMD, TIMEOUT_NS);
++	if (!rc) {
++		rc = wait_int(INT_XFER, TIMEOUT_DMA_NS);
++	}
++	if (!rc) {
++		rc = write_finish();
++	}
++	if (!rc) {
++		return 0;
++	}
++
++fail:
++	em.writable = false;
++	printf("DOHA EMMC: write lba %llu n %u failed: %d int=0x%x adma=0x%x, writes off\n",
++	    lba, sectors, rc, em.last_int, rd32(HC_ADMA_ERR));
++	/* Best effort: back to the transfer state, so that reads keep working. */
++	if (send_cmd(MMC_STOP, 0, CMD_R1B, 0) == 0) {
++		(void)write_finish();
++	}
++	return rc;
 +}
 +
 +static int
@@ -686,7 +831,7 @@ index 0000000..2391f77
 +		printf("DOHA EMMC: DMA memory at 0x%llx is above 4 GiB\n", em.dma_pa);
 +		return ENXIO;
 +	}
-+	printf("DOHA EMMC: read only; ver=0x%x, DMA at 0x%llx\n", rd16(HC_VERSION), em.dma_pa);
++	printf("DOHA EMMC: ver=0x%x, DMA at 0x%llx\n", rd16(HC_VERSION), em.dma_pa);
 +
 +	int rc = host_init();
 +	if (!rc) {
@@ -707,7 +852,7 @@ index 0000000..2391f77
 +	if (!em.ready) {
 +		return ENXIO;
 +	}
-+	return (flags & FWRITE) ? EROFS : 0;
++	return ((flags & FWRITE) && !em.writable) ? EROFS : 0;
 +}
 +
 +static int
@@ -724,10 +869,16 @@ index 0000000..2391f77
 +	uint64_t off = (uint64_t)buf_blkno(bp) * em.secsize;
 +	uint32_t count = buf_count(bp);
 +	uint64_t part_bytes = em.nsectors * SECTOR;
++	bool is_read = (buf_flags(bp) & B_READ) != 0;
 +
 +	buf_setresid(bp, count);
-+	if (!(buf_flags(bp) & B_READ)) {
++	if (!is_read && !em.writable) {
 +		error = EROFS;
++		goto done;
++	}
++	/* No read-modify-write: a file system writes whole sectors. */
++	if (!is_read && (off % SECTOR != 0 || count % SECTOR != 0)) {
++		error = EINVAL;
 +		goto done;
 +	}
 +	if (off > part_bytes || count > part_bytes - off) {
@@ -749,11 +900,19 @@ index 0000000..2391f77
 +		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
 +		uint32_t sectors = (skip + want + SECTOR - 1) / SECTOR;
 +
-+		error = emmc_read(em.first_lba + pos / SECTOR, sectors);
-+		if (error) {
-+			break;
++		if (is_read) {
++			error = emmc_read(em.first_lba + pos / SECTOR, sectors);
++			if (error) {
++				break;
++			}
++			memcpy(vaddr + done, (const char *)(em.dma + DMA_BOUNCE) + skip, want);
++		} else {
++			memcpy((char *)(em.dma + DMA_BOUNCE), vaddr + done, want);
++			error = emmc_write(em.first_lba + pos / SECTOR, sectors);
++			if (error) {
++				break;
++			}
 +		}
-+		memcpy(vaddr + done, (const char *)(em.dma + DMA_BOUNCE) + skip, want);
 +		done += want;
 +		buf_setresid(bp, count - done);
 +	}
@@ -794,7 +953,7 @@ index 0000000..2391f77
 +		*o = em.nsectors * SECTOR / em.secsize;
 +		return 0;
 +	case DKIOCISWRITABLE:
-+		*f = 0;
++		*f = em.writable ? 1 : 0;
 +		return 0;
 +	case DKIOCSYNCHRONIZE:
 +	case DKIOCSYNCHRONIZECACHE:
@@ -803,7 +962,7 @@ index 0000000..2391f77
 +		*o = BOUNCE_SIZE / em.secsize;
 +		return 0;
 +	case DKIOCGETMAXBLOCKCOUNTWRITE:
-+		*o = 0;
++		*o = em.writable ? BOUNCE_SIZE / em.secsize : 0;
 +		return 0;
 +	case DKIOCGETMAXSEGMENTCOUNTREAD:
 +	case DKIOCGETMAXSEGMENTCOUNTWRITE:
@@ -839,9 +998,12 @@ index 0000000..2391f77
 +}
 +
 +static int
-+doha_emmc_write(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag)
++doha_emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
 +{
-+	return EROFS;
++	if (!em.writable) {
++		return EROFS;
++	}
++	return physio(doha_emmc_strategy, NULL, dev, B_WRITE, minphys, uio, (int)em.secsize);
 +}
 +
 +static const struct bdevsw doha_emmc_bdevsw = {
@@ -871,6 +1033,148 @@ index 0000000..2391f77
 +	.d_type       = D_DISK,
 +};
 +
++/* The guard itself, on the real bounds. Nothing here reaches the hardware. */
++static bool
++write_guard_check(uint64_t first, uint64_t count)
++{
++	return write_allowed(first, 1, first, count) &&
++	       write_allowed(first + count - 1, 1, first, count) &&
++	       !write_allowed(first + count, 1, first, count) &&
++	       !write_allowed(first + count - 1, 2, first, count) &&
++	       !write_allowed(first - 1, 1, first, count) &&
++	       !write_allowed(first - 1, 2, first, count) &&
++	       !write_allowed(first, 0, first, count) &&
++	       !write_allowed(0, 1, first, count) &&
++	       !write_allowed(UINT64_MAX, 1, first, count) &&
++	       !write_allowed(first, UINT32_MAX, first, count);
++}
++
++/* boot-arg emmcwrite=<the partition in emmcroot=>, and it must be in writable_parts[]. */
++static void
++write_enable(const char *part)
++{
++	char want[64] = "";
++
++	if (!PE_parse_boot_argn("emmcwrite", want, sizeof(want))) {
++		return;
++	}
++	if (strcmp(want, part) != 0) {
++		printf("DOHA EMMC: emmcwrite=%s is not emmcroot=%s: read-only\n", want, part);
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(writable_parts) / sizeof(writable_parts[0]); i++) {
++		uint64_t first = writable_parts[i].first, last = writable_parts[i].last;
++
++		if (strcmp(writable_parts[i].name, part) != 0) {
++			continue;
++		}
++		if (em.first_lba != first || em.nsectors != last - first + 1) {
++			printf("DOHA EMMC: %s is not at LBA %llu..%llu: read-only\n", part, first, last);
++			return;
++		}
++		if (!write_guard_check(first, last - first + 1)) {
++			printf("DOHA EMMC: write guard failed: read-only\n");
++			return;
++		}
++		em.write_first = first;
++		em.write_count = last - first + 1;
++		em.writable = true;
++		return;
++	}
++	printf("DOHA EMMC: %s is not on the write list: read-only\n", part);
++}
++
++static uint32_t
++test_word(uint64_t base, uint32_t i, uint32_t nonce)
++{
++	return nonce ^ (uint32_t)(base + i / (SECTOR / 4)) ^ (i * 0x9e3779b1u);
++}
++
++/*
++ * One round trip of n sectors with the sector on each side as a witness: keep the
++ * contents, write a pattern, read it back, put the contents back, read that back.
++ * saved holds n + 2 sectors. The buffer is zeroed before each check, so a read that
++ * moved nothing cannot pass.
++ */
++static int
++write_test_one(uint64_t base, uint32_t n, uint8_t *saved, uint32_t nonce)
++{
++	uint8_t *b = (uint8_t *)(em.dma + DMA_BOUNCE);
++	uint32_t total = (n + 2) * SECTOR, last = (n + 1) * SECTOR;
++	uint64_t t0, ns;
++
++	int rc = emmc_read(base - 1, n + 2);
++	if (rc) {
++		return rc;
++	}
++	memcpy(saved, b, total);
++
++	for (uint32_t i = 0; i < n * SECTOR / 4; i++) {
++		((uint32_t *)(em.dma + DMA_BOUNCE))[i] = test_word(base, i, nonce);
++	}
++	t0 = mach_absolute_time();
++	rc = emmc_write(base, n);
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	if (rc) {
++		return rc;
++	}
++
++	memset(b, 0, total);
++	rc = emmc_read(base - 1, n + 2);
++	if (rc) {
++		return rc;
++	}
++	bool sides = memcmp(b, saved, SECTOR) == 0 && memcmp(b + last, saved + last, SECTOR) == 0;
++	bool pattern = true;
++	const uint32_t *got = (const uint32_t *)(em.dma + DMA_BOUNCE + SECTOR);
++	for (uint32_t i = 0; pattern && i < n * SECTOR / 4; i++) {
++		pattern = got[i] == test_word(base, i, nonce);
++	}
++
++	/* Put it back even if the checks failed. */
++	memcpy(b, saved + SECTOR, n * SECTOR);
++	rc = emmc_write(base, n);
++	if (rc) {
++		return rc;
++	}
++	memset(b, 0, total);
++	rc = emmc_read(base - 1, n + 2);
++	if (rc) {
++		return rc;
++	}
++	bool restored = memcmp(b, saved, total) == 0;
++
++	printf("DOHA EMMC: write test %u sectors: %llu ms, pattern %s, sides %s, restored %s\n",
++	    n, ns / NSEC_PER_MSEC, pattern ? "ok" : "BAD", sides ? "ok" : "BAD", restored ? "ok" : "BAD");
++	return (pattern && sides && restored) ? 0 : EIO;
++}
++
++/* boot-arg emmcwritetest=1: 128 MiB into the writable partition, past the test volume. */
++static void
++write_selftest(void)
++{
++	static const uint32_t sizes[] = { 1, 8, BOUNCE_SECTORS - 2 };
++	uint64_t base = em.write_first + WRITE_TEST_OFFSET;
++	uint8_t *saved = kalloc_data(BOUNCE_SIZE, Z_WAITOK);
++	int rc = 0;
++
++	if (saved == NULL) {
++		printf("DOHA EMMC: write test: no memory\n");
++		return;
++	}
++	lck_mtx_lock(&doha_emmc_lock);
++	for (unsigned i = 0; !rc && i < sizeof(sizes) / sizeof(sizes[0]); i++) {
++		rc = write_test_one(base, sizes[i], saved, (uint32_t)mach_absolute_time());
++	}
++	if (rc) {
++		em.writable = false;
++	}
++	lck_mtx_unlock(&doha_emmc_lock);
++	kfree_data(saved, BOUNCE_SIZE);
++	printf("DOHA EMMC: write test %s (%d), writes %s\n", rc ? "FAILED" : "passed", rc,
++	    em.writable ? "on" : "off");
++}
++
 +static int
 +doha_emmc_init(void)
 +{
@@ -888,6 +1192,8 @@ index 0000000..2391f77
 +		return error;
 +	}
 +
++	write_enable(want);
++
 +	em.secsize = DEV_BSIZE;
 +	em.bmajor = bdevsw_add(-1, &doha_emmc_bdevsw);
 +	if (em.bmajor < 0) {
@@ -901,7 +1207,14 @@ index 0000000..2391f77
 +	devfs_make_node(em.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "emmcroot0");
 +	devfs_make_node(makedev(em.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "remmcroot0");
 +	em.ready = true;
-+	printf("DOHA EMMC: \"%s\" is emmcroot0, %llu MiB, read-only\n", want, em.nsectors / 2048);
++	printf("DOHA EMMC: \"%s\" is emmcroot0, %llu MiB, %s\n", want, em.nsectors / 2048,
++	    em.writable ? "WRITES ON" : "read-only");
++
++	uint32_t writetest = 0;
++	PE_parse_boot_argn("emmcwritetest", &writetest, sizeof(writetest));
++	if (writetest == 1 && em.writable) {
++		write_selftest();
++	}
 +	return 0;
 +}
 +
