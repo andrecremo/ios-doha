@@ -179,9 +179,20 @@ da foto, sem panic, antes de `Waiting on ... IOMedia ... Apple_HFS`:
 O driver roda sob o MMU, com os mesmos registradores do shim, e o hipervisor não reclamou. Ele
 ainda é só uma sonda: não há dispositivo de bloco.
 
+## 2026-11-04, boot 10: ADMA2 e CMD18 no shim
+
+`shim/sdhci.c`: 16 MiB de uma vez, ADMA2 de 32 bits, chunks de 32 KiB, auto CMD12, da LBA do
+`boot_a` para `0xc0100000`, com MMU desligado.
+- `DMA ms=169` (361 ms, ~44 MiB/s). Soma `4ddcf87c`, igual aos 16 MiB iniciais do backup.
+- SMMU: `cr0=00270406`, `smrs=0x36` (54). Stream do eMMC: `smr=80000160`, `s2cr=00000000`.
+
+Atenção: `s2cr` tipo 0 é **tradução, pelo context bank 0**, e não bypass como o device tree
+sugeria. O DMA chegou aos endereços certos, então o bank 0 deve estar desligado ou ser identidade
+nessa faixa, mas isso não foi lido, e `cr0` tem `USFCFG` ligado (stream sem SMR gera falha). Só a
+faixa `0xc0000000..0xc1100000` foi comprovada. Conferir o SCTLR do bank 0 se o DMA falhar em
+outro endereço, especialmente acima de 4 GiB.
+
 Próximo:
-1. Dispositivo de bloco só leitura sobre uma partição (modelo: `sweet_ufs.c`).
-2. Desempenho: `CMD18` e ADMA2 (o SMMU pode exigir o mesmo cuidado que no USB dos forks). PIO a
-   ~2,4 MiB/s é pouco para o shared cache.
-3. Raiz em `userdata`: apaga o LineageOS; confirmar antes. Possível teste intermediário: uma
+1. Dispositivo de bloco só leitura sobre uma partição (modelo: `sweet_ufs.c`), com ADMA2.
+2. Raiz em `userdata`: apaga o LineageOS; confirmar antes. Possível teste intermediário: uma
    imagem HFS pequena em `system_b`, o slot inativo, o que mantém o LineageOS no `_a`.

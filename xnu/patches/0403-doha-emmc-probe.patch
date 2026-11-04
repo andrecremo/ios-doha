@@ -12,34 +12,52 @@ index a16d8e0..ef521e3 100644
  bsd/dev/herolte_battery.c		standard
 diff --git a/bsd/dev/doha_emmc.c b/bsd/dev/doha_emmc.c
 new file mode 100755
-index 0000000..6149689
+index 0000000..0c62ca2
 --- /dev/null
 +++ b/bsd/dev/doha_emmc.c
-@@ -0,0 +1,574 @@
+@@ -0,0 +1,938 @@
 +/*
-+ * DOHA eMMC probe: sdhci@4744000 (qcom,sdhci-msm-v5), PIO, polled.
++ * DOHA internal eMMC: sdhci@4744000 (qcom,sdhci-msm-v5), read-only BSD disk.
 + *
-+ * The sequence was proven on the phone by shim/sdhci.c (NOTES.md, boots 5-8).
++ * The sequence was proven on the phone by shim/sdhci.c (NOTES.md, boots 5-10).
 + * ABL leaves the host reset: set the GCC root clock to 400 kHz, power the bus
 + * with the MSM power-switch acknowledgement, select 1.8 V pads, identify the
-+ * card, then go to 8-bit HS at 50 MHz. PIO uses no DMA, so no SMMU.
++ * card, then go to 8-bit HS at 50 MHz. Data moves by polled ADMA2 through one
++ * physically contiguous allocation (descriptors and a 1 MiB bounce buffer);
++ * the host is not treated as cache coherent, so caches are maintained around
++ * each transfer. The block device glue follows ios-sweet's sweet_ufs.c.
 + *
-+ * No data is ever written. The only commands sent are CMD0, CMD1, CMD2, CMD3
-+ * and CMD7 (reset and select the card), CMD13 (status), CMD8 (read EXT_CSD),
-+ * CMD17 (read one block) and CMD6, only for the two mode fields BUS_WIDTH and
-+ * HS_TIMING of EXT_CSD. No CMD24, CMD25.
++ * It finds one GPT partition by name (boot-arg emmcroot=, default "userdata")
++ * and exposes it as the BSD disk emmcroot0 (remmcroot0). Root on it with
++ * rd=emmcroot0. Boot-arg emmcprobe=1 times the first 16 MiB of boot_a.
 + *
-+ * Boot-arg emmcprobe=1 runs it from IOFindBSDRoot. No block device yet.
++ * READ ONLY: no data write path exists. The only commands sent are CMD0, CMD1,
++ * CMD2, CMD3 and CMD7 (reset and select the card), CMD13 (status), CMD8 (read
++ * EXT_CSD), CMD18 (read blocks, with auto CMD12) and CMD6, only for the two mode
++ * fields BUS_WIDTH and HS_TIMING of EXT_CSD. No CMD24, CMD25. Opening for writing
++ * fails with EROFS.
 + */
 +#if defined(ARM64_BOARD_CONFIG_DOHA)
 +#include <sys/param.h>
 +#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
 +#include <kern/clock.h>
++#include <kern/locks.h>
 +#include <mach/mach_time.h>
 +#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
 +#include <pexpert/pexpert.h>
 +#include <libkern/libkern.h>
 +
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 +/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +
@@ -60,6 +78,10 @@ index 0000000..6149689
 +#define HC_INT_EN               0x34
 +#define HC_SIG_EN               0x38
 +#define HC_CTRL2_HI             0x3e
++#define HC_ADMA_ERR             0x54
++#define HC_ADMA_ADDR            0x58
++#define HC_ADMA_ADDR_HI         0x5c
++#define HC_VERSION              0xfe
 +
 +/* sdhci_msm_v5_offset */
 +#define MSM_DLL_CONFIG          0x200
@@ -94,6 +116,8 @@ index 0000000..6149689
 +#define POWER_ON_3V0            0x0d    /* bus on, 3.0 V: vdd is 2.95 V */
 +#define CTRL2_1V8               (1u << 3)
 +#define CTRL1_HS                (1u << 2)
++#define CTRL1_DMA_MASK          (3u << 3)
++#define CTRL1_ADMA2_32          (2u << 3)
 +#define CTRL1_8BIT              (1u << 5)
 +#define RESET_CMD_DAT           0x6
 +#define INT_CMD                 (1u << 0)
@@ -108,7 +132,12 @@ index 0000000..6149689
 +#define CMD_R1_DATA             0x3a
 +#define CMD_R2                  0x09
 +#define CMD_R3                  0x02
-+#define XFER_READ_ONE           ((1u << 4) | (1u << 1))  /* card to host, count enable, no DMA */
++#define XFER_READ_ONE_PIO       ((1u << 4) | (1u << 1))  /* card to host, count enable, no DMA */
++/* DMA on, count enable, auto CMD12 (Linux MULTIBLOCK_READ_ACMD12), read, multi-block */
++#define XFER_READ_DMA           ((1u << 0) | (1u << 1) | (1u << 2) | (1u << 4) | (1u << 5))
++#define ADMA_VALID_TRAN         0x21
++#define ADMA_END                0x02
++#define ADMA_CHUNK              0x8000u
 +
 +#define MMC_GO_IDLE             0
 +#define MMC_SEND_OP_COND        1
@@ -118,7 +147,7 @@ index 0000000..6149689
 +#define MMC_SELECT              7
 +#define MMC_READ_EXT_CSD        8
 +#define MMC_STATUS              13
-+#define MMC_READ_BLOCK          17
++#define MMC_READ_MULTIPLE       18
 +#define MMC_STATE_TRAN          4
 +#define OCR_SECTOR_DUAL         0x40ff8080      /* sector addressing, 1.8 V and 2.7-3.6 V */
 +#define OCR_READY               (1u << 31)
@@ -135,61 +164,82 @@ index 0000000..6149689
 +#define DEVICE_TYPE_HS_52       (1u << 1)
 +
 +#define SECTOR                  512u
++#define BOUNCE_SIZE             (1u << 20)
++#define BOUNCE_SECTORS          (BOUNCE_SIZE / SECTOR)
++#define PHYS_BLOCK              4096u
 +#define GPT_ENTRY_SIZE          128u
 +#define GPT_MAX_ENTRIES         128u
 +#define TIMEOUT_NS              (1000ull * NSEC_PER_MSEC)
-+#define SPEED_TEST_SECTORS      2048u   /* 1 MiB */
++#define TIMEOUT_DMA_NS          (5000ull * NSEC_PER_MSEC)
++#define PROBE_BYTES             (16u << 20)
 +
-+static vm_offset_t hc, gcc;
-+static uint32_t sec[SECTOR / 4];
-+static uint32_t last_int;
++/* Layout of the contiguous DMA allocation. */
++#define DMA_DESC                0x0000
++#define DMA_BOUNCE              0x4000
++#define DMA_SIZE                (DMA_BOUNCE + BOUNCE_SIZE)
++
++static struct {
++	vm_offset_t hc, gcc;
++	vm_offset_t dma;                /* kernel VA of the DMA allocation */
++	uint64_t dma_pa;
++	uint32_t ext_csd[SECTOR / 4];
++	uint32_t last_int;
++	uint64_t first_lba, nsectors;   /* partition, in 512-byte sectors */
++	uint32_t secsize;               /* logical sector size for the BSD layer */
++	int bmajor, cmajor;
++	dev_t bdev;
++	bool host_up, ready;
++} em;
++
++static LCK_GRP_DECLARE(doha_emmc_grp, "doha_emmc");
++static LCK_MTX_DECLARE(doha_emmc_lock, &doha_emmc_grp);
 +
 +static inline uint32_t
 +rd32(unsigned r)
 +{
-+	return *(volatile uint32_t *)(hc + r);
++	return *(volatile uint32_t *)(em.hc + r);
 +}
 +
 +static inline uint16_t
 +rd16(unsigned r)
 +{
-+	return *(volatile uint16_t *)(hc + r);
++	return *(volatile uint16_t *)(em.hc + r);
 +}
 +
 +static inline uint8_t
 +rd8(unsigned r)
 +{
-+	return *(volatile uint8_t *)(hc + r);
++	return *(volatile uint8_t *)(em.hc + r);
 +}
 +
 +static inline void
 +wr32(unsigned r, uint32_t v)
 +{
-+	*(volatile uint32_t *)(hc + r) = v;
++	*(volatile uint32_t *)(em.hc + r) = v;
 +}
 +
 +static inline void
 +wr16(unsigned r, uint16_t v)
 +{
-+	*(volatile uint16_t *)(hc + r) = v;
++	*(volatile uint16_t *)(em.hc + r) = v;
 +}
 +
 +static inline void
 +wr8(unsigned r, uint8_t v)
 +{
-+	*(volatile uint8_t *)(hc + r) = v;
++	*(volatile uint8_t *)(em.hc + r) = v;
 +}
 +
 +static inline uint32_t
 +gcc_rd(unsigned r)
 +{
-+	return *(volatile uint32_t *)(gcc + r);
++	return *(volatile uint32_t *)(em.gcc + r);
 +}
 +
 +static inline void
 +gcc_wr(unsigned r, uint32_t v)
 +{
-+	*(volatile uint32_t *)(gcc + r) = v;
++	*(volatile uint32_t *)(em.gcc + r) = v;
 +}
 +
 +static uint64_t
@@ -202,9 +252,9 @@ index 0000000..6149689
 +}
 +
 +static uint8_t
-+byte_at(unsigned off)
++ext_csd_byte(unsigned off)
 +{
-+	return ((const uint8_t *)sec)[off];
++	return ((const uint8_t *)em.ext_csd)[off];
 +}
 +
 +static void
@@ -221,14 +271,14 @@ index 0000000..6149689
 +
 +/* 0 when a bit of mask latched (and acked); EIO on a controller error, ETIMEDOUT otherwise. */
 +static int
-+wait_int(uint32_t mask)
++wait_int(uint32_t mask, uint64_t timeout_ns)
 +{
-+	uint64_t end = deadline_ns(TIMEOUT_NS);
++	uint64_t end = deadline_ns(timeout_ns);
 +
 +	for (;;) {
 +		uint32_t st = rd32(HC_INT);
 +		if (st & INT_ERR) {
-+			last_int = st;
++			em.last_int = st;
 +			reset_lines();
 +			return EIO;
 +		}
@@ -237,7 +287,7 @@ index 0000000..6149689
 +			return 0;
 +		}
 +		if (mach_absolute_time() > end) {
-+			last_int = st;
++			em.last_int = st;
 +			reset_lines();
 +			return ETIMEDOUT;
 +		}
@@ -251,7 +301,7 @@ index 0000000..6149689
 +
 +	while (rd32(HC_PRESENT) & PRESENT_INHIBIT) {
 +		if (mach_absolute_time() > end) {
-+			last_int = rd32(HC_PRESENT);
++			em.last_int = rd32(HC_PRESENT);
 +			reset_lines();
 +			return ETIMEDOUT;
 +		}
@@ -273,33 +323,78 @@ index 0000000..6149689
 +	}
 +	wr32(HC_ARG, arg);
 +	wr32(HC_XFER_CMD, ((index << 8 | flags) << 16) | xfer);
-+	return wait_int(INT_CMD);
++	return wait_int(INT_CMD, TIMEOUT_NS);
 +}
 +
-+/* One 512-byte block into sec[]. CMD17 takes a sector address on this card. */
++/* EXT_CSD by PIO into em.ext_csd, before the fast path exists. */
 +static int
-+read_data(unsigned index, uint32_t arg)
++read_ext_csd(void)
 +{
-+	int rc = send_cmd(index, arg, CMD_R1_DATA, XFER_READ_ONE);
++	int rc = send_cmd(MMC_READ_EXT_CSD, 0, CMD_R1_DATA, XFER_READ_ONE_PIO);
 +
 +	if (rc) {
 +		return rc;
 +	}
-+	rc = wait_int(INT_BUF_RD);
++	rc = wait_int(INT_BUF_RD, TIMEOUT_NS);
 +	if (rc) {
 +		return rc;
 +	}
 +	for (unsigned i = 0; i < SECTOR / 4; i++) {
-+		sec[i] = rd32(HC_DATA);
++		em.ext_csd[i] = rd32(HC_DATA);
 +	}
-+	return wait_int(INT_XFER);
++	return wait_int(INT_XFER, TIMEOUT_NS);
 +}
 +
 +static int
 +report_fail(const char *what, int rc)
 +{
-+	printf("DOHA EMMC: %s failed: %d int=0x%x\n", what, rc, last_int);
++	printf("DOHA EMMC: %s failed: %d int=0x%x\n", what, rc, em.last_int);
 +	return rc;
++}
++
++/* Sectors from the whole device into the bounce buffer; caller holds the lock. */
++static int
++emmc_read(uint64_t lba, uint32_t sectors)
++{
++	uint32_t *desc = (uint32_t *)(em.dma + DMA_DESC);
++	uint32_t bytes = sectors * SECTOR, chunks = (bytes + ADMA_CHUNK - 1) / ADMA_CHUNK;
++	uint64_t bounce_pa = em.dma_pa + DMA_BOUNCE;
++	uint64_t cards = (uint64_t)em.ext_csd[EXT_CSD_SEC_COUNT / 4];
++
++	if (sectors == 0 || sectors > BOUNCE_SECTORS || lba + sectors > cards) {
++		return EINVAL;
++	}
++	for (uint32_t i = 0; i < chunks; i++) {
++		uint32_t len = (i == chunks - 1) ? bytes - i * ADMA_CHUNK : ADMA_CHUNK;
++
++		desc[2 * i] = (len << 16) | ADMA_VALID_TRAN | (i == chunks - 1 ? ADMA_END : 0);
++		desc[2 * i + 1] = (uint32_t)(bounce_pa + i * ADMA_CHUNK);
++	}
++	clean_dcache64((addr64_t)(em.dma_pa + DMA_DESC), chunks * 8, TRUE);
++	/* Nothing dirty may be evicted over the data the host is about to write. */
++	flush_dcache64((addr64_t)bounce_pa, bytes, TRUE);
++
++	int rc = wait_idle();
++	if (rc) {
++		return rc;
++	}
++	wr32(HC_INT, 0xffffffff);
++	wr32(HC_BLOCK, (sectors << 16) | SECTOR);
++	wr32(HC_ARG, (uint32_t)lba);
++	__builtin_arm_dsb(0xf);         /* SY: descriptors are visible before the command */
++	wr32(HC_XFER_CMD, ((MMC_READ_MULTIPLE << 8 | CMD_R1_DATA) << 16) | XFER_READ_DMA);
++	rc = wait_int(INT_CMD, TIMEOUT_NS);
++	if (!rc) {
++		rc = wait_int(INT_XFER, TIMEOUT_DMA_NS);
++	}
++	if (rc) {
++		printf("DOHA EMMC: read lba %llu n %u failed: %d int=0x%x adma=0x%x\n",
++		    lba, sectors, rc, em.last_int, rd32(HC_ADMA_ERR));
++		return rc;
++	}
++	/* Drop any line the CPU pulled in speculatively during the transfer. */
++	flush_dcache64((addr64_t)bounce_pa, bytes, TRUE);
++	return 0;
 +}
 +
 +static int
@@ -390,8 +485,8 @@ index 0000000..6149689
 +		ocr = rd32(HC_RESP0);
 +		delay(10000);
 +	}
-+	printf("DOHA EMMC: OCR 0x%x\n", ocr);
 +	if (!(ocr & OCR_READY)) {
++		printf("DOHA EMMC: card not ready, OCR 0x%x\n", ocr);
 +		return ETIMEDOUT;
 +	}
 +
@@ -448,27 +543,26 @@ index 0000000..6149689
 +static int
 +go_fast(void)
 +{
-+	int rc = read_data(MMC_READ_EXT_CSD, 0);
++	int rc = read_ext_csd();
 +
 +	if (rc) {
 +		return report_fail("EXT_CSD", rc);
 +	}
-+	if (byte_at(EXT_CSD_PART_CONFIG) & 7) {
++	if (ext_csd_byte(EXT_CSD_PART_CONFIG) & 7) {
 +		printf("DOHA EMMC: not on the user area\n");
 +		return EIO;
 +	}
-+	if (!(byte_at(EXT_CSD_DEVICE_TYPE) & DEVICE_TYPE_HS_52)) {
-+		printf("DOHA EMMC: no HS52, type=0x%x\n", byte_at(EXT_CSD_DEVICE_TYPE));
++	if (!(ext_csd_byte(EXT_CSD_DEVICE_TYPE) & DEVICE_TYPE_HS_52)) {
++		printf("DOHA EMMC: no HS52, type=0x%x\n", ext_csd_byte(EXT_CSD_DEVICE_TYPE));
 +		return ENOTSUP;
 +	}
-+	printf("DOHA EMMC: %u sectors\n", sec[EXT_CSD_SEC_COUNT / 4]);
 +
 +	rc = mmc_switch(EXT_CSD_BUS_WIDTH, BUS_WIDTH_8);
 +	if (rc) {
 +		return rc;
 +	}
 +	wr8(HC_CTRL1, rd8(HC_CTRL1) | CTRL1_8BIT);
-+	rc = read_data(MMC_READ_EXT_CSD, 0);
++	rc = read_ext_csd();
 +	if (rc) {
 +		return report_fail("8-bit read", rc);
 +	}
@@ -491,122 +585,406 @@ index 0000000..6149689
 +	wr16(HC_CLOCK, rd16(HC_CLOCK) | CLOCK_SD_ON);
 +	delay(1000);
 +
-+	rc = read_data(MMC_READ_EXT_CSD, 0);
++	rc = read_ext_csd();
 +	if (rc) {
 +		return report_fail("HS read", rc);
 +	}
-+	printf("DOHA EMMC: 8-bit HS 50 MHz, width=%u hs=%u\n",
-+	    byte_at(EXT_CSD_BUS_WIDTH), byte_at(EXT_CSD_HS_TIMING));
++	printf("DOHA EMMC: 8-bit HS 50 MHz, %u sectors, width=%u hs=%u\n",
++	    em.ext_csd[EXT_CSD_SEC_COUNT / 4], ext_csd_byte(EXT_CSD_BUS_WIDTH),
++	    ext_csd_byte(EXT_CSD_HS_TIMING));
++
++	wr8(HC_CTRL1, (rd8(HC_CTRL1) & (uint8_t)~CTRL1_DMA_MASK) | CTRL1_ADMA2_32);
++	wr32(HC_ADMA_ADDR, (uint32_t)(em.dma_pa + DMA_DESC));
++	wr32(HC_ADMA_ADDR_HI, 0);
++	return 0;
++}
++
++/* Bounds of a GPT partition, in sectors; caller holds the lock. */
++static int
++find_partition(const char *want, uint64_t *first, uint64_t *count)
++{
++	const uint8_t *b = (const uint8_t *)(em.dma + DMA_BOUNCE);
++	int rc = emmc_read(1, 1);
++
++	if (rc) {
++		return rc;
++	}
++	if (memcmp(b, "EFI PART", 8) != 0) {
++		printf("DOHA EMMC: no GPT at LBA 1\n");
++		return ENXIO;
++	}
++	uint64_t entry_lba;
++	uint32_t nent, esz;
++	memcpy(&entry_lba, b + 72, 8);
++	memcpy(&nent, b + 80, 4);
++	memcpy(&esz, b + 84, 4);
++	if (esz != GPT_ENTRY_SIZE || nent == 0 || nent > GPT_MAX_ENTRIES) {
++		printf("DOHA EMMC: unsupported GPT entries %u x %u\n", nent, esz);
++		return ENXIO;
++	}
++	rc = emmc_read(entry_lba, (nent * esz + SECTOR - 1) / SECTOR);
++	if (rc) {
++		return rc;
++	}
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = b + i * esz;
++		char name[37];
++		unsigned c;
++
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		if (strcmp(name, want) != 0) {
++			continue;
++		}
++		uint64_t lo, hi;
++		memcpy(&lo, e + 32, 8);
++		memcpy(&hi, e + 40, 8);
++		if (hi < lo) {
++			return ENXIO;
++		}
++		*first = lo;
++		*count = hi - lo + 1;
++		printf("DOHA EMMC: p%u %s LBA %llu..%llu\n", i + 1, name, lo, hi);
++		return 0;
++	}
++	printf("DOHA EMMC: no GPT partition named \"%s\"\n", want);
++	return ENOENT;
++}
++
++/* Host, card and the DMA memory, once; caller holds the lock. */
++static int
++host_up(void)
++{
++	if (em.host_up) {
++		return 0;
++	}
++	em.hc = ml_io_map(HC_PA, HC_SIZE);
++	em.gcc = ml_io_map(GCC_SDCC1_PA, GCC_SDCC1_SIZE);
++	if (!em.hc || !em.gcc) {
++		printf("DOHA EMMC: cannot map registers\n");
++		return ENXIO;
++	}
++	if (kmem_alloc_contig(kernel_map, &em.dma, DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("DOHA EMMC: no contiguous DMA memory\n");
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)em.dma);
++	if (!pn) {
++		return ENOMEM;
++	}
++	em.dma_pa = ptoa_64(pn);
++	/* ADMA2 descriptors here are 32-bit. */
++	if (em.dma_pa + DMA_SIZE > (1ull << 32)) {
++		printf("DOHA EMMC: DMA memory at 0x%llx is above 4 GiB\n", em.dma_pa);
++		return ENXIO;
++	}
++	printf("DOHA EMMC: read only; ver=0x%x, DMA at 0x%llx\n", rd16(HC_VERSION), em.dma_pa);
++
++	int rc = host_init();
++	if (!rc) {
++		rc = card_init();
++	}
++	if (!rc) {
++		rc = go_fast();
++	}
++	if (!rc) {
++		em.host_up = true;
++	}
++	return rc;
++}
++
++static int
++doha_emmc_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++{
++	if (!em.ready) {
++		return ENXIO;
++	}
++	return (flags & FWRITE) ? EROFS : 0;
++}
++
++static int
++doha_emmc_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
 +	return 0;
 +}
 +
 +static void
-+speed_test(uint32_t lba)
++doha_emmc_strategy(buf_t bp)
 +{
-+	uint64_t start = mach_absolute_time(), ns;
-+	uint32_t sum = 0;
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * em.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t part_bytes = em.nsectors * SECTOR;
 +
-+	for (uint32_t s = 0; s < SPEED_TEST_SECTORS; s++) {
-+		int rc = read_data(MMC_READ_BLOCK, lba + s);
-+		if (rc) {
-+			report_fail("speed test", rc);
-+			return;
-+		}
-+		for (unsigned i = 0; i < SECTOR / 4; i++) {
-+			sum += sec[i];
-+		}
++	buf_setresid(bp, count);
++	if (!(buf_flags(bp) & B_READ)) {
++		error = EROFS;
++		goto done;
 +	}
-+	absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
-+	printf("DOHA EMMC: 1 MiB of boot_a in %llu ms, sum32 0x%x\n", ns / NSEC_PER_MSEC, sum);
++	if (off > part_bytes || count > part_bytes - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++
++	lck_mtx_lock(&doha_emmc_lock);
++	for (uint32_t done = 0; done < count;) {
++		uint64_t pos = off + done;
++		uint32_t skip = (uint32_t)(pos % SECTOR);
++		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
++		uint32_t sectors = (skip + want + SECTOR - 1) / SECTOR;
++
++		error = emmc_read(em.first_lba + pos / SECTOR, sectors);
++		if (error) {
++			break;
++		}
++		memcpy(vaddr + done, (const char *)(em.dma + DMA_BOUNCE) + skip, want);
++		done += want;
++		buf_setresid(bp, count - done);
++	}
++	lck_mtx_unlock(&doha_emmc_lock);
++	buf_unmap(bp);
++
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
 +}
 +
-+static void
-+list_gpt(void)
++static int
++doha_emmc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    __unused struct proc *p, int is_char)
 +{
-+	uint32_t boot_lba = 0, used = 0;
-+	int rc = read_data(MMC_READ_BLOCK, 1);
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
 +
-+	if (rc) {
-+		report_fail("LBA 1", rc);
-+		return;
-+	}
-+	if (sec[0] != 0x20494645 || sec[1] != 0x54524150) {     /* "EFI PART" */
-+		printf("DOHA EMMC: no GPT at LBA 1: 0x%x 0x%x\n", sec[0], sec[1]);
-+		return;
-+	}
-+	uint32_t entries_lba = sec[72 / 4], count = sec[80 / 4], size = sec[84 / 4];
-+	printf("DOHA EMMC: GPT entries at LBA %u, %u of %u bytes\n", entries_lba, count, size);
-+	if (size != GPT_ENTRY_SIZE || count > GPT_MAX_ENTRIES) {
-+		return;
-+	}
-+	for (uint32_t i = 0; i < count; i++) {
-+		unsigned entry = (i % (SECTOR / GPT_ENTRY_SIZE)) * GPT_ENTRY_SIZE;
-+		char name[37];
-+
-+		if (entry == 0) {
-+			rc = read_data(MMC_READ_BLOCK, entries_lba + i / (SECTOR / GPT_ENTRY_SIZE));
-+			if (rc) {
-+				report_fail("GPT entries", rc);
-+				return;
-+			}
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*f = em.secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (is_char) {
++			return ENODEV;
 +		}
-+		if (!sec[entry / 4] && !sec[entry / 4 + 1]) {   /* type GUID not in use */
-+			continue;
++		if (*f < DEV_BSIZE || *f > PHYS_BLOCK || (*f & (*f - 1))) {
++			return EINVAL;
 +		}
-+		used++;
-+		for (unsigned c = 0; c < 36; c++) {
-+			name[c] = (char)byte_at(entry + 56 + 2 * c);
-+		}
-+		name[36] = 0;
-+		if (strcmp(name, "boot_a") == 0) {
-+			boot_lba = sec[(entry + 32) / 4];
-+		}
-+		if (strcmp(name, "boot_a") == 0 || strcmp(name, "persist") == 0 ||
-+		    strcmp(name, "userdata") == 0) {
-+			printf("DOHA EMMC: p%u %s LBA %u..%u\n", i + 1, name,
-+			    sec[(entry + 32) / 4], sec[(entry + 40) / 4]);
-+		}
-+	}
-+	printf("DOHA EMMC: %u partitions\n", used);
-+	if (boot_lba) {
-+		speed_test(boot_lba);
++		em.secsize = *f;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = SECTOR;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = em.nsectors * SECTOR / em.secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = 0;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE:
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*o = BOUNCE_SIZE / em.secsize;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	default:
++		return ENOTTY;
 +	}
 +}
 +
++static int
++doha_emmc_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return doha_emmc_ioctl(dev, cmd, data, flag, p, 0);
++}
++
++static int
++doha_emmc_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return doha_emmc_ioctl(dev, cmd, data, flag, p, 1);
++}
++
++static int
++doha_emmc_psize(__unused dev_t dev)
++{
++	return em.ready ? (int)MIN(em.nsectors * SECTOR / em.secsize, INT_MAX) : -1;
++}
++
++static int
++doha_emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(doha_emmc_strategy, NULL, dev, B_READ, minphys, uio, (int)em.secsize);
++}
++
++static int
++doha_emmc_write(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag)
++{
++	return EROFS;
++}
++
++static const struct bdevsw doha_emmc_bdevsw = {
++	.d_open     = doha_emmc_open,
++	.d_close    = doha_emmc_close,
++	.d_strategy = doha_emmc_strategy,
++	.d_ioctl    = doha_emmc_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = doha_emmc_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw doha_emmc_cdevsw = {
++	.d_open       = doha_emmc_open,
++	.d_close      = doha_emmc_close,
++	.d_read       = doha_emmc_read,
++	.d_write      = doha_emmc_write,
++	.d_ioctl      = doha_emmc_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++static int
++doha_emmc_init(void)
++{
++	char want[64] = "userdata";
++	int error;
++
++	PE_parse_boot_argn("emmcroot", want, sizeof(want));
++	lck_mtx_lock(&doha_emmc_lock);
++	error = host_up();
++	if (!error) {
++		error = find_partition(want, &em.first_lba, &em.nsectors);
++	}
++	lck_mtx_unlock(&doha_emmc_lock);
++	if (error) {
++		return error;
++	}
++
++	em.secsize = DEV_BSIZE;
++	em.bmajor = bdevsw_add(-1, &doha_emmc_bdevsw);
++	if (em.bmajor < 0) {
++		return ENXIO;
++	}
++	em.cmajor = cdevsw_add_with_bdev(-1, &doha_emmc_cdevsw, em.bmajor);
++	if (em.cmajor < 0) {
++		return ENXIO;
++	}
++	em.bdev = makedev(em.bmajor, 0);
++	devfs_make_node(em.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "emmcroot0");
++	devfs_make_node(makedev(em.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "remmcroot0");
++	em.ready = true;
++	printf("DOHA EMMC: \"%s\" is emmcroot0, %llu MiB, read-only\n", want, em.nsectors / 2048);
++	return 0;
++}
++
++/* boot-arg emmcprobe=1: the first 16 MiB of boot_a, to compare with a backup. */
 +void doha_emmc_probe(void);
 +void
 +doha_emmc_probe(void)
 +{
-+	hc = ml_io_map(HC_PA, HC_SIZE);
-+	gcc = ml_io_map(GCC_SDCC1_PA, GCC_SDCC1_SIZE);
-+	if (!hc || !gcc) {
-+		printf("DOHA EMMC: cannot map registers\n");
++	uint64_t first = 0, count = 0, ns;
++	uint32_t sum = 0;
++
++	lck_mtx_lock(&doha_emmc_lock);
++	int rc = host_up();
++	if (!rc) {
++		rc = find_partition("boot_a", &first, &count);
++	}
++	uint64_t start = mach_absolute_time(), busy = 0;
++	for (uint32_t s = 0; !rc && s < PROBE_BYTES / SECTOR; s += BOUNCE_SECTORS) {
++		uint64_t t = mach_absolute_time();
++		rc = emmc_read(first + s, BOUNCE_SECTORS);
++		busy += mach_absolute_time() - t;
++		const uint32_t *w = (const uint32_t *)(em.dma + DMA_BOUNCE);
++		for (uint32_t i = 0; !rc && i < BOUNCE_SIZE / 4; i++) {
++			sum += w[i];
++		}
++	}
++	lck_mtx_unlock(&doha_emmc_lock);
++	if (rc) {
++		printf("DOHA EMMC: probe failed: %d\n", rc);
 +		return;
 +	}
-+	printf("DOHA EMMC: probe, no writes; ver=0x%x clk=0x%x\n", rd16(0xfe), rd32(HC_CLOCK));
-+	if (host_init() || card_init() || go_fast()) {
-+		return;
++	absolutetime_to_nanoseconds(busy, &ns);
++	printf("DOHA EMMC: 16 MiB of boot_a: %llu ms in reads, sum32 0x%x\n", ns / NSEC_PER_MSEC, sum);
++	absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
++	printf("DOHA EMMC: with the sum, %llu ms\n", ns / NSEC_PER_MSEC);
++}
++
++/* Root device for rd=emmcroot0 (IOFindBSDRoot). */
++int doha_emmc_rootdev(dev_t *dev);
++
++int
++doha_emmc_rootdev(dev_t *dev)
++{
++	if (!em.ready) {
++		int error = doha_emmc_init();
++		if (error) {
++			return error;
++		}
 +	}
-+	list_gpt();
++	*dev = em.bdev;
++	return 0;
 +}
 +#endif /* ARM64_BOARD_CONFIG_DOHA */
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
-index 5175bb3..43e89f8 100644
+index 5175bb3..e6bf80b 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -828,6 +828,18 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+@@ -828,6 +828,32 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  	}
  #endif
  
 +#if defined(ARM64_BOARD_CONFIG_DOHA)
++//
++//	DOHA: read-only eMMC (bsd/dev/doha_emmc.c)
++//
 +	{
-+		/* Read-only eMMC bring-up (bsd/dev/doha_emmc.c); no root device yet. */
 +		uint32_t emmcprobe = 0;
 +		PE_parse_boot_argn("emmcprobe", &emmcprobe, sizeof(emmcprobe));
 +		if (emmcprobe == 1) {
 +			extern void doha_emmc_probe(void);
 +			doha_emmc_probe();
 +		}
++	}
++	if (strcmp(rdBootVar, "emmcroot0") == 0) {
++		extern int doha_emmc_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int emmc_error = doha_emmc_rootdev(root);
++		if (emmc_error) {
++			panic("IOFindBSDRoot: DOHA eMMC root %s unavailable: %d", rdBootVar, emmc_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
 +	}
 +#endif
 +
