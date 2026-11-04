@@ -150,5 +150,14 @@ Boot 6 (`shim/sdhci.c`, inicialização completa, sem comando de escrita):
 - Partições, batendo com o Linux: `persist` p46 LBA `104200`, `boot_a` p53 LBA `12c700`,
   `userdata` p80 LBA `1118000`.
 
-`BOOT_A magic MISMATCH` no boot 6 veio de um erro meu na constante de `OID!`, ou de uma leitura
-errada: corrigido e com os valores impressos, a confirmar no próximo boot.
+`BOOT_A magic MISMATCH` no boot 6 veio de um erro na constante de `OID!`, não da leitura.
+
+Boot 7 confirma, com a constante corrigida: `ANDROID! magic OK`, `w0=52444e41`, `w1=2144494f`,
+`w2=00d7e5f1`. São os mesmos 3 primeiros valores do backup `boot_a.img`, incluindo o tamanho do
+kernel, então a leitura de dados pelo eMMC está certa. Só o início de um setor foi comparado.
+
+Próximo:
+1. Velocidade: `CMD6` para largura de barramento e HS, e RCG mais rápido (400 kHz, 1 bit dá uns
+   50 KB/s). O `CMD6` altera campos de modo do EXT_CSD, não os dados da flash.
+2. Driver no XNU, só leitura, listando a GPT, e tirar o `0401`.
+3. Raiz em `userdata`: apaga o LineageOS; confirmar antes.
