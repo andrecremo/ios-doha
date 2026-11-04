@@ -34,7 +34,8 @@ port do Galaxy S7 confirma o problema e mostra a solução:
 | `0257-commpage-text-16k-aligned` | Alinha o commpage a 16K dentro de páginas de 4K |
 | `0242-pmap-sync-page-attributes-above-4g` | Corrige truncamento de endereço físico acima de 4 GiB |
 
-O A73 também é ARMv8.0 (sem LSE, sem PAN, sem 16K), então a mesma série deve servir para os dois
+O A73 também é ARMv8.0 (sem LSE, sem PAN). **Correção de 2026-11-04:** "sem 16K" só foi medido no
+núcleo Silver; o ios-topaz relata 16K nos Gold, e isso falta medir no doha. A mesma série deve servir para os dois
 clusters do doha. Isso ainda precisa ser confirmado no aparelho.
 
 **Estratégia:** partir da branch `herolte` (que já contém a série do sweet + ARMv8.0) e trazer de
@@ -217,3 +218,33 @@ Formatar os dados pelo recovery, se a etapa 1 confirmar que dá. Fotos e apps n�
 Um aparelho usável. Depois da etapa 5 ainda faltam mais de um núcleo, tela pelo backboardd, toque, botões,
 bateria e rede. No S7, com um só núcleo A53, o primeiro frame não terminava, e a tela inicial veio com GPU
 Mali por Panfrost. O doha tem Adreno 610, sem esse trabalho pronto.
+
+## ios-topaz: o parente mais próximo (lido em 2026-11-04, nada testado no doha)
+
+[MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz): iOS 16 no Redmi Note 12 4G, SM6225. O README
+relata tela inicial, toque, botões e Wi-Fi, com a GPU em andamento e a tela inicial já desenhada por ela.
+[HackiOS](https://github.com/oosexgang/hackios-xnu-kernel) é a origem de boa parte da GPU, em outro aparelho.
+
+| Item | topaz | doha | Consequência |
+|---|---|---|---|
+| Núcleos | Kryo 260, Silver `0x0-3`, Gold `0x100-3` | Igual | Mesma topologia |
+| GIC, framebuffer, PS_HOLD, IMEM | `0xf200000`, `0x5c000000`, `0x440b000`, `0xc12565c` | Iguais | Mapa de hardware muito parecido |
+| Armazenamento | UFS em `0x4804000` | eMMC (nosso driver) | O nosso continua necessário |
+| RAM | 4 GiB em `0x1_40000000` | Até `0x13fffffff` | `--highmem` não se aplica |
+| Tela | 1080x2400 com DSC | 1080x2280; falta ver se usa DSC | Scanout direto precisa de revisão |
+| GPU | Adreno 610, sem GMU | Adreno 610 pelas especificações; falta confirmar no aparelho | Clocks e energia a conferir |
+
+O que muda no plano:
+
+1. **Medir `MMFR0` nos Gold.** Se tiver 16K, podemos rodar com 16K nativo nos 4 Gold, como o topaz, em vez de
+   16K de VM sobre 4K. O topaz deixa os Silver parados; suas 0140 e 0141 são o experimento com 8 núcleos.
+2. **Emulação de LSE e `ldapr` no modo usuário** (0081): o userland do iPhone X usa essas instruções, e o
+   ARMv8.0 não tem. Conferir o que a série herolte já cobre.
+3. **`fastboot -S 512M flash userdata` com imagem sparse** é como o topaz grava. Nossa recusa foi com imagem
+   raw no `system_b`; testar sparse no `system_b` antes de depender do recovery.
+4. **GPU:** kernel `TopazAdreno` e `RedwoodGPU`, Mesa freedreno no modo usuário. Firmware (`a610_zap`,
+   `a630_sqe`) do `/vendor/firmware` do próprio aparelho, fora do repositório. Memória visível pela GPU abaixo de 4 GiB.
+
+Licenças: o GitHub não detecta licença no ios-topaz nem no topaz-woa. O `CREDITS.md` diz que as partes
+derivadas do HackiOS são APSL 2.0 (kernel) e MIT (modo usuário). O resto do topaz serve só para leitura, sem
+copiar: 0080 a 0152 são escritos de novo aqui. Conferir o HackiOS na fonte antes de reutilizar.
