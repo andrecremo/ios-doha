@@ -364,3 +364,35 @@ Depois:
 1. Montar o volume com escrita, criar um arquivo a partir do programa de usuário e conferir depois de
    reiniciar. Cobre a persistência e o caminho do sistema de arquivos.
 2. Raiz em `userdata`, que precisa de confirmação e de outro caminho de gravação sem o LineageOS.
+
+## 2026-11-04: sistema de arquivos grava no eMMC e os dados sobrevivem ao reinício
+
+`rootrw=1` não existe neste kernel: em 0031 o código é só para `ARM64_BOARD_CONFIG_SWEET`, e DOHA não
+define isso. O caminho usado é `mount -uw /` a partir do processo 1, como o launchd faz. O `data` não
+pode ser NULL (`hfs_assert`): caminho do dispositivo e `hfs_mount_args` com tudo em VNOVAL.
+
+Mesmo kernel `4232c073de6db08a…`, `emmcwrite=system_b`, volume `382b00924e0ec625…`, gravado com
+`dd conv=notrunc,fsync`. Lido das fotos:
+
+    boot 1: root is read-write; previous count 00; wrote count 01; panic exit status 42
+    boot 2: root is read-write; previous count 01; 2 MiB from the previous boot ok; wrote count 02;
+            panic exit status 42
+
+Status 42 também diz que `mount -ur /` passou. Entre os boots houve reinício por botões. `Calendar - Boot`
+= 15 s, os 3 ticks. `vnode_create_internal: alias vnode ... state of change` aparece no `mount -uw`; não
+investigado, sem efeito visível.
+
+Conferência pelo LineageOS, depois dos dois boots:
+- Volume: `c13bc9ecc53a8218` (mudou, como esperado), assinatura `HX`, marcado limpo.
+- `fsck_hfs -n -f` em uma cópia: "The volume DOHATEST appears to be OK".
+- `DOHA-COUNT 02` e os 2 MiB do boot 2 estão no volume, lidos pelo Linux, fora do nosso driver.
+- Iguais aos de antes: `system_a`, trecho final do `system_b` (zeros), `boot_a/b`, `dtbo_a/b`,
+  `vbmeta_a/b`, primeiro 1 MiB do eMMC. `userdata`, `persist` e modem não são comparáveis por hash.
+
+Milestone 3 cumprido: leitura e escrita pelo sistema de arquivos, limitadas a uma partição.
+
+Em aberto: causa dos zeros no `system_b`; recusa de `doha-xnu-guard.img`, sem resultado informado; `fork`,
+`spawn`, dyld; assinatura de código ligada; SMP.
+
+Depois: raiz do iOS. Antes de apagar qualquer coisa, falta decidir como gravar o `userdata` sem ele estar
+montado e onde montar o volume, porque o IPSW não pode passar pelo CI público.
