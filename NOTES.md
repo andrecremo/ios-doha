@@ -274,8 +274,42 @@ de montagem. `handshake structure not initialized`, na mesma tela, não foi inve
 
 Milestone 3: leitura e montagem de raiz HFS read-only cumpridas. Escrita ainda não testada.
 
+O boot 17 confirmou a montagem com a linha `hfs: mounted DOHATEST on device b(1, 0)`.
+
+## 2026-11-04, boot 17: primeiro processo de usuário
+
+`userland/init.S` como `/sbin/launchd` em um volume HFSX de 64 MiB sem journal, gerado pelo CI
+(`rootfs.yml`; sha256 `bcdaf42cd28a0d26…`) e gravado em `system_b` com `dd`.
+`doha-xnu-init.img`: mesmo kernel `b8d99f33c55c0e39…`, mais `cs_enforcement_disable=1`. O CI ficou
+sem máquina `macos-15-intel` duas vezes, então este workflow usa `macos-15`.
+
+Lido das fotos:
+
+    hfs: mounted DOHATEST on device b(1, 0)
+    A5XELTE: root volume is not authenticated (error 25); continuing unsealed
+    load_init_program: attempting to load /sbin/launchd
+    *** DOHA userspace: init running, PID 01 ***
+    DOHA init: tick 01 ... tick 10
+    panic: initproc failed to start -- no exit reason available -- (signal 0, exit status 42)
+
+Funcionaram no aparelho: exec de um Mach-O lido do eMMC, entrada em EL0, syscalls, devfs,
+`/dev/console` e `select` com timer. `exit status 42` só existe depois do último tick. O relógio do
+panic dá `Calendar - Boot` = 0x5a - 0x1e = 60 s, igual aos 12 ticks de 5 s. As fotos mostram até o
+tick 10; os ticks 11 e 12 são dedução do status.
+
+`initproc failed to start` não indica erro aqui: o XNU usa esse texto enquanto `kern.initproc_spawned`
+é 0, e quem liga esse sysctl é o launchd de verdade.
+
+`EXIT init[1] xstat 0` vem do printf do patch 0261 em `proc_exit`. O exec encerra a tarefa antiga
+(`kern_exec.c`, `task_terminate_internal(old_task)`), então é o `init` do kernel sendo trocado pelo
+launchd. Combina com o código, mas a linha aparece duas vezes e não sei por quê.
+
+Não testado: assinatura de código ligada (o boot usa `cs_enforcement_disable=1`), `fork`/`spawn`,
+dyld, e qualquer escrita.
+
+O `system_b` continua com o volume de teste e o slot `_b` não inicia até a restauração.
+
 Depois:
-1. Volume de teste com um `/sbin/launchd` mínimo nosso, para o primeiro processo de usuário. Não
-   precisa do caminho de escrita.
-2. Caminho de escrita limitado à partição escolhida (`CMD25`).
-3. Raiz em `userdata`: apaga o LineageOS; confirmar antes.
+1. Caminho de escrita limitado à partição escolhida (`CMD25`), testado em `system_b`. Comando novo
+   no eMMC: confirmar antes.
+2. Raiz em `userdata`, porque o `system_b` tem só 3 GiB: apaga o LineageOS; confirmar antes.
