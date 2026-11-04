@@ -156,8 +156,15 @@ Boot 7 confirma, com a constante corrigida: `ANDROID! magic OK`, `w0=52444e41`, 
 `w2=00d7e5f1`. São os mesmos 3 primeiros valores do backup `boot_a.img`, incluindo o tamanho do
 kernel, então a leitura de dados pelo eMMC está certa. Só o início de um setor foi comparado.
 
+## 2026-11-03, boot 8: eMMC em 8 bits e HS a 50 MHz
+
+`CMD6` em `BUS_WIDTH`=2 e `HS_TIMING`=1, ambos com `r1=900` (sem erro de switch). RCG
+`cfg=20b`. Depois de cada etapa, o EXT_CSD relido mostra os valores novos e `sec=0747c000`.
+
+1 MiB do início do `boot_a`, um `CMD17` por setor, em PIO e com MMU desligado: `ms=1f0` (496 ms,
+~2 MiB/s). Soma de 32 bits `fa62bcb9`, igual à do `boot_a.img`.
+
 Próximo:
-1. Velocidade: `CMD6` para largura de barramento e HS, e RCG mais rápido (400 kHz, 1 bit dá uns
-   50 KB/s). O `CMD6` altera campos de modo do EXT_CSD, não os dados da flash.
-2. Driver no XNU, só leitura, listando a GPT, e tirar o `0401`.
+1. Driver no XNU, só leitura, listando a GPT, e tirar o `0401`.
+2. Desempenho: `CMD18` e ADMA2 (o SMMU pode exigir o mesmo cuidado que no USB dos forks).
 3. Raiz em `userdata`: apaga o LineageOS; confirmar antes.

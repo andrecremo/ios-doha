@@ -1,0 +1,615 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index a16d8e0..ef521e3 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,7 @@ bsd/dev/random/randomdev.c		standard
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/a5xelte_emmc.c			standard
++bsd/dev/doha_emmc.c			standard
+ bsd/dev/herolte_ufs.c			standard
+ bsd/dev/herolte_touch.c			standard
+ bsd/dev/herolte_battery.c		standard
+diff --git a/bsd/dev/doha_emmc.c b/bsd/dev/doha_emmc.c
+new file mode 100755
+index 0000000..6149689
+--- /dev/null
++++ b/bsd/dev/doha_emmc.c
+@@ -0,0 +1,574 @@
++/*
++ * DOHA eMMC probe: sdhci@4744000 (qcom,sdhci-msm-v5), PIO, polled.
++ *
++ * The sequence was proven on the phone by shim/sdhci.c (NOTES.md, boots 5-8).
++ * ABL leaves the host reset: set the GCC root clock to 400 kHz, power the bus
++ * with the MSM power-switch acknowledgement, select 1.8 V pads, identify the
++ * card, then go to 8-bit HS at 50 MHz. PIO uses no DMA, so no SMMU.
++ *
++ * No data is ever written. The only commands sent are CMD0, CMD1, CMD2, CMD3
++ * and CMD7 (reset and select the card), CMD13 (status), CMD8 (read EXT_CSD),
++ * CMD17 (read one block) and CMD6, only for the two mode fields BUS_WIDTH and
++ * HS_TIMING of EXT_CSD. No CMD24, CMD25.
++ *
++ * Boot-arg emmcprobe=1 runs it from IOFindBSDRoot. No block device yet.
++ */
++#if defined(ARM64_BOARD_CONFIG_DOHA)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define HC_PA                   0x04744000UL
++#define HC_SIZE                 0x1000
++#define HC_BLOCK                0x04    /* size (16), count (16) */
++#define HC_ARG                  0x08
++#define HC_XFER_CMD             0x0c    /* transfer mode (16), command (16) */
++#define HC_RESP0                0x10
++#define HC_DATA                 0x20
++#define HC_PRESENT              0x24
++#define HC_CTRL1                0x28
++#define HC_POWER                0x29
++#define HC_CLOCK                0x2c    /* clock (16), timeout (8), software reset (8) */
++#define HC_TIMEOUT              0x2e
++#define HC_RESET                0x2f
++#define HC_INT                  0x30    /* normal (16), error (16); write 1 to clear */
++#define HC_INT_EN               0x34
++#define HC_SIG_EN               0x38
++#define HC_CTRL2_HI             0x3e
++
++/* sdhci_msm_v5_offset */
++#define MSM_DLL_CONFIG          0x200
++#define DLL_PDN                 (1u << 29)
++#define DLL_RST                 (1u << 30)
++#define MSM_VENDOR_SPEC         0x20c
++#define MSM_PWRCTL_STATUS       0x240
++#define MSM_PWRCTL_CLEAR        0x248
++#define MSM_PWRCTL_CTL          0x24c
++#define PWRCTL_BUS_SUCCESS      (1u << 0)
++#define PWRCTL_IO_SUCCESS       (1u << 2)
++#define VENDOR_IO_PAD_EN        (1u << 15)
++#define VENDOR_IO_PAD_1V8       (1u << 16)
++
++/* gcc-sm6125: gcc_sdcc1_apps_clk_src and branches, in one 4 KiB page */
++#define GCC_SDCC1_PA            0x01438000UL
++#define GCC_SDCC1_SIZE          0x1000
++#define GCC_APPS_CBCR           0x004
++#define GCC_AHB_CBCR            0x008
++#define GCC_RCG_CMD             0x028
++#define GCC_RCG_CFG             0x02c
++#define GCC_RCG_M               0x030
++#define GCC_RCG_N               0x034
++#define GCC_RCG_D               0x038
++#define CBCR_OFF                (1u << 31)
++#define RCG_UPDATE              (1u << 0)
++#define RCG_CFG_400K            ((23u << 0) | (0u << 8) | (2u << 12))   /* TCXO / 12, M/N 1/4 */
++#define RCG_CFG_50M             ((11u << 0) | (2u << 8))                /* GPLL0_OUT_AUX2 / 6 */
++
++#define PRESENT_INHIBIT         0x3     /* command and data lines */
++#define CLOCK_SD_ON             (1u << 2)
++#define POWER_ON_3V0            0x0d    /* bus on, 3.0 V: vdd is 2.95 V */
++#define CTRL2_1V8               (1u << 3)
++#define CTRL1_HS                (1u << 2)
++#define CTRL1_8BIT              (1u << 5)
++#define RESET_CMD_DAT           0x6
++#define INT_CMD                 (1u << 0)
++#define INT_XFER                (1u << 1)
++#define INT_BUF_RD              (1u << 5)
++#define INT_ERR                 (1u << 15)
++
++/* Command register: index << 8 | data present | index check | CRC check | response */
++#define CMD_NONE                0x00
++#define CMD_R1                  0x1a
++#define CMD_R1B                 0x1b
++#define CMD_R1_DATA             0x3a
++#define CMD_R2                  0x09
++#define CMD_R3                  0x02
++#define XFER_READ_ONE           ((1u << 4) | (1u << 1))  /* card to host, count enable, no DMA */
++
++#define MMC_GO_IDLE             0
++#define MMC_SEND_OP_COND        1
++#define MMC_ALL_SEND_CID        2
++#define MMC_SET_RCA             3
++#define MMC_SWITCH              6
++#define MMC_SELECT              7
++#define MMC_READ_EXT_CSD        8
++#define MMC_STATUS              13
++#define MMC_READ_BLOCK          17
++#define MMC_STATE_TRAN          4
++#define OCR_SECTOR_DUAL         0x40ff8080      /* sector addressing, 1.8 V and 2.7-3.6 V */
++#define OCR_READY               (1u << 31)
++#define CARD_RCA                1
++#define R1_SWITCH_ERROR         (1u << 7)
++
++#define EXT_CSD_PART_CONFIG     179
++#define EXT_CSD_BUS_WIDTH       183
++#define EXT_CSD_HS_TIMING       185
++#define EXT_CSD_DEVICE_TYPE     196
++#define EXT_CSD_SEC_COUNT       212
++#define BUS_WIDTH_8             2
++#define HS_TIMING_HS            1
++#define DEVICE_TYPE_HS_52       (1u << 1)
++
++#define SECTOR                  512u
++#define GPT_ENTRY_SIZE          128u
++#define GPT_MAX_ENTRIES         128u
++#define TIMEOUT_NS              (1000ull * NSEC_PER_MSEC)
++#define SPEED_TEST_SECTORS      2048u   /* 1 MiB */
++
++static vm_offset_t hc, gcc;
++static uint32_t sec[SECTOR / 4];
++static uint32_t last_int;
++
++static inline uint32_t
++rd32(unsigned r)
++{
++	return *(volatile uint32_t *)(hc + r);
++}
++
++static inline uint16_t
++rd16(unsigned r)
++{
++	return *(volatile uint16_t *)(hc + r);
++}
++
++static inline uint8_t
++rd8(unsigned r)
++{
++	return *(volatile uint8_t *)(hc + r);
++}
++
++static inline void
++wr32(unsigned r, uint32_t v)
++{
++	*(volatile uint32_t *)(hc + r) = v;
++}
++
++static inline void
++wr16(unsigned r, uint16_t v)
++{
++	*(volatile uint16_t *)(hc + r) = v;
++}
++
++static inline void
++wr8(unsigned r, uint8_t v)
++{
++	*(volatile uint8_t *)(hc + r) = v;
++}
++
++static inline uint32_t
++gcc_rd(unsigned r)
++{
++	return *(volatile uint32_t *)(gcc + r);
++}
++
++static inline void
++gcc_wr(unsigned r, uint32_t v)
++{
++	*(volatile uint32_t *)(gcc + r) = v;
++}
++
++static uint64_t
++deadline_ns(uint64_t ns)
++{
++	uint64_t t;
++
++	nanoseconds_to_absolutetime(ns, &t);
++	return mach_absolute_time() + t;
++}
++
++static uint8_t
++byte_at(unsigned off)
++{
++	return ((const uint8_t *)sec)[off];
++}
++
++static void
++reset_lines(void)
++{
++	uint64_t end = deadline_ns(TIMEOUT_NS);
++
++	wr8(HC_RESET, RESET_CMD_DAT);
++	while ((rd8(HC_RESET) & RESET_CMD_DAT) && mach_absolute_time() < end) {
++		;
++	}
++	wr32(HC_INT, 0xffffffff);
++}
++
++/* 0 when a bit of mask latched (and acked); EIO on a controller error, ETIMEDOUT otherwise. */
++static int
++wait_int(uint32_t mask)
++{
++	uint64_t end = deadline_ns(TIMEOUT_NS);
++
++	for (;;) {
++		uint32_t st = rd32(HC_INT);
++		if (st & INT_ERR) {
++			last_int = st;
++			reset_lines();
++			return EIO;
++		}
++		if (st & mask) {
++			wr32(HC_INT, st & mask);
++			return 0;
++		}
++		if (mach_absolute_time() > end) {
++			last_int = st;
++			reset_lines();
++			return ETIMEDOUT;
++		}
++	}
++}
++
++static int
++wait_idle(void)
++{
++	uint64_t end = deadline_ns(TIMEOUT_NS);
++
++	while (rd32(HC_PRESENT) & PRESENT_INHIBIT) {
++		if (mach_absolute_time() > end) {
++			last_int = rd32(HC_PRESENT);
++			reset_lines();
++			return ETIMEDOUT;
++		}
++	}
++	return 0;
++}
++
++static int
++send_cmd(unsigned index, uint32_t arg, unsigned flags, uint32_t xfer)
++{
++	int rc = wait_idle();
++
++	if (rc) {
++		return rc;
++	}
++	wr32(HC_INT, 0xffffffff);
++	if (xfer) {
++		wr32(HC_BLOCK, (1u << 16) | SECTOR);
++	}
++	wr32(HC_ARG, arg);
++	wr32(HC_XFER_CMD, ((index << 8 | flags) << 16) | xfer);
++	return wait_int(INT_CMD);
++}
++
++/* One 512-byte block into sec[]. CMD17 takes a sector address on this card. */
++static int
++read_data(unsigned index, uint32_t arg)
++{
++	int rc = send_cmd(index, arg, CMD_R1_DATA, XFER_READ_ONE);
++
++	if (rc) {
++		return rc;
++	}
++	rc = wait_int(INT_BUF_RD);
++	if (rc) {
++		return rc;
++	}
++	for (unsigned i = 0; i < SECTOR / 4; i++) {
++		sec[i] = rd32(HC_DATA);
++	}
++	return wait_int(INT_XFER);
++}
++
++static int
++report_fail(const char *what, int rc)
++{
++	printf("DOHA EMMC: %s failed: %d int=0x%x\n", what, rc, last_int);
++	return rc;
++}
++
++static int
++rcg_update(void)
++{
++	uint64_t end = deadline_ns(100 * NSEC_PER_MSEC);
++
++	gcc_wr(GCC_RCG_CMD, gcc_rd(GCC_RCG_CMD) | RCG_UPDATE);
++	while (gcc_rd(GCC_RCG_CMD) & RCG_UPDATE) {
++		if (mach_absolute_time() > end) {
++			printf("DOHA EMMC: RCG stuck, cmd=0x%x\n", gcc_rd(GCC_RCG_CMD));
++			return ETIMEDOUT;
++		}
++	}
++	return 0;
++}
++
++/* Linux sdhci_msm_handle_pwr_irq, polled: clear the request and report success. */
++static void
++ack_power(uint32_t ack)
++{
++	uint64_t end = deadline_ns(100 * NSEC_PER_MSEC);
++	uint32_t st;
++
++	while (!(st = rd32(MSM_PWRCTL_STATUS)) && mach_absolute_time() < end) {
++		;
++	}
++	if (st) {
++		wr32(MSM_PWRCTL_CLEAR, st);
++		wr32(MSM_PWRCTL_CTL, ack);
++	}
++}
++
++static int
++host_init(void)
++{
++	/* The SD clock is off while the root clock changes. */
++	wr16(HC_CLOCK, rd16(HC_CLOCK) & (uint16_t)~CLOCK_SD_ON);
++	gcc_wr(GCC_RCG_M, (gcc_rd(GCC_RCG_M) & ~0xffu) | 1);
++	gcc_wr(GCC_RCG_N, (gcc_rd(GCC_RCG_N) & ~0xffu) | (~(4u - 1) & 0xff));
++	gcc_wr(GCC_RCG_D, (gcc_rd(GCC_RCG_D) & ~0xffu) | (~4u & 0xff));
++	gcc_wr(GCC_RCG_CFG, RCG_CFG_400K);
++	int rc = rcg_update();
++	if (rc) {
++		return rc;
++	}
++	for (unsigned r = GCC_APPS_CBCR; r <= GCC_AHB_CBCR; r += 4) {
++		if (gcc_rd(r) & CBCR_OFF) {
++			gcc_wr(r, gcc_rd(r) | 1);
++		}
++	}
++	delay(1000);
++
++	/* Status bits must be enabled to latch; the signal lines stay off (no IRQs). */
++	wr32(HC_SIG_EN, 0);
++	wr32(HC_INT_EN, 0xffffffff);
++	wr32(MSM_VENDOR_SPEC, rd32(MSM_VENDOR_SPEC) | VENDOR_IO_PAD_EN | VENDOR_IO_PAD_1V8);
++
++	wr8(HC_POWER, POWER_ON_3V0);
++	ack_power(PWRCTL_BUS_SUCCESS | PWRCTL_IO_SUCCESS);
++	wr16(HC_CTRL2_HI, CTRL2_1V8);
++	ack_power(PWRCTL_IO_SUCCESS);
++
++	wr8(HC_TIMEOUT, 0xe);
++	wr16(HC_CLOCK, rd16(HC_CLOCK) | CLOCK_SD_ON);
++	delay(2000);    /* at least 74 clocks before the first command */
++	return 0;
++}
++
++static int
++card_init(void)
++{
++	uint32_t ocr = 0;
++	int rc;
++
++	/* No response expected. Back to the power-on default: 1-bit, slow. */
++	rc = send_cmd(MMC_GO_IDLE, 0, CMD_NONE, 0);
++	if (rc) {
++		return report_fail("CMD0", rc);
++	}
++	delay(2000);
++
++	for (unsigned tries = 0; tries < 200 && !(ocr & OCR_READY); tries++) {
++		rc = send_cmd(MMC_SEND_OP_COND, OCR_SECTOR_DUAL, CMD_R3, 0);
++		if (rc) {
++			return report_fail("CMD1", rc);
++		}
++		ocr = rd32(HC_RESP0);
++		delay(10000);
++	}
++	printf("DOHA EMMC: OCR 0x%x\n", ocr);
++	if (!(ocr & OCR_READY)) {
++		return ETIMEDOUT;
++	}
++
++	/* The CID carries the serial number: read it, do not print it. */
++	rc = send_cmd(MMC_ALL_SEND_CID, 0, CMD_R2, 0);
++	if (rc) {
++		return report_fail("CMD2", rc);
++	}
++	rc = send_cmd(MMC_SET_RCA, CARD_RCA << 16, CMD_R1, 0);
++	if (rc) {
++		return report_fail("CMD3", rc);
++	}
++	rc = send_cmd(MMC_SELECT, CARD_RCA << 16, CMD_R1B, 0);
++	if (rc) {
++		return report_fail("CMD7", rc);
++	}
++	rc = send_cmd(MMC_STATUS, CARD_RCA << 16, CMD_R1, 0);
++	if (rc) {
++		return report_fail("CMD13", rc);
++	}
++	uint32_t r1 = rd32(HC_RESP0);
++	if (((r1 >> 9) & 0xf) != MMC_STATE_TRAN) {
++		printf("DOHA EMMC: card not in tran state, r1=0x%x\n", r1);
++		return EIO;
++	}
++	return 0;
++}
++
++/* CMD6, write-byte access to one EXT_CSD mode field; R1b, so wait out the busy. */
++static int
++mmc_switch(unsigned index, unsigned value)
++{
++	int rc = send_cmd(MMC_SWITCH, (3u << 24) | (index << 16) | (value << 8), CMD_R1B, 0);
++
++	if (rc) {
++		return report_fail("CMD6", rc);
++	}
++	rc = wait_idle();
++	if (rc) {
++		return report_fail("CMD6 busy", rc);
++	}
++	rc = send_cmd(MMC_STATUS, CARD_RCA << 16, CMD_R1, 0);
++	if (rc) {
++		return report_fail("CMD6 status", rc);
++	}
++	uint32_t r1 = rd32(HC_RESP0);
++	if (r1 & R1_SWITCH_ERROR) {
++		printf("DOHA EMMC: CMD6 field %u refused, r1=0x%x\n", index, r1);
++		return EIO;
++	}
++	return 0;
++}
++
++static int
++go_fast(void)
++{
++	int rc = read_data(MMC_READ_EXT_CSD, 0);
++
++	if (rc) {
++		return report_fail("EXT_CSD", rc);
++	}
++	if (byte_at(EXT_CSD_PART_CONFIG) & 7) {
++		printf("DOHA EMMC: not on the user area\n");
++		return EIO;
++	}
++	if (!(byte_at(EXT_CSD_DEVICE_TYPE) & DEVICE_TYPE_HS_52)) {
++		printf("DOHA EMMC: no HS52, type=0x%x\n", byte_at(EXT_CSD_DEVICE_TYPE));
++		return ENOTSUP;
++	}
++	printf("DOHA EMMC: %u sectors\n", sec[EXT_CSD_SEC_COUNT / 4]);
++
++	rc = mmc_switch(EXT_CSD_BUS_WIDTH, BUS_WIDTH_8);
++	if (rc) {
++		return rc;
++	}
++	wr8(HC_CTRL1, rd8(HC_CTRL1) | CTRL1_8BIT);
++	rc = read_data(MMC_READ_EXT_CSD, 0);
++	if (rc) {
++		return report_fail("8-bit read", rc);
++	}
++
++	rc = mmc_switch(EXT_CSD_HS_TIMING, HS_TIMING_HS);
++	if (rc) {
++		return rc;
++	}
++	wr8(HC_CTRL1, rd8(HC_CTRL1) | CTRL1_HS);
++
++	/* DLL off below 100 MHz (Linux sdhci_msm_set_uhs_signaling). */
++	wr16(HC_CLOCK, rd16(HC_CLOCK) & (uint16_t)~CLOCK_SD_ON);
++	wr32(MSM_DLL_CONFIG, rd32(MSM_DLL_CONFIG) | DLL_RST);
++	wr32(MSM_DLL_CONFIG, rd32(MSM_DLL_CONFIG) | DLL_PDN);
++	gcc_wr(GCC_RCG_CFG, RCG_CFG_50M);
++	rc = rcg_update();
++	if (rc) {
++		return rc;
++	}
++	wr16(HC_CLOCK, rd16(HC_CLOCK) | CLOCK_SD_ON);
++	delay(1000);
++
++	rc = read_data(MMC_READ_EXT_CSD, 0);
++	if (rc) {
++		return report_fail("HS read", rc);
++	}
++	printf("DOHA EMMC: 8-bit HS 50 MHz, width=%u hs=%u\n",
++	    byte_at(EXT_CSD_BUS_WIDTH), byte_at(EXT_CSD_HS_TIMING));
++	return 0;
++}
++
++static void
++speed_test(uint32_t lba)
++{
++	uint64_t start = mach_absolute_time(), ns;
++	uint32_t sum = 0;
++
++	for (uint32_t s = 0; s < SPEED_TEST_SECTORS; s++) {
++		int rc = read_data(MMC_READ_BLOCK, lba + s);
++		if (rc) {
++			report_fail("speed test", rc);
++			return;
++		}
++		for (unsigned i = 0; i < SECTOR / 4; i++) {
++			sum += sec[i];
++		}
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
++	printf("DOHA EMMC: 1 MiB of boot_a in %llu ms, sum32 0x%x\n", ns / NSEC_PER_MSEC, sum);
++}
++
++static void
++list_gpt(void)
++{
++	uint32_t boot_lba = 0, used = 0;
++	int rc = read_data(MMC_READ_BLOCK, 1);
++
++	if (rc) {
++		report_fail("LBA 1", rc);
++		return;
++	}
++	if (sec[0] != 0x20494645 || sec[1] != 0x54524150) {     /* "EFI PART" */
++		printf("DOHA EMMC: no GPT at LBA 1: 0x%x 0x%x\n", sec[0], sec[1]);
++		return;
++	}
++	uint32_t entries_lba = sec[72 / 4], count = sec[80 / 4], size = sec[84 / 4];
++	printf("DOHA EMMC: GPT entries at LBA %u, %u of %u bytes\n", entries_lba, count, size);
++	if (size != GPT_ENTRY_SIZE || count > GPT_MAX_ENTRIES) {
++		return;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		unsigned entry = (i % (SECTOR / GPT_ENTRY_SIZE)) * GPT_ENTRY_SIZE;
++		char name[37];
++
++		if (entry == 0) {
++			rc = read_data(MMC_READ_BLOCK, entries_lba + i / (SECTOR / GPT_ENTRY_SIZE));
++			if (rc) {
++				report_fail("GPT entries", rc);
++				return;
++			}
++		}
++		if (!sec[entry / 4] && !sec[entry / 4 + 1]) {   /* type GUID not in use */
++			continue;
++		}
++		used++;
++		for (unsigned c = 0; c < 36; c++) {
++			name[c] = (char)byte_at(entry + 56 + 2 * c);
++		}
++		name[36] = 0;
++		if (strcmp(name, "boot_a") == 0) {
++			boot_lba = sec[(entry + 32) / 4];
++		}
++		if (strcmp(name, "boot_a") == 0 || strcmp(name, "persist") == 0 ||
++		    strcmp(name, "userdata") == 0) {
++			printf("DOHA EMMC: p%u %s LBA %u..%u\n", i + 1, name,
++			    sec[(entry + 32) / 4], sec[(entry + 40) / 4]);
++		}
++	}
++	printf("DOHA EMMC: %u partitions\n", used);
++	if (boot_lba) {
++		speed_test(boot_lba);
++	}
++}
++
++void doha_emmc_probe(void);
++void
++doha_emmc_probe(void)
++{
++	hc = ml_io_map(HC_PA, HC_SIZE);
++	gcc = ml_io_map(GCC_SDCC1_PA, GCC_SDCC1_SIZE);
++	if (!hc || !gcc) {
++		printf("DOHA EMMC: cannot map registers\n");
++		return;
++	}
++	printf("DOHA EMMC: probe, no writes; ver=0x%x clk=0x%x\n", rd16(0xfe), rd32(HC_CLOCK));
++	if (host_init() || card_init() || go_fast()) {
++		return;
++	}
++	list_gpt();
++}
++#endif /* ARM64_BOARD_CONFIG_DOHA */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 5175bb3..43e89f8 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -828,6 +828,18 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	}
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_DOHA)
++	{
++		/* Read-only eMMC bring-up (bsd/dev/doha_emmc.c); no root device yet. */
++		uint32_t emmcprobe = 0;
++		PE_parse_boot_argn("emmcprobe", &emmcprobe, sizeof(emmcprobe));
++		if (emmcprobe == 1) {
++			extern void doha_emmc_probe(void);
++			doha_emmc_probe();
++		}
++	}
++#endif
++
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ //
+ //	SWEET: root on a GPT partition of the internal UFS (bsd/dev/sweet_ufs.c)
