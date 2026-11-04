@@ -337,3 +337,30 @@ partição. Como essa área está zerada, depois do teste o hash do trecho final
 Imagens: `doha-xnu-guard.img` (`emmcwrite=boot_a`, deve recusar) e `doha-xnu-write.img`
 (`emmcwrite=system_b emmcwritetest=1`). O LineageOS pode ser apagado (decisão do dono), mas é por ele
 que gravamos e conferimos partições, porque o `fastboot flash` recusou a nossa imagem.
+
+## 2026-11-04, boot 19: primeira escrita do kernel no eMMC
+
+`doha-xnu-write.img`, kernel `4232c073de6db08a…`, `emmcwrite=system_b emmcwritetest=1`. Lido da foto:
+
+    "system_b" is emmcroot0, 3088 MiB, WRITES ON
+    write test 1 sectors: 0 ms, pattern ok, sides ok, restored ok
+    write test 8 sectors: 0 ms, pattern ok, sides ok, restored ok
+    write test 2046 sectors: 23 ms, pattern ok, sides ok, restored ok
+    write test passed (0), writes on
+
+Depois disso, montagem, launchd e ticks normais. ~44 MiB/s, igual à leitura.
+
+De volta ao LineageOS, todos os hashes batem com os de antes do teste: `system_a`, volume e trecho final
+do `system_b`, `boot_a/b`, `dtbo_a/b`, `vbmeta_a/b`, primeiro 1 MiB do eMMC (GPT). O `userdata`, o
+`persist` e o modem não entram na conta porque mudam sozinhos; o LineageOS iniciou normalmente.
+
+Não prova:
+- Persistência depois de reiniciar: a área voltou a zeros, então o hash seria o mesmo se o padrão nunca
+  tivesse chegado à flash.
+- O caminho de `doha_emmc_strategy` para escrita, que um sistema de arquivos usaria.
+- A recusa de `doha-xnu-guard.img`, se esse boot não tiver sido feito (resultado não informado).
+
+Depois:
+1. Montar o volume com escrita, criar um arquivo a partir do programa de usuário e conferir depois de
+   reiniciar. Cobre a persistência e o caminho do sistema de arquivos.
+2. Raiz em `userdata`, que precisa de confirmação e de outro caminho de gravação sem o LineageOS.
