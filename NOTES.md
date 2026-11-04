@@ -227,7 +227,26 @@ pela foto do boot 11 que o reset vinha antes do driver: a foto era só um instan
 
 Correções no 0403: `HC_ADMA_ADDR` em cada leitura, e 30 s na tela antes desse panic.
 
+## 2026-11-04, boot 15: disco `emmcroot0` lido pelo HFS (0403 corrigido)
+
+`doha-xnu-disk2.img`, `emmcprobe=1 rd=emmcroot0 emmcroot=boot_a`. Sem reset. Lido da foto:
+- `p53 boot_a LBA 1230592..1361663`
+- `16 MiB of boot_a: 363 ms in reads, sum32 0x4ddcf87c`, igual ao backup; `with the sum, 371 ms`.
+  Sob o MMU, com cache e a manutenção de cache: ~44 MiB/s, o mesmo do shim.
+- `BSD root: emmcroot0, major 1, minor 0`
+- `hfs_ValidateHFSPlusVolumeHeader: unknown Volume Signature : 0`,
+  `hfs_mount returned error=22`, `cannot mount root, errno = 19`, `mount(N) failed`
+
+O HFS leu pelo disco e recusou o conteúdo, como esperado: o `boot_a` não é HFS, e os bytes 1024 e
+1025 do backup, onde fica a assinatura, são zero. O loop é a repetição de montagem do próprio
+XNU, que reexecuta o `emmcprobe` a cada tentativa. O reset do boot 11 não se repetiu com a correção do ADMA, o que combina
+com a dedução anterior, sem prová-la.
+
+Milestone 3 cumprido para leitura. Ainda não testados: montar um volume HFS de verdade e um
+caminho de escrita, que o iOS vai precisar (raiz read/write).
+
 Depois:
-1. Dispositivo de bloco só leitura estável (`emmcroot0`).
-2. Raiz em `userdata`: apaga o LineageOS; confirmar antes. Possível teste intermediário: uma
-   imagem HFS pequena em `system_b`, o slot inativo, o que mantém o LineageOS no `_a`.
+1. Imagem HFS de teste em `system_b`, o slot inativo, o que mantém o LineageOS no `_a` (grava no
+   eMMC: confirmar antes; conferir o tamanho e o uso de `system_b` pelo LineageOS).
+2. Caminho de escrita limitado à partição escolhida (`CMD25`).
+3. Raiz em `userdata`: apaga o LineageOS; confirmar antes.
