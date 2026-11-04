@@ -248,3 +248,27 @@ O que muda no plano:
 Licenças: o GitHub não detecta licença no ios-topaz nem no topaz-woa. O `CREDITS.md` diz que as partes
 derivadas do HackiOS são APSL 2.0 (kernel) e MIT (modo usuário). O resto do topaz serve só para leitura, sem
 copiar: 0080 a 0152 são escritos de novo aqui. Conferir o HackiOS na fonte antes de reutilizar.
+
+## willow-hackios: mesmo chip do doha (lido em 2026-11-04, nada testado aqui)
+
+[Floppikrob/willow-hackios](https://github.com/Floppikrob/willow-hackios): HackiOS no Redmi Note 8T, SM6125 com
+eMMC. É o material mais próximo que temos, mas é só o que o README afirma: repositório novo, sem estrelas,
+publicado em poucos dias. **Não rodar os binários de `prebuilt/`; compilar da fonte, depois de ler.**
+Licença: APSL 2.0 (kernel), como o HackiOS, e o resto a conferir arquivo por arquivo.
+
+O README relata: 8 núcleos, tela inicial, eMMC, `/var` gravável, toque, botões, Adreno 610 (`0x6010000`) com
+OpenGL ES e Metal, USB. Não funciona: Wi-Fi, bateria e rede móvel. Os Gold ficam a 300 MHz.
+
+| Item | willow | doha | Consequência |
+|---|---|---|---|
+| RAM | `0x40000000..0x140000000` | Igual | Mapa de memória deve servir |
+| Núcleos | Sobe em Silver, 4K, 8 núcleos | Mesmos núcleos | Não precisamos dos 16K nos Gold |
+| GPU | Adreno 610 | `Adreno610v1` | Boa chance de reaproveitar; firmware do próprio aparelho |
+| Toque | Novatek por SPI | FocalTech (`fts_ts_doha`) | Driver novo; o topaz tem um FocalTech para consulta |
+| Tela | NT36672A, 1080x2340 | 1080x2280, a identificar | Tamanho e backlight a ajustar |
+| Boot | Mu-Silicium UEFI, loader próprio | Mu-Silicium tem `willow` e `ginkgo`, não `doha` | Portar a UEFI ou trocar por nosso shim |
+| Raiz | iOS 16.5 em APFS na partição `system` | `system_b` tem 3 GiB | Talvez dispense apagar o `userdata`; falta ver o tamanho |
+| Kernel | xnu-8796.121.2, config BCM2837, compila em Linux | xnu-8796.141.3, config DOHA, compila em macOS | Duas bases diferentes |
+
+Decisão pendente: seguir com a nossa base e trazer peças, ou mudar para a base HackiOS/willow. Antes: ler
+como o eMMC e o boot dependem da UEFI, o tamanho do volume e o que o toolchain pede.

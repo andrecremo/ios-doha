@@ -396,3 +396,20 @@ Em aberto: causa dos zeros no `system_b`; recusa de `doha-xnu-guard.img`, sem re
 
 Depois: raiz do iOS. Antes de apagar qualquer coisa, falta decidir como gravar o `userdata` sem ele estar
 montado e onde montar o volume, porque o IPSW não pode passar pelo CI público.
+
+## 2026-11-04: o que cada núcleo oferece
+
+`doha-cores.img`, shim sem payload, sem acesso ao armazenamento. Lido da foto:
+
+    CPU0-3 midr=51AF8014 mmfr0=00001122 isar0=00011120 isar1=00000000  16K NO   LSE NO  RCPC NO
+    CPU4-6 midr=51AF8002 mmfr0=00101122 isar0=00011120 isar1=00000000  16K YES  LSE NO  RCPC NO
+    CPU7   midr=51AF8002 mmfr0=00101122 isar0=00011120 isar1=00000000  (linhas seguintes fora da tela)
+
+Os Gold têm 16K; o "sem 16K" de antes valia só para os Silver. Nenhum tem LSE ou `ldapr`, então o userland
+precisa de emulação. Os 8 núcleos acordaram.
+
+No fim, o aparelho reiniciou no LineageOS, não no fastboot como o shim anuncia. O motivo do reinício
+gravado no IMEM não valeu desta vez; não investigado.
+
+Outras leituras pelo LineageOS: `gpu_model` = `Adreno610v1`; toque `fts_ts_doha` (FocalTech);
+`qpnp_pon` e `gpio-keys`; `board-id` `0x42 0xb200`.
