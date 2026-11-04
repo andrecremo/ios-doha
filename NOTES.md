@@ -313,3 +313,27 @@ Depois:
 1. Caminho de escrita limitado à partição escolhida (`CMD25`), testado em `system_b`. Comando novo
    no eMMC: confirmar antes.
 2. Raiz em `userdata`, porque o `system_b` tem só 3 GiB: apaga o LineageOS; confirmar antes.
+
+## 2026-11-04: `system_b` zerado além do volume; caminho de escrita pronto, sem teste no aparelho
+
+Antes de testar a escrita, comparei as partições pelo LineageOS:
+- `system_a` inteira: `4ab9d8d9f0be0245`, igual à leitura anterior. Intacta.
+- `system_b`, primeiros 64 MiB: `bcdaf42cd28a0d26`, o volume de teste.
+- `system_b`, de 64 MiB ao fim: `1c5607e28eca13cd`, igual a 3024 MiB de zeros. Antes tinha os dados
+  do sistema (o hash inteiro batia com o de `system_a`).
+- `boot_a/b`, `dtbo_a/b` e `vbmeta_a/b` batem com o backup. Primeiro 1 MiB do eMMC (GPT):
+  `bdd742db82c608c7`.
+
+Portanto, a frase "só os primeiros 64 MiB mudam" estava errada. Causa não identificada. Os kernels até
+aqui não têm código de escrita nem de erase. Suspeitos, sem prova: o `fastboot flash` recusado ou o `dd`
+sem `conv=notrunc`. Nada indica outra partição afetada. A restauração a partir de `system_a` continua valendo.
+
+Patch 0403, kernel `4232c073de6db08a…`: `CMD25` só em `emmc_write`. Liga com `emmcwrite=` igual a
+`emmcroot=`, partição em `writable_parts[]` e mesmo intervalo no GPT. `write_allowed` passou em 5,1
+milhões de casos fora do aparelho, com sanitizadores. `emmcwritetest=1` faz a ida e volta a 128 MiB da
+partição. Como essa área está zerada, depois do teste o hash do trecho final deve continuar
+`1c5607e28eca13cd`, e qualquer byte perdido nele aparece.
+
+Imagens: `doha-xnu-guard.img` (`emmcwrite=boot_a`, deve recusar) e `doha-xnu-write.img`
+(`emmcwrite=system_b emmcwritetest=1`). O LineageOS pode ser apagado (decisão do dono), mas é por ele
+que gravamos e conferimos partições, porque o `fastboot flash` recusou a nossa imagem.
