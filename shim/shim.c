@@ -251,9 +251,19 @@ static void test_cpu(uint64_t dtb)
 
 /* ---- SMP ---- */
 
-void secondary_main(uint64_t idx)
+static uint64_t sec_mmfr0[NR_CPUS], sec_isar0[NR_CPUS], sec_isar1[NR_CPUS];
+
+static void read_features(uint64_t idx)
 {
 	sec_midr[idx] = rsr("midr_el1");
+	sec_mmfr0[idx] = rsr("id_aa64mmfr0_el1");
+	sec_isar0[idx] = rsr("id_aa64isar0_el1");
+	sec_isar1[idx] = rsr("id_aa64isar1_el1");
+}
+
+void secondary_main(uint64_t idx)
+{
+	read_features(idx);
 	sec_mpidr[idx] = rsr("mpidr_el1") | (1ULL << 63);
 	__asm__ volatile("dsb sy" ::: "memory");
 	smc(PSCI_CPU_OFF, 0, 0, 0);
@@ -274,11 +284,20 @@ static void test_smp(void)
 	for (int i = 0; i < NR_CPUS; i++) {
 		char label[] = "CPU0";
 		label[3] = '0' + i;
-		if (mpidr[i] == self)
-			con_str(label, "is boot cpu");
-		else
-			con_hex2(label, "ret=", (uint32_t)ret[i], "midr=",
-				 sec_mpidr[i] ? (uint32_t)sec_midr[i] : 0xdead0000);
+		if (mpidr[i] == self) {
+			read_features(i);
+			sec_mpidr[i] = 1;
+		}
+		if (!sec_mpidr[i]) {
+			con_hex2(label, "ret=", (uint32_t)ret[i], "midr=", 0xdead0000);
+			continue;
+		}
+		con_hex2(label, "midr=", (uint32_t)sec_midr[i], "mmfr0=", (uint32_t)sec_mmfr0[i]);
+		con_hex2(" isar", "0=", (uint32_t)sec_isar0[i], "1=", (uint32_t)sec_isar1[i]);
+		/* TGran16 [23:20]: nonzero = 16K. ISAR0 atomic [23:20]: 2 = LSE. ISAR1 LRCPC [23:20]: ldapr. */
+		con_str(" 16K", ((sec_mmfr0[i] >> 20) & 0xf) ? "YES" : "NO");
+		con_str(" LSE", ((sec_isar0[i] >> 20) & 0xf) >= 2 ? "YES" : "NO");
+		con_str(" RCPC", ((sec_isar1[i] >> 20) & 0xf) ? "YES" : "NO");
 	}
 	con_skip();
 }
@@ -410,6 +429,9 @@ void shim_main(uint64_t dtb)
 	con_str("LOADER", why);
 	con_skip();
 
+	/* What each core offers: 16K, LSE, ldapr. */
+	test_smp();
+
 	/* Milestone 1 answered these (NOTES.md); flip to repeat them. */
 	if (0) {
 		test_cpu(dtb);
@@ -420,12 +442,11 @@ void shim_main(uint64_t dtb)
 			 "rst2=", smc(PSCI_FEATURES, PSCI_SYSTEM_RESET2, 0, 0));
 		con_skip();
 
-		test_smp();
 		test_gic();
-	}
 
-	stage = "sdhci";
-	test_sdhci();
+		stage = "sdhci";
+		test_sdhci();
+	}
 
 	stage = "done";
 	con_skip();
