@@ -436,3 +436,20 @@ dentro de uma seção GUID. Lido com um parser próprio em Python:
 
 Parado aqui: o bloqueio automático de segurança não deixou compilar e executar o UEFIReader, por ser código externo.
 A compilação do Mu-Silicium teria o mesmo problema. Falta autorização do dono. Os scripts ficam fora do repositório.
+
+## 2026-11-05: `dohaPkg` pronto para compilar
+
+O dono rodou o UEFIReader no próprio terminal: 84 módulos, com 73 dos 74 do willow com o mesmo nome. Fica de fora do
+repositório, em uma pasta privada do WSL.
+
+`uefi/mkdohapkg.py` gera o `dohaPkg` a partir do `willowPkg` em um Mu-Silicium fixado (`6b3d90b7`). Testado em uma
+cópia só com os fontes: passa, com 32 referências de binários conferidas. Compilação ainda não testada.
+
+Escolhas para o primeiro boot:
+- `SimpleFbDxe`, sobre o framebuffer que o ABL deixa ligado, sem `DisplayDxe`. A dependência dele do protocolo de hwid
+  da Motorola não pesa aqui.
+- Fora: USB, carregador, ADC, PIL e o app de armazenamento em massa. `Mot*` nem entram.
+- `PcdEmuVariableNvModeEnable` vem ligado no `QcomPkg`: as variáveis ficam na RAM.
+- `TzDxe`, `ScmDxe` e `SdccDxe` ficam, como no willow. O `ButtonsDxe` procura o protocolo de hwid; efeito desconhecido.
+- ACPI continua a do willow, porque só um sistema operacional a lê.
+- `uefi/DohaShim.S` é nosso e `uefi/mkdohaimg.py` empacota como header v2 com o dtb do aparelho.
