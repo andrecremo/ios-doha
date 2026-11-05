@@ -413,3 +413,26 @@ gravado no IMEM não valeu desta vez; não investigado.
 
 Outras leituras pelo LineageOS: `gpu_model` = `Adreno610v1`; toque `fts_ts_doha` (FocalTech);
 `qpnp_pon` e `gpio-keys`; `board-id` `0x42 0xb200`.
+
+## 2026-11-05: UEFI do doha comparada com a do willow, sem executar nada
+
+Backup ampliado em `backup/2026-11-05` na pasta do usuário (privado): 74 partições, com hash igual ao do celular, e
+as duas cópias do GPT. Sem `userdata`, `system_*` e RPMB. `xbl_a` e `xbl_b` são iguais.
+
+O `xbl` traz um volume de firmware em `0x5FC00000`, 3 MiB, igual ao `willowPkg`. A parte principal é gzip
+dentro de uma seção GUID. Lido com um parser próprio em Python:
+
+- 113 módulos. Dos 74 do willow, 53 têm o mesmo nome. A maioria dos outros parece só nome diferente: `ChipInfo`,
+  `DALSys`, `GlinkDxe`, `PmicDxe`, `ScmDxe`, `TzDxe`, `DxeCore`.
+- Sem equivalente aparente: `MiToken` (Xiaomi).
+- Só no doha: `MotBootFlagsDxe`, `MotCoreServicesDxe`, `MotHwIdDxe`, `MotSolDxe`, `MotStorageDxe`, `MotUtagsDxe`,
+  `MotUtagsDictDxe`, `MbmModeDxe`, `AbDxe`, `BacklightDxe`. Um `.fdf` nosso só carrega o que listar; manter
+  fora os `Mot*`, principalmente `MotStorageDxe` e `MotUtagsDxe`. Uma mensagem pede o "Motorola hwid protocol": pode
+  haver dependência a resolver.
+- `uefiplat.cfg`: 99 linhas nos dois; difere em uma região de log, `MemoryCaptureModeOffset`, `SecurityFlag`
+  (`0xC4` x `0x81CC`), `DefaultBDSBootApp` e `EnableDisplayImageFv`.
+- `SecParti.cfg` (RPMB/GPT) igual, ignorando comentários.
+- Painéis da Motorola no firmware; falta saber qual é o do doha.
+
+Parado aqui: o bloqueio automático de segurança não deixou compilar e executar o UEFIReader, por ser código externo.
+A compilação do Mu-Silicium teria o mesmo problema. Falta autorização do dono. Os scripts ficam fora do repositório.
