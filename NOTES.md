@@ -457,3 +457,12 @@ Escolhas para o primeiro boot:
 Primeiro boot pela RAM, `doha-uefi.img` RELEASE, sha256 `5b89add3c86bc4cd`: 2 minutos parado no logo da Motorola, sem
 mudança na tela. Inconclusivo: RELEASE não escreve nada. Próximo: DEBUG, com log na tela, e o shim pintando uma
 faixa verde antes de saltar, para separar "o ABL não rodou o shim" de "a UEFI travou".
+
+Boot DEBUG pela RAM, sha256 `b306386088aad613`: **a UEFI rodou no aparelho**, com o framebuffer funcionando. Parou com
+um data abort: `ELR 0x5A2E6874`, `FAR 0x10AC000`, `ESR 0x96000046` (escrita, translation fault no nível 2). O stack tem o
+texto `ASSERT BootFlagsLib.c +28: Status == 0 && mProtocol != (void *)`. Os módulos da Motorola têm um `BootFlagsLib`
+que exige o protocolo do `MotBootFlagsDxe`. O salto para `0x10AC000` parece ser o tratamento desse assert; não confirmado.
+
+Pela ordem original (arquivo APRIORI do FV): `... ArmTimerDxe MotBootFlagsDxe SmemDxe ...`. `MotBootFlagsDxe` entra:
+guarda flags na memória, sem biblioteca de armazenamento. `MotHwIdDxe` fica fora, porque usa `UtagsLib` e pode gravar
+("Failed to write programmable HWID"). Logo, `ButtonsDxe`, que exige o hwid, sai também.

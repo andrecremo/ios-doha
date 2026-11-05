@@ -8,7 +8,7 @@ never goes into a repository.
 
 For a first boot the package keeps what it takes to reach the boot menu on the framebuffer ABL left on,
 and leaves out what could act on the hardware for no use here: charging, USB (mass storage above all),
-loading peripherals, and every Motorola module, which are not in willow's lists to begin with.
+loading peripherals, the buttons, and every Motorola module but one (BOOT_FLAGS below).
 """
 import re
 import shutil
@@ -25,7 +25,12 @@ LEFT_OUT = (
     'UsbMsdDxe', 'UsbDeviceDxe', 'UsbConfigDxe', 'UsbfnDwc3Dxe', 'UsbPwrCtrlDxe', 'XhciDxe',
     'XhciPciEmulationDxe', 'UsbBusDxe', 'UsbKbDxe', 'UsbMassStorageDxe',
     'QcomChargerDxeLA', 'ChargerExDxe', 'AdcDxe', 'PILDxe',
+    # Asks for the protocol of MotHwIdDxe, which stays out: that one uses UtagsLib and can write.
+    'ButtonsDxe',
 )
+# The one Motorola module in the package. EnvDxe, SmemDxe and PmicDxe assert without its protocol. It keeps
+# flags in memory: no storage library, no dependencies. In the stock order it loads right before SmemDxe.
+BOOT_FLAGS = 'Binaries/doha/MbmPkg/Core/Drivers/MotBootFlagsDxe/MotBootFlagsDxe.inf'
 # Lines dropped from the .fdf: the USB power enabler, and the application that offers the storage over USB.
 FDF_LEFT_OUT = ('NicobarPkg/Drivers/UsbPwrEnablerDxe', 'QcomPkg/Extra.fdf.inc')
 
@@ -103,7 +108,8 @@ def main():
         path = dst / inc
         t, dropped = drop_lines(path.read_text(), LEFT_OUT, inc)
         seen |= dropped
-        path.write_text(t)
+        smem = '  INF Binaries/doha/QcomPkg/Drivers/SmemDxe/SmemDxe.inf\n'
+        path.write_text(sub1(t, smem, f'  INF {BOOT_FLAGS}\n{smem}', inc))
     if seen != set(LEFT_OUT):
         raise SystemExit(f'module lists: did not find {set(LEFT_OUT) - seen}')
 
@@ -146,7 +152,7 @@ def main():
                 missing.append(m.group(0))
     if missing:
         raise SystemExit('missing from the firmware:\n  ' + '\n  '.join(sorted(set(missing))))
-    bad = [n for n in names if re.search(r'/Mot[A-Z]|MbmPkg|/MiToken', n)]
+    bad = [n for n in names if n != BOOT_FLAGS and re.search(r'/Mot[A-Z]|MbmPkg|/MiToken', n)]
     if bad:
         raise SystemExit(f'not for this boot: {bad}')
     print(f'{dst}: {len(set(names))} binary references checked, {len(LEFT_OUT)} modules left out')
