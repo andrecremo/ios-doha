@@ -453,3 +453,7 @@ Escolhas para o primeiro boot:
 - `TzDxe`, `ScmDxe` e `SdccDxe` ficam, como no willow. O `ButtonsDxe` procura o protocolo de hwid; efeito desconhecido.
 - ACPI continua a do willow, porque só um sistema operacional a lê.
 - `uefi/DohaShim.S` é nosso e `uefi/mkdohaimg.py` empacota como header v2 com o dtb do aparelho.
+
+Primeiro boot pela RAM, `doha-uefi.img` RELEASE, sha256 `5b89add3c86bc4cd`: 2 minutos parado no logo da Motorola, sem
+mudança na tela. Inconclusivo: RELEASE não escreve nada. Próximo: DEBUG, com log na tela, e o shim pintando uma
+faixa verde antes de saltar, para separar "o ABL não rodou o shim" de "a UEFI travou".

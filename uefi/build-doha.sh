@@ -8,7 +8,8 @@ MU_COMMIT=6b3d90b79e191e08171bfedd3980234a7e49d340
 HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=~/doha-xnu/uefi
 FIRMWARE=$WORK/private/doha
-OUT=/mnt/c/Users/andre/doha-uefi.img
+MODE=${1:-DEBUG}        # DEBUG writes its log on the screen; RELEASE is silent
+OUT=/mnt/c/Users/andre/doha-uefi-$MODE.img
 
 [ -d "$FIRMWARE" ] || { echo "no $FIRMWARE: run UEFIReader on the xbl first"; exit 1; }
 for tool in clang lld llvm-objcopy nasm mono make python3; do
@@ -30,8 +31,8 @@ python3 "$HERE/mkdohapkg.py" Mu-Silicium "$FIRMWARE"
 [ -x venv/bin/python ] || python3 -m venv venv
 venv/bin/pip install -q -r Mu-Silicium/pip-requirements.txt
 
-(cd Mu-Silicium && source ../venv/bin/activate && python3 build_uefi.py -d doha -r RELEASE)
-FD=Mu-Silicium/Build/dohaPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd
+(cd Mu-Silicium && source ../venv/bin/activate && python3 build_uefi.py -d doha -r "$MODE")
+FD=Mu-Silicium/Build/dohaPkg/${MODE}_CLANGPDB/FV/SILICIUM_UEFI.fd
 [ -f "$FD" ] || { echo "no $FD"; exit 1; }
 
 clang --target=aarch64-linux-gnu -c "$HERE/DohaShim.S" -o DohaShim.o
