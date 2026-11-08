@@ -1,0 +1,20 @@
+[Defines]
+  INF_VERSION    = 0x00010005
+  BASE_NAME      = DohaRegsBefore
+  FILE_GUID      = 4B7E2A90-1D63-4C58-9F21-A6E8035D7C14
+  MODULE_TYPE    = DXE_DRIVER
+  VERSION_STRING = 1.0
+  ENTRY_POINT    = DohaRegsEntry
+
+[Sources]
+  DohaRegs.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+
+[LibraryClasses]
+  UefiDriverEntryPoint
+  DebugLib
+
+[Depex]
+  TRUE

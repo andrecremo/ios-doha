@@ -1,0 +1,21 @@
+[Defines]
+  INF_VERSION    = 0x00010005
+  BASE_NAME      = DohaMmrtDxe
+  FILE_GUID      = 1F6C8A3D-B572-4E09-93D4-7A2E60C5B18F
+  MODULE_TYPE    = DXE_DRIVER
+  VERSION_STRING = 1.0
+  ENTRY_POINT    = DohaMmrtEntry
+
+[Sources]
+  DohaMmrtDxe.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+
+[LibraryClasses]
+  UefiDriverEntryPoint
+  UefiBootServicesTableLib
+  DebugLib
+
+[Depex]
+  TRUE

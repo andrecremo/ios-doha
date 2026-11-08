@@ -466,3 +466,96 @@ que exige o protocolo do `MotBootFlagsDxe`. O salto para `0x10AC000` parece ser 
 Pela ordem original (arquivo APRIORI do FV): `... ArmTimerDxe MotBootFlagsDxe SmemDxe ...`. `MotBootFlagsDxe` entra:
 guarda flags na memória, sem biblioteca de armazenamento. `MotHwIdDxe` fica fora, porque usa `UtagsLib` e pode gravar
 ("Failed to write programmable HWID"). Logo, `ButtonsDxe`, que exige o hwid, sai também.
+
+Com o `MotBootFlagsDxe`, DEBUG sha256 `82807aeeb71f738c`: o assert sumiu, o log vai até o `ULogDxe`, a tela apaga e o
+aparelho "reinicia". Para isolar, `uefi/DohaHaltDxe` para o boot depois do módulo em `DOHA_HALT_AFTER`, conta na tela e
+pede `PSCI SYSTEM_RESET` aos 30 s, um sinal que funciona sem tela.
+
+| Parada depois de | Resultado |
+|---|---|
+| `ULogDxe`, `NpaDxe` | Tela viva. `NpaDxe`: reboot PSCI aos 30 s (controle). `ULogDxe` ainda sem PSCI: contou sem reiniciar |
+| `ClockDxe` | Tela apaga, reboot perto de 30 s no relato do usuário: CPU e timer vivos |
+| `ScmDxeLA`, `SdccDxe`, `TzDxeLA`, `PmicDxeLa` | Reboot por volta de 30 s |
+
+Imagem completa, cabo tirado com a tela preta: a impressão foi de que ficou desligado. Coerente com
+`PlatformBootManagerUnableToBoot` (Mu-Silicium), que espera 10 s e pede `EfiResetShutdown`. Nesse caso a UEFI termina o
+boot; falta confirmar. Com o cabo, o desligamento parecia um reboot.
+
+Tela preta: o `ClockDxe` do doha é quase o mesmo do willow (mesmo tamanho, textos quase iguais; não comparei o código). Ele
+traz nós NPA de PMIC (`/pmic/client/disp_prim`, `ldo7`, `ldo10`, `ldo15`, `ldo18`, `smps5`), uma pista ainda sem prova. O
+willow usa o framebuffer da UEFI no iOS, então a queda não é inerente a esse módulo. Falta saber se a luz de fundo fica acesa.
+
+Consumidores lidos no Lineage: painel `mipi_mot_vid_tianma_1080p_630` (`dsi_ft8719_tm_vid_display`, modo vídeo). `pm6125_l18`
+alimenta `mdss_dsi_ctrl0-vdda-1p2`, `pm6125_s5_level` alimenta `mdss_dsi_phy0-vdda-0p9`, `pm6125_l9` é `dsi-display-vddio`,
+`lcdb_ldo` e `lcdb_ncp` são `lab` e `ibb`. `l7`, `l10` e `l15` alimentam o `qusb`, não o display. Dos reguladores citados no
+`ClockDxe`, `l18` e `s5` são os candidatos. Depois de um boot de teste, com religamento pelo Power: `POWERUPREASON 0x80`,
+`Last boot reason: power_key_press`, ou seja, o aparelho estava mesmo desligado.
+
+Imagem `halt-ClockDxe`, sem cabo: luz de fundo acesa, sem imagem, reboot aos 30 s. Logo, o desligamento em 15 s veio da imagem
+completa, que chega à BDS. `uefi/DohaDispProbeDxe` (sha256 `6c69a60a7875ceda`) ligou, pela `EFI_CLOCK_PROTOCOL`, o
+`mdss_core_gdsc` e 12 clocks do display: a imagem não voltou, reboot perto de 60 s, ou seja, algum clock lido estava desligado.
+Não sei qual, porque esse log ficou invisível.
+
+Caminho original: o `DisplayDxe` do doha tem `Panel_tm_ft8719_fhd_vid.xml`, nosso painel, e o arquivo está no firmware. Ele
+exige o protocolo de hwid `6634b0ee-0d71-40f4-5944-487ad029619e`, do `MotHwIdDxe`, com assert se faltar. Na desmontagem, o
+`DisplayDxe` só chama duas funções dele, nos deslocamentos `0x18` e `0x28`. A primeira tem o retorno testado contra NULL. O que
+cada uma faz ainda não está confirmado. Ideia: um driver nosso, só em memória, com esse protocolo, sem `MotHwIdDxe`,
+`MotUtagsDxe` e `MotStorageDxe`.
+
+Imagem com `DisplayDxe` e `DohaHwIdDxe`: tela preta, sem mudança em 2 minutos. Para ler sem tela, `uefi/DohaLogDxe` põe o
+núcleo `0x103` como vigia (PSCI CPU_ON, MMU desligada): copia o framebuffer e o buffer de log para a região `DBI Dump` a cada
+segundo e pede reboot aos 45 s. Ao reiniciar segurando Volume para baixo, `doha-logreader.img` (sem payload, `show_saved` em
+`shim.c`) mostra as cópias. A RAM sobrevive ao `PSCI SYSTEM_RESET`. Um primeiro vigia por timer parou cedo; o abort abaixo
+explica isso, porque o tratador nunca retorna. O buffer `0x5FFF7000` só tinha o log antigo do XBL, 116 linhas.
+
+Tela salva, `SECONDS` 0x2F: data abort, `ESR 0x96000046`, `FAR 0x10AC000`, `ELR 0x59B7EF14`, com a pilha trazendo
+`ASSERT UtagsLib.c +26: !(((INTN)(RETURN_STATUS)(Status)) < 0) && mProtoc...`. É o mesmo `FAR` do assert do `BootFlagsLib`. Dos
+módulos mantidos, só o `DisplayDxe` tem `UtagsLib`. Ele usa o protocolo `feb30e8d-06ed-4c9a-8d35-a8e52a346f3f` por quatro entradas:
+`0x10`, `0x18`, `0x20` (tamanho por parâmetro de saída) e `0xA8` (a tag existe?), para `BootCycleCount`, `logfs` e `bare_board`.
+O `DohaHwIdDxe` agora responde `EFI_NOT_FOUND` a todas, sem gravar nada.
+
+Partições depois desses boots, contra `backup/2026-11-05`: 66 iguais e as duas GPT iguais. Mudaram `utags` e `utagsBackup`
+(só `BootCycleCount`), `prodpersist` (na primeira comparação, 8 bytes no superbloco ext4), `logfs` (os `LOGxx.TXT`, cerca de
+um por boot normal, pelas datas), e `persist`, `metadata`, `modemst1` e `modemst2`, sem comparação byte a byte.
+
+Com o `DohaHwIdDxe` também como protocolo de UTAG, a imagem com `DisplayDxe` não trava mais no assert, mas a tela fica
+preta. O vigia num segundo núcleo morreu cedo nessa imagem: o reboot veio da parada aos 30 s, e não dele aos 25 s, e a RAM
+voltou sem a marca. Não sei por que ele morreu. A parada depois do `DisplayDxe` (`DohaHaltDxe`, salvando a tela pelo núcleo
+principal ao carregar e a cada 5 s) também deixou a RAM sem marca. Já o controle, com a parada logo depois do `TsensDxe` e
+antes do `DohaHwIdDxe` e do `DisplayDxe` (sha256 `59bce0cff8840bc2`), salvou a tela: `SECONDS` 0x1E, log até
+`DohaHalt: 30 s`. Logo, o núcleo principal salva a RAM, e é o `DisplayDxe` que não retorna. A tela salva também mostra que
+os módulos da Qualcomm escrevem no framebuffer: o `PmicDxe` imprime os motivos de PON do último reset (PM0: `HARD_RESET`,
+`PS_HOLD`; PM1: `CBLPWR_N`, `SOFT`). O reboot por PSCI preserva a RAM.
+
+Próximo: `uefi/DohaSaveDxe`, carregado antes do `DohaHwIdDxe`, salva a tela por timer a cada segundo e deixa o boot seguir,
+para guardar a última tela do `DisplayDxe` enquanto ele não retorna.
+
+O microSD não serve: com `DohaSaveDxe` listando os dispositivos de bloco, o firmware expõe só o eMMC (área de usuário de
+122142720 setores e duas partições de boot de 8192), 80 dispositivos com as partições. `DohaSaveDxe` passou a gravar a tela
+e o buffer de log na `system_b`, a 128 MiB (LBA 11862016 a 11881318), só se o disco tiver exatamente 122142720 setores e a
+GPT trouxer `system_b` de 11599872 a 17924095. `tools/readsave.py` lê pelo adb e gera um PNG. Depois de cada uso, o trecho de
+1 MiB antes e depois da área continuou zerado, e as 66 partições e as duas GPT seguiram iguais ao backup.
+
+Com o `DisplayDxe`, só a escrita inicial acontecia: nenhum timer rodava depois, nem um de `TPL_NOTIFY` que copia para a RAM
+(`SECONDS` 0 no leitor; a RAM sobrevive a esse reset). Motivo do reset, lido na rodada seguinte: `HARD_RESET`, `PS_HOLD`.
+`EnableDisplayThread` em 0 não mudou nada. O `DisplayDxe` traz a própria `ArmMmuLib` e a usa pela
+`UncachedMemoryAllocationLib`, desligando interrupções e MMU para trocar entradas de tabela de páginas (`0x7104`).
+
+Rodada com um vigia no núcleo `0x103`, ligado pelo `DohaSaveDxe` logo antes do `DisplayDxe` (sha256 `966bb8eadbb85f28`):
+o `DisplayDxe` retornou e o boot chegou à BDS. A tela salva tem `No Operating System Found!` desenhado pelo console gráfico, e
+a `system_b` tem 4 escritas (0, 5, 10 e 15 s). Ainda não sei se o painel acendeu nem se o resultado se repete.
+
+Resultados com o vigia: a tela acendeu em 3 de 4 boots (`No Operating System Found!` no painel, desenhado pelo console gráfico).
+Um núcleo só parado em `wfe` (`uefi/DohaParkDxe`) não fez a tela acender em nenhum de 3. Um vigia leve (`uefi/DohaSnapDxe`)
+ligou (`CPU_ON` 0) mas não deixou nada na RAM. O `DisplayDxe` tem uma corrida que o tráfego de memória do vigia costuma evitar.
+Não a investiguei mais: os outros projetos reaproveitam o framebuffer do bootloader, e o willow usa o `SimpleFbDxe`.
+
+Caminho do framebuffer, resolvido. `uefi/DohaRegsDxe` (antes do `ClockDxe` e depois do `SdccDxe`, endereços de
+`dispcc-sm6125.c` e `gcc-sm6125.c` do Linux) mostrou que o `ClockDxe` faz `gcc_disp_hf_axi_cbcr` ir de `00004221` a
+`80004221`: o clock AXI do display, habilitado, para. Também `gcc_disp_throttle`, de `00000000` a `80000000`. A origem é o
+barramento de multimídia em tempo real, o recurso do RPM `/clk/mmrt`, que o `ClockDxe` cria e ninguém pede. O `DisplayDxe`
+original cria um cliente obrigatório (`0x40`, `UEFI_DISPLAY_DRIVER`) e pede 240000 kHz, pelo protocolo NPA do `NpaDxe`
+(`79d6c870-725e-489e-a0a1-27e7a5d0cb35`, criar em `0x10`, pedir em `0x28`). `uefi/DohaMmrtDxe` faz o mesmo logo depois do
+`ClockDxe`: com ele, a tela que o ABL deixou continua acesa até o fim do boot, com o `SimpleFbDxe` (sha256 `22237cabbb53289f`).
+Antes e depois ficam iguais: AXI `00004221`, `mdss_gdscr` `F822F000` (ligado), pipe `VIG0` em `0x5C000000`, 1080 x 2280.
+`mkdohapkg.py` agora põe o `DohaMmrtDxe` sempre depois do `ClockDxe`. As 66 partições e as duas GPT seguem iguais ao backup.

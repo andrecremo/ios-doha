@@ -1,0 +1,21 @@
+[Defines]
+  INF_VERSION    = 0x00010005
+  BASE_NAME      = DohaDispProbeDxe
+  FILE_GUID      = 9B4E2F16-7A3C-4D58-B1E7-2C8F60D3A571
+  MODULE_TYPE    = DXE_DRIVER
+  VERSION_STRING = 1.0
+  ENTRY_POINT    = DohaDispProbeEntry
+
+[Sources]
+  DohaDispProbeDxe.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+
+[LibraryClasses]
+  UefiDriverEntryPoint
+  UefiBootServicesTableLib
+  DebugLib
+
+[Depex]
+  TRUE

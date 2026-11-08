@@ -417,6 +417,84 @@ static void test_gic(void)
 	isb();
 }
 
+/*
+ * What uefi/DohaLogDxe left in RAM before a reboot: first the framebuffer it saved, as it was, then the text
+ * of the firmware's log buffer. Returns 0 if nothing was left.
+ */
+#define SAVE_FB		0x5b100000UL
+#define SAVE_LOG	0x5ba80000UL
+#define SAVE_LOG_SIZE	0x8000UL
+#define SAVE_HEADER	0x5baff000UL
+#define SAVE_MAGIC_LO	0x41484f44U	/* "DOHA" */
+#define SAVE_MAGIC_HI	0x31474f4cU	/* "LOG1" */
+#define SAVE_LINES	16
+#define SAVE_LINE_MAX	96
+
+static int saved_line(uintptr_t *pos, uintptr_t end, char *out)
+{
+	while (*pos < end) {
+		int n = 0;
+		while (*pos < end) {
+			uint8_t c = *(volatile uint8_t *)(*pos);
+			(*pos)++;
+			if (c < 32 || c > 126)
+				break;
+			if (n < SAVE_LINE_MAX - 1)
+				out[n++] = (char)c;
+		}
+		if (n >= 4) {
+			out[n] = 0;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static int show_saved(void)
+{
+	static char line[SAVE_LINE_MAX];
+	uintptr_t pos, end = SAVE_LOG + SAVE_LOG_SIZE;
+	int total = 0, seen = 0;
+
+	if (rd32(SAVE_HEADER) != SAVE_MAGIC_LO || rd32(SAVE_HEADER + 4) != SAVE_MAGIC_HI)
+		return 0;
+	uint32_t seconds = rd32(SAVE_HEADER + 8);
+
+	for (uintptr_t i = 0; i < FB_H * FB_STRIDE; i += 4)
+		*(volatile uint32_t *)(FB_BASE + i) = rd32(SAVE_FB + i);
+	delay_ms(45000);
+
+	con_clear(BLUE);
+	con_skip();	/* the first row is under the camera notch */
+	con_skip();
+	con_hex("SECONDS", seconds);
+	for (pos = SAVE_LOG; saved_line(&pos, end, line); )
+		total++;
+	con_hex("LINES", total);
+	for (pos = SAVE_LOG; saved_line(&pos, end, line); ) {
+		if (++seen <= total - SAVE_LINES)
+			continue;
+		/* 35 columns fit after the label */
+		for (char *p = line, more = 1; more; ) {
+			char *q = p;
+			int n = 0;
+			while (*q && n < 35) {
+				q++;
+				n++;
+			}
+			more = *q;
+			*q = 0;
+			con_str("", p);
+			p = q;
+			if (more)
+				*q = more;
+		}
+	}
+	*(volatile uint32_t *)SAVE_HEADER = 0;
+	delay_ms(60000);
+	return 1;
+}
+
 /* ---- main ---- */
 
 void shim_main(uint64_t dtb)
@@ -428,6 +506,13 @@ void shim_main(uint64_t dtb)
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
+
+	if (show_saved()) {
+		stage = "done";
+		con_str("DONE", "saved log shown");
+		reset(HOLD_SECONDS);
+	}
+	con_str("SAVED", "nothing in RAM");
 
 	/* What each core offers: 16K, LSE, ldapr. */
 	test_smp();

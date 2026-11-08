@@ -10,6 +10,7 @@ For a first boot the package keeps what it takes to reach the boot menu on the f
 and leaves out what could act on the hardware for no use here: charging, USB (mass storage above all),
 loading peripherals, the buttons, and every Motorola module but one (BOOT_FLAGS below).
 """
+import os
 import re
 import shutil
 import sys
@@ -50,6 +51,66 @@ def drop_lines(text, names, what):
         else:
             out.append(line)
     return ''.join(out), dropped
+
+
+def add_halt(dst, after, drivers, what='diagnostic build'):
+    """Diagnostic build: drivers of ours (DOHA_HALT_DRIVER, comma separated, in load order) right after
+    DOHA_HALT_AFTER. The last one usually never returns."""
+    for spec in drivers.split(','):
+        # DIR/INF for a directory with more than one module (DohaRegsDxe/DohaRegsBefore), else the name of both.
+        folder, driver = spec.split('/') if '/' in spec else (spec, spec)
+        if not (dst / 'Drivers' / folder).exists():
+            shutil.copytree(Path(__file__).parent / folder, dst / 'Drivers' / folder)
+        inf = f'dohaPkg/Drivers/{folder}/{driver}.inf'
+        dsc = dst / 'doha.dsc'
+        dsc.write_text(sub1(dsc.read_text(), '[Components]\n', f'[Components]\n  {inf}\n', 'dsc'))
+        apriori = dst / 'Include/APRIORI.inc'
+        t, n = re.subn(rf'^(\s*INF \S*/{re.escape(after)}\.inf\n)', rf'\g<1>  INF {inf}\n', apriori.read_text(), flags=re.M)
+        if n != 1:
+            raise SystemExit(f'APRIORI.inc: expected one {after}, found {n}')
+        apriori.write_text(t)
+        dxe = dst / 'Include/DXE.inc'
+        dxe.write_text(dxe.read_text().rstrip('\n') + f'\n  INF {inf}\n')
+        if driver == 'DohaSaveDxe':
+            once = 1 if os.environ.get('DOHA_SAVE_ONCE') else 0
+            (dst / 'Drivers' / driver / 'DohaSaveConfig.h').write_text(f'#define SAVE_ONCE  {once}\n')
+        print(f'{what}: {driver} after {after}')
+        after = driver
+
+
+def add_hwid(dst):
+    """The firmware's DisplayDxe needs a hwid protocol: DohaHwIdDxe, in memory, loads right before it."""
+    shutil.copytree(Path(__file__).parent / 'DohaHwIdDxe', dst / 'Drivers/DohaHwIdDxe')
+    inf = 'dohaPkg/Drivers/DohaHwIdDxe/DohaHwIdDxe.inf'
+    dsc = dst / 'doha.dsc'
+    dsc.write_text(sub1(dsc.read_text(), '[Components]\n', f'[Components]\n  {inf}\n', 'dsc'))
+    apriori = dst / 'Include/APRIORI.inc'
+    display = '  INF Binaries/doha/QcomPkg/Drivers/DisplayDxe/DisplayDxe.inf\n'
+    apriori.write_text(sub1(apriori.read_text(), display, f'  INF {inf}\n{display}', 'APRIORI.inc'))
+    dxe = dst / 'Include/DXE.inc'
+    dxe.write_text(dxe.read_text().rstrip('\n') + f'\n  INF {inf}\n')
+
+
+def add_log(dst):
+    """Diagnostic build: DohaLogDxe keeps the logs in RAM, from as soon as there is a timer."""
+    shutil.copytree(Path(__file__).parent / 'DohaLogDxe', dst / 'Drivers/DohaLogDxe')
+    inf = 'dohaPkg/Drivers/DohaLogDxe/DohaLogDxe.inf'
+    dsc = dst / 'doha.dsc'
+    dsc.write_text(sub1(dsc.read_text(), '[Components]\n', f'[Components]\n  {inf}\n', 'dsc'))
+    apriori = dst / 'Include/APRIORI.inc'
+    apriori.write_text(sub1(apriori.read_text(), f'  INF {BOOT_FLAGS}\n', f'  INF {inf}\n  INF {BOOT_FLAGS}\n', 'APRIORI.inc'))
+    dxe = dst / 'Include/DXE.inc'
+    dxe.write_text(dxe.read_text().rstrip('\n') + f'\n  INF {inf}\n')
+
+
+def stock_panels(firmware):
+    """The panel files of the firmware, under the names and GUIDs it has them, for DisplayDxe to pick from."""
+    found = re.findall(r'FILE FREEFORM = ([0-9A-Fa-f-]+) \{\s*SECTION UI = "((?:Panel_|mipi_)[^"]+\.xml)"\s*SECTION RAW = RawFiles/\2\s*\}',
+                       (firmware / 'DXE.inc').read_text())
+    if not any(name == 'Panel_tm_ft8719_fhd_vid.xml' for _, name in found):
+        raise SystemExit('the firmware does not list the panel of this phone')
+    return ''.join(f'  FILE FREEFORM = {guid} {{\n    SECTION UI = "{name}"\n    SECTION RAW = Binaries/doha/RawFiles/{name}\n  }}\n\n'
+                   for guid, name in found)
 
 
 def main():
@@ -95,6 +156,9 @@ def main():
     t = sub1(t, 'PcdFrameBufferHeight|2340', f'PcdFrameBufferHeight|{FB_HEIGHT}', 'dsc')
     if not re.search(r'USE_CUSTOM_DISPLAY_DRIVER\s*=\s*0', t):
         raise SystemExit('dsc: the first boot needs SimpleFbDxe (USE_CUSTOM_DISPLAY_DRIVER = 0)')
+    stock_display = bool(os.environ.get('DOHA_STOCK_DISPLAY'))
+    if stock_display:
+        t = re.sub(r'(USE_CUSTOM_DISPLAY_DRIVER\s*=\s*)0', r'\g<1>1', t, count=1)
     dsc.write_text(t)
 
     fdf = dst / 'doha.fdf'
@@ -113,15 +177,37 @@ def main():
     if seen != set(LEFT_OUT):
         raise SystemExit(f'module lists: did not find {set(LEFT_OUT) - seen}')
 
-    # willow's panels, only there for its own display driver, which this package does not build.
+    # Always: right after ClockDxe, ask for the bus the display reads the framebuffer through (/clk/mmrt), or the
+    # RPM turns it off and the screen ABL left on goes black. Diagnostic drivers placed after ClockDxe come after it.
+    add_halt(dst, 'ClockDxe', 'DohaMmrtDxe', 'part of the package')
+    halt_after = os.environ.get('DOHA_HALT_AFTER')
+    if halt_after:
+        add_halt(dst, halt_after, os.environ.get('DOHA_HALT_DRIVER', 'DohaHaltDxe'))
+    # DOHA_INSERT=MODULE=DRIVERS;MODULE=DRIVERS: diagnostic drivers at more than one place in the load order.
+    for group in filter(None, os.environ.get('DOHA_INSERT', '').split(';')):
+        module, drivers = group.split('=')
+        add_halt(dst, module, drivers)
+
+    if stock_display:
+        add_hwid(dst)
+    if os.environ.get('DOHA_LOG'):
+        add_log(dst)
+
+    # willow's panels, only there for its own display driver: either none, or the ones of the doha firmware.
+    panels = stock_panels(roots[0]) if stock_display else ''
     raw = dst / 'Include/RAW.inc'
-    t, n = re.subn(r'!if \$\(USE_CUSTOM_DISPLAY_DRIVER\) == 1\n.*?!endif\n', '', raw.read_text(), flags=re.S)
+    t, n = re.subn(r'!if \$\(USE_CUSTOM_DISPLAY_DRIVER\) == 1\n.*?!endif\n', lambda _: panels, raw.read_text(), flags=re.S)
     if n != 1:
         raise SystemExit(f'RAW.inc: expected one display block, found {n}')
     raw.write_text(t)
 
     cfg = dst / 'Library/ConfigurationMapLib/ConfigurationMapLib.c'
-    cfg.write_text(sub1(cfg.read_text(), '{"SecurityFlag", 0xC4}', '{"SecurityFlag", %s}' % SECURITY_FLAG, 'config map'))
+    t = sub1(cfg.read_text(), '{"SecurityFlag", 0xC4}', '{"SecurityFlag", %s}' % SECURITY_FLAG, 'config map')
+    if stock_display:
+        # The firmware's DisplayDxe runs its work on a thread when this is 1, through Qualcomm's scheduler, which
+        # Mu-Silicium does not have. With 1 it never returned on the doha.
+        t = sub1(t, '{"EnableDisplayThread", 1}', '{"EnableDisplayThread", 0}', 'config map')
+    cfg.write_text(t)
 
     build = dst / 'DeviceBuild.py'
     t = build.read_text()

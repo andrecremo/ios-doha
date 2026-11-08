@@ -1,0 +1,20 @@
+[Defines]
+  INF_VERSION    = 0x00010005
+  BASE_NAME      = DohaLogDxe
+  FILE_GUID      = 5E9A1D37-B2C4-46F8-9E03-8D17F4A6C25B
+  MODULE_TYPE    = DXE_DRIVER
+  VERSION_STRING = 1.0
+  ENTRY_POINT    = DohaLogEntry
+
+[Sources]
+  DohaLogDxe.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+
+[LibraryClasses]
+  UefiDriverEntryPoint
+  DebugLib
+
+[Depex]
+  TRUE

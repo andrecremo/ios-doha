@@ -9,7 +9,12 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=~/doha-xnu/uefi
 FIRMWARE=$WORK/private/doha
 MODE=${1:-DEBUG}        # DEBUG writes its log on the screen; RELEASE is silent
-OUT=/mnt/c/Users/andre/doha-uefi-$MODE.img
+# DOHA_HALT_AFTER=<module> makes a diagnostic image: DOHA_HALT_DRIVER (default DohaHaltDxe) runs right after
+# that module and the boot goes no further.
+# DOHA_STOCK_DISPLAY=1 uses the firmware's own DisplayDxe instead of the framebuffer ABL left on.
+# DOHA_LOG=1 keeps the logs in RAM and reboots at 25 s, for the shim to show them.
+# DOHA_INSERT (see mkdohapkg.py) puts diagnostic drivers at several places; the image is named -insert.
+OUT=/mnt/c/Users/andre/doha-uefi-$MODE${DOHA_STOCK_DISPLAY:+-display}${DOHA_LOG:+-log}${DOHA_INSERT:+-insert}${DOHA_HALT_AFTER:+-${DOHA_HALT_DRIVER:-halt}-$DOHA_HALT_AFTER}.img
 
 [ -d "$FIRMWARE" ] || { echo "no $FIRMWARE: run UEFIReader on the xbl first"; exit 1; }
 for tool in clang lld llvm-objcopy nasm mono make python3; do

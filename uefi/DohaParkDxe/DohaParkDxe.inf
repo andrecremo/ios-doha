@@ -1,0 +1,20 @@
+[Defines]
+  INF_VERSION    = 0x00010005
+  BASE_NAME      = DohaParkDxe
+  FILE_GUID      = 2E8D4B71-6C39-4F05-A1D7-58B3E92C40F6
+  MODULE_TYPE    = DXE_DRIVER
+  VERSION_STRING = 1.0
+  ENTRY_POINT    = DohaParkEntry
+
+[Sources]
+  DohaParkDxe.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+
+[LibraryClasses]
+  UefiDriverEntryPoint
+  DebugLib
+
+[Depex]
+  TRUE
