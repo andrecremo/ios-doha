@@ -14,7 +14,7 @@ MODE=${1:-DEBUG}        # DEBUG writes its log on the screen; RELEASE is silent
 # DOHA_STOCK_DISPLAY=1 uses the firmware's own DisplayDxe instead of the framebuffer ABL left on.
 # DOHA_LOG=1 keeps the logs in RAM and reboots at 25 s, for the shim to show them.
 # DOHA_INSERT (see mkdohapkg.py) puts diagnostic drivers at several places; the image is named -insert.
-OUT=/mnt/c/Users/andre/doha-uefi-$MODE${DOHA_STOCK_DISPLAY:+-display}${DOHA_LOG:+-log}${DOHA_INSERT:+-insert}${DOHA_HALT_AFTER:+-${DOHA_HALT_DRIVER:-halt}-$DOHA_HALT_AFTER}.img
+OUT=/mnt/c/Users/andre/doha-uefi-$MODE${DOHA_PAYLOAD:+-xnu}${DOHA_STOCK_DISPLAY:+-display}${DOHA_LOG:+-log}${DOHA_INSERT:+-insert}${DOHA_HALT_AFTER:+-${DOHA_HALT_DRIVER:-halt}-$DOHA_HALT_AFTER}.img
 
 [ -d "$FIRMWARE" ] || { echo "no $FIRMWARE: run UEFIReader on the xbl first"; exit 1; }
 for tool in clang lld llvm-objcopy nasm mono make python3; do
@@ -44,5 +44,7 @@ clang --target=aarch64-linux-gnu -c "$HERE/DohaShim.S" -o DohaShim.o
 aarch64-linux-gnu-objcopy -O binary DohaShim.o DohaShim.bin
 truncate -s 4096 DohaShim.bin
 
-python3 "$HERE/mkdohaimg.py" DohaShim.bin "$FD" "$HERE/../dtb/boot_a_unpacked/dtb" "$OUT"
+# DOHA_PAYLOAD=an XNUP container (willow-hackios's mkpayload.py): the shim copies it to 0xF0000000, and with
+# DOHA_WILLOW set the UEFI starts the XNU loader in it.
+python3 "$HERE/mkdohaimg.py" DohaShim.bin "$FD" "$HERE/../dtb/boot_a_unpacked/dtb" "$OUT" ${DOHA_PAYLOAD:+"$DOHA_PAYLOAD"}
 echo "done: $OUT"

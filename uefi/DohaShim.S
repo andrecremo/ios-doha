@@ -7,7 +7,8 @@
 #define FD_BASE     0x5FC00000
 #define FD_SIZE     0x300000
 #define TEXT_OFFSET 0x80000
-#define IMAGE_SIZE  0x400000    /* this page and the FD, in 2 MiB units */
+#define IMAGE_SIZE  0x400000    /* this page and the FD, in 2 MiB units; mkdohaimg.py raises it for a payload */
+#define PAYLOAD_BASE 0xF0000000 /* willow-hackios's: "XNU Payload" in the memory map, 64 MiB */
 #define FB_BASE     0x5C000000
 #define FB_STRIDE   4320
 
@@ -47,6 +48,28 @@ copy:
 	stp	x2, x3, [x5], #16
 	subs	x6, x6, #16
 	b.ne	copy
+
+	/*
+	 * x4 is now just past the FD: an "XNUP" container may follow (mkdohaimg.py -p), for willow-hackios's
+	 * XNU loader. It goes to PAYLOAD_BASE, where the UEFI's BootManagerLib looks for it (willow-hackios
+	 * uefi/mu-silicium.patch does the same in Mu-Silicium's BootShim). The magic is built in registers,
+	 * so that the shim itself never contains it.
+	 */
+	ldr	w2, [x4]
+	movz	w3, #0x4E58
+	movk	w3, #0x5055, lsl #16		/* "XNUP" */
+	cmp	w2, w3
+	b.ne	no_payload
+	ldr	w6, [x4, #4]			/* size after the 8-byte header */
+	add	x6, x6, #23			/* the header, rounded up to 16 */
+	and	x6, x6, #~15
+	movz	x5, #(PAYLOAD_BASE >> 16), lsl #16
+payload:
+	ldp	x2, x3, [x4], #16
+	stp	x2, x3, [x5], #16
+	subs	x6, x6, #16
+	b.ne	payload
+no_payload:
 	dsb	sy
 	ic	iallu
 	dsb	sy

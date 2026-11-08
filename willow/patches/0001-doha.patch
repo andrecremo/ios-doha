@@ -1,0 +1,115 @@
+From 235077f1141f250f12cc037bad4ae71ec3c539b5 Mon Sep 17 00:00:00 2001
+From: ios-doha <ios-doha@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 18:34:50 -0300
+Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
+
+The loader tells devices apart by the framebuffer base, which doha's UEFI
+shares with willow (0x5C000000): it now also compares the height. doha gets
+willow's SoC values and nothing of willow's board. With no logdump and no
+USB link yet, the loader leaves its screen up 30 s before its reset on doha.
+In the kernel, doha uses the SM6125's timer interrupt like willow, and has
+its own row of buttons (the PM6125's power-on block; volume up on its GPIO9).
+---
+ xnu/files/bsd/dev/redwood_buttons.c |  3 +++
+ xnu/files/osfmk/arm64/gic_v3_irq.c  |  4 ++--
+ xnuloader/loader.c                  | 26 +++++++++++++++++++++++++-
+ 3 files changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/xnu/files/bsd/dev/redwood_buttons.c b/xnu/files/bsd/dev/redwood_buttons.c
+index 593ed6e..619bd93 100644
+--- a/xnu/files/bsd/dev/redwood_buttons.c
++++ b/xnu/files/bsd/dev/redwood_buttons.c
+@@ -170,6 +170,9 @@ static const struct board {
+ 	/* qcom,spmi@1c40000 of willow's device tree; qcom,power-on@800 of the PM6125, gpio_keys' GPIO5 of it */
+ 	{ "willow", 0x01c40000, 0x01c0a000, 0x03e00000, "the PM6125's power-on block", 0x008, 0x01, 0x05, 0x01, 0x02,
+ 	  "GPIO5 of the PM6125", 0x0c4 },
++	/* doha: the same PM6125 and SPMI; volume up is gpio_keys' GPIO9 of the PM6125 (pinctrl@c000, phandle 0x1e0) */
++	{ "doha", 0x01c40000, 0x01c0a000, 0x03e00000, "the PM6125's power-on block", 0x008, 0x01, 0x05, 0x01, 0x02,
++	  "GPIO9 of the PM6125", 0x0c8 },
+ };
+ static const struct board *board = &boards[0];
+ 
+diff --git a/xnu/files/osfmk/arm64/gic_v3_irq.c b/xnu/files/osfmk/arm64/gic_v3_irq.c
+index ce5452a..62a6911 100644
+--- a/xnu/files/osfmk/arm64/gic_v3_irq.c
++++ b/xnu/files/osfmk/arm64/gic_v3_irq.c
+@@ -500,8 +500,8 @@ gic_v3_irq_cpu_init(void)
+ 			char device[16] = "";
+ 			uint32_t ppi = 0;
+ 
+-			if (PE_parse_boot_arg_str("device", device, sizeof(device)) && strcmp(device, "willow") == 0) {
+-				gic_vtimer = GIC_INTID_VTIMER_QCOM;
++			if (PE_parse_boot_arg_str("device", device, sizeof(device)) && (strcmp(device, "willow") == 0 || strcmp(device, "doha") == 0)) {
++				gic_vtimer = GIC_INTID_VTIMER_QCOM;     /* the SM6125's, both phones */
+ 			}
+ 			if (PE_parse_boot_argn("vtimer_ppi", &ppi, sizeof(ppi)) && ppi >= 16 && ppi < 32) {
+ 				gic_vtimer = ppi;
+diff --git a/xnuloader/loader.c b/xnuloader/loader.c
+index 256397e..bc00b1d 100644
+--- a/xnuloader/loader.c
++++ b/xnuloader/loader.c
+@@ -541,6 +541,7 @@ struct platform {
+ 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
+ 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
+ 	uint64_t fb_base;                /* the framebuffer the firmware reports (GOP): it tells this device apart */
++	uint32_t fb_height;              /* ... with its height, when two devices share a base (willow, doha); 0: any */
+ 	const struct store_part *store;  /* the partition a write may reach; NULL: none */
+ 	const struct store_part *data_store;     /* ... with ufs_write=data instead: a filesystem's, whole */
+ };
+@@ -619,10 +620,26 @@ static const struct platform platform_willow = {
+ 	 */
+ 	.small_cores = 0xf0,
+ 	.fb_base = 0x5C000000,           /* Mu-Silicium willowPkg: "Display Reserved", 1080 x 2340 */
++	.fb_height = 2340,
+ 	.store = &willow_store,
+ 	.data_store = &willow_data_store,
+ };
+ 
++/*
++ * Moto G8 Plus (doha, SM6125, github.com/andrecremo/ios-doha): the same SoC as willow, so the same peripherals,
++ * GIC and clusters, and its UEFI (dohaPkg) puts the framebuffer at the same 0x5C000000; the screen is 1080 x 2280,
++ * which tells it from willow. No partition is written yet (no store), and nothing of willow's board: not its OSM
++ * settings, nor its RPM voltages, nor its touch panel (the kernel's drivers check device=).
++ */
++static const struct platform platform_doha = {
++	.name = "doha", .io_base = 0x00400000, .io_size = 0x3FC00000,
++	.gic_dist = 0x0F200000, .gic_redist = 0x0F300000, .uart = 0, .log_other_cpu = 1,
++	.cores = 8, .core_mpidr = willow_core_mpidr,
++	.small_cores = 0xf0,             /* as on willow: Gold stays at its lowest clock with no OSM */
++	.fb_base = 0x5C000000,           /* dohaPkg: "Display Reserved", what ABL scans out, 1080 x 2280 */
++	.fb_height = 2280,
++};
++
+ /* The slower cores of this run: the platform's, unless willow_osm() has raised the Gold cluster's clock. */
+ static uint32_t small_cores_now;
+ 
+@@ -655,6 +672,7 @@ platform_mpidr_core(const struct platform *plat, uint64_t mpidr)
+ static const struct platform *const platforms[] = {
+ 	&platform_redwood,
+ 	&platform_willow,
++	&platform_doha,
+ };
+ 
+ /* ------------------------------------------------------------------------ */
+@@ -4503,7 +4521,8 @@ efi_main(efi_handle image, efi_system_table *st)
+ 		SCREEN.height = GOP->mode->info->height;
+ 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
+ 		for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++)
+-			if (platforms[i]->fb_base == SCREEN.base)
++			if (platforms[i]->fb_base == SCREEN.base &&
++			    (platforms[i]->fb_height == 0 || platforms[i]->fb_height == SCREEN.height))
+ 				PLAT = platforms[i];
+ 		if (PLAT == &platform_qemu_virt)
+ 			ramfb_phone_screen();
+@@ -4524,6 +4543,11 @@ efi_main(efi_handle image, efi_system_table *st)
+ 	if (have_payload) {
+ 		run_kernel(0, 0);
+ 	}
++	if (PLAT == &platform_doha) {
++		/* doha has no logdump and no USB link to the loader yet: its screen is the only log, so leave time to read it */
++		print("reset in 30 s\n");
++		BS->stall(30000000);
++	}
+ 	reboot();
+ 	return 0;
+ }

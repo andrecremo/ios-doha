@@ -559,3 +559,24 @@ original cria um cliente obrigatório (`0x40`, `UEFI_DISPLAY_DRIVER`) e pede 240
 `ClockDxe`: com ele, a tela que o ABL deixou continua acesa até o fim do boot, com o `SimpleFbDxe` (sha256 `22237cabbb53289f`).
 Antes e depois ficam iguais: AXI `00004221`, `mdss_gdscr` `F822F000` (ligado), pipe `VIG0` em `0x5C000000`, 1080 x 2280.
 `mkdohapkg.py` agora põe o `DohaMmrtDxe` sempre depois do `ClockDxe`. As 66 partições e as duas GPT seguem iguais ao backup.
+
+## Base willow-hackios: o loader no doha
+
+`willow/patches/0001` (sobre willow-hackios `796e42b`): o `xnuloader` escolhe o aparelho pelo endereço do framebuffer, que
+o doha divide com o willow (`0x5C000000`), e agora também pela altura (2280 contra 2340). `platform_doha` tem os valores
+do SoC do willow e nada da placa dele (sem partição, OSM, RPM ou touch). No kernel, `device=doha` usa o timer da Qualcomm
+como o willow (`gic_v3_irq.c`) e tem a sua linha nos botões (`redwood_buttons.c`: power e volume para baixo no PON do PM6125,
+volume para cima no GPIO9 do PM6125, lidos do device tree do doha). Sem kernel, o loader espera 30 s antes do reset no doha.
+Cuidados: sem `gpu=1` (o driver do redwood decide pelo SoC base, igual ao do doha), `touchscreen=1`, `osm=`, `ufs_write=`.
+
+UEFI: `DohaShim.S` copia um contêiner XNUP que segue o FD para `0xF0000000`; `mkdohaimg.py` o acrescenta e aumenta o
+`image_size`; `mkdohapkg.py` reserva `QTEE`, `TZApps` e `XNU Payload` no mapa de memória e, com `DOHA_WILLOW`, monta em
+`dohaPkg/Library/BootManagerLib` a biblioteca da base do willow (`e51cd877`) com o patch dele e o `XnuLoader.c`, que no
+doha também escreve na tela o que faz. Primeiro boot com só o loader no pacote (sha256 `3ac1a7260f45de12`):
+
+    == XNULOADER v3 ==
+    CurrentEL=1 MIDR=51af8014 MMFR0=1122 CNTFRQ=19200000 image=a1000000
+    display 1080 x 2280 at 5c000000
+    platform doha
+    payload entry 'loader.efi' size 11e00
+    no kernel in payload

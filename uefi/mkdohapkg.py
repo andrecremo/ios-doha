@@ -13,7 +13,9 @@ loading peripherals, the buttons, and every Motorola module but one (BOOT_FLAGS 
 import os
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 FD_BASE, FD_SIZE = '0x5FC00000', '0x300000'
@@ -101,6 +103,88 @@ def add_log(dst):
     apriori.write_text(sub1(apriori.read_text(), f'  INF {BOOT_FLAGS}\n', f'  INF {inf}\n  INF {BOOT_FLAGS}\n', 'APRIORI.inc'))
     dxe = dst / 'Include/DXE.inc'
     dxe.write_text(dxe.read_text().rstrip('\n') + f'\n  INF {inf}\n')
+
+
+def show_xnu_loader_log(path):
+    """willow-hackios's XnuLoader.c keeps its log for a "logdump" partition, which the doha does not have, and resets
+    at once: the doha's copy also prints what it does and the whole log on the screen, and waits 30 s first."""
+    raw = path.read_bytes()
+    crlf = b'\r\n' in raw
+    t = raw.decode().replace('\r\n', '\n')
+    t = sub1(t, '#include <Library/PrintLib.h>\n', '#include <Library/PrintLib.h>\n#include <Library/DebugLib.h>\n', 'XnuLoader.c')
+    t = sub1(t, '  if (Header->Magic != XNU_PAYLOAD_MAGIC || Header->Size > XNU_PAYLOAD_MAX_SIZE) {\n    return;\n  }\n',
+             '  DEBUG ((DEBUG_ERROR, "XnuLoader: payload at %lx: magic %08x size %x\\n", (UINT64)XNU_PAYLOAD_BASE,\n'
+             '          Header->Magic, Header->Size));\n'
+             '  if (Header->Magic != XNU_PAYLOAD_MAGIC || Header->Size > XNU_PAYLOAD_MAX_SIZE) {\n    return;\n  }\n',
+             'XnuLoader.c')
+    t = sub1(t, '      if (!EFI_ERROR (gBS->LoadImage (FALSE, gImageHandle, NULL, Entry + 1, Entry->Size, &Handle))) {\n'
+                '        gBS->StartImage (Handle, NULL, NULL);\n      }\n',
+             '      EFI_STATUS  Status = gBS->LoadImage (FALSE, gImageHandle, NULL, Entry + 1, Entry->Size, &Handle);\n\n'
+             '      DEBUG ((DEBUG_ERROR, "XnuLoader: loader.efi, %u bytes: LoadImage %r\\n", Entry->Size, Status));\n'
+             '      if (!EFI_ERROR (Status)) {\n'
+             '        Status = gBS->StartImage (Handle, NULL, NULL);\n'
+             '        DEBUG ((DEBUG_ERROR, "XnuLoader: StartImage returned %r\\n", Status));\n'
+             '      }\n', 'XnuLoader.c')
+    t = sub1(t, '  // The phone is unattended: always come back to Android.\n',
+             '  // The doha has no logdump: the log goes on the screen, line by line, with time to read it.\n'
+             '  if (mLog != NULL) {\n'
+             '    CHAR8 *Line = mLog;\n\n'
+             '    while (*Line != 0) {\n'
+             '      CHAR8  *End = Line;\n'
+             '      CHAR8  Keep;\n\n'
+             '      while (*End != 0 && *End != \'\\n\' && End - Line < 120) {\n'
+             '        End++;\n'
+             '      }\n\n'
+             '      Keep = *End;\n'
+             '      *End = 0;\n'
+             '      DEBUG ((DEBUG_ERROR, "%a\\n", Line));\n'
+             '      *End = Keep;\n'
+             '      Line = (Keep == \'\\n\') ? End + 1 : End;\n'
+             '    }\n'
+             '  }\n\n'
+             '  DEBUG ((DEBUG_ERROR, "XnuLoader: reset in 30 s\\n"));\n'
+             '  gBS->Stall (30000000);\n\n'
+             '  // The phone is unattended: always come back to Android.\n', 'XnuLoader.c')
+    path.write_bytes(t.replace('\n', '\r\n').encode() if crlf else t.encode())
+
+
+def add_xnu_boot(mu, dst, willow):
+    """BDS starts willow-hackios's XNU loader ("loader.efi" in the XNUP payload at 0xF0000000) instead of giving up.
+
+    willow-hackios patches Mu-Silicium's BootManagerLib in place (uefi/mu-silicium.patch, on its uefi/BASE commit);
+    here the patched library is made in dohaPkg from that same base, so that neither tree is changed and nothing of
+    willow-hackios is copied into this repository.
+    """
+    base = (willow / 'uefi/BASE').read_text().strip()
+    rel = 'Silicon/Silicium/SiliciumPkg/Library/BootManagerLib'
+    lib = dst / 'Library/BootManagerLib'
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp) / rel
+        work.mkdir(parents=True)
+        names = subprocess.run(['git', '-C', str(mu), 'ls-tree', '--name-only', f'{base}:{rel}'],
+                               capture_output=True, check=True, text=True).stdout.split()
+        for name in names:
+            text = subprocess.run(['git', '-C', str(mu), 'show', f'{base}:{rel}/{name}'],
+                                  capture_output=True, check=True).stdout
+            (work / name).write_bytes(text)
+        # As bytes: the patched files have CRLF line ends, which reading as text would turn into LF.
+        patch = (willow / 'uefi/mu-silicium.patch').read_bytes()
+        hunk = patch[patch.index(f'diff --git a/{rel}/BootManager.c'.encode()):]
+        subprocess.run(['patch', '-s', '-p1', '-d', tmp], input=hunk, check=True)
+        for name in ('XnuLoader.c', 'XnuLoader.h'):
+            shutil.copy(willow / 'uefi/files' / rel / name, work / name)
+        show_xnu_loader_log(work / 'XnuLoader.c')
+        shutil.copytree(work, lib)
+    if 'XnuLoaderMain ()' not in (lib / 'BootManager.c').read_text() or 'XnuLoader.c' not in (lib / 'BootManagerLib.inf').read_text():
+        raise SystemExit('BootManagerLib: willow-hackios patch did not give the XNU loader hook')
+    dsc = dst / 'doha.dsc'
+    t = dsc.read_text()
+    # The [LibraryClasses] of doha.dsc come after the SiliciumPkg include, so this mapping is the one used.
+    t = sub1(t, '  MemoryMapLib|dohaPkg/Library/MemoryMapLib/MemoryMapLib.inf\n',
+             '  MemoryMapLib|dohaPkg/Library/MemoryMapLib/MemoryMapLib.inf\n'
+             '  PlatformBootManagerLib|dohaPkg/Library/BootManagerLib/BootManagerLib.inf\n', 'dsc')
+    dsc.write_text(t)
+    print(f'BDS starts the XNU loader: BootManagerLib from willow-hackios {base[:8]} + its patch')
 
 
 def stock_panels(firmware):
@@ -208,6 +292,23 @@ def main():
         # Mu-Silicium does not have. With 1 it never returned on the doha.
         t = sub1(t, '{"EnableDisplayThread", 1}', '{"EnableDisplayThread", 0}', 'config map')
     cfg.write_text(t)
+
+    # Kept out of the UEFI's memory: TrustZone's regions (the doha xbl's TzAppsRegnAddr = 0x46D00000; Android's
+    # removed_region covers 0x46200000 to 0x48F00000), and the 64 MiB where the shim puts an XNUP payload.
+    mm = dst / 'Library/MemoryMapLib/MemoryMapLib.c'
+    t = mm.read_text()
+    t = sub1(t, '  {"SMEM",              0x46000000, 0x00200000, AddMem, MEM_RES, WRITE_COMBINEABLE, Reserv, UNCACHED_UNBUFFERED_XN},\n',
+             '  {"SMEM",              0x46000000, 0x00200000, AddMem, MEM_RES, WRITE_COMBINEABLE, Reserv, UNCACHED_UNBUFFERED_XN},\n'
+             '  {"QTEE",              0x46200000, 0x00B00000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},\n'
+             '  {"TZApps",            0x46D00000, 0x02200000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},\n', 'memory map')
+    t = sub1(t, '  {"Info Blk",          0x5FFFF000, 0x00001000, AddMem, SYS_MEM, SYS_MEM_CAP, RtData, WRITE_BACK_XN},\n',
+             '  {"Info Blk",          0x5FFFF000, 0x00001000, AddMem, SYS_MEM, SYS_MEM_CAP, RtData, WRITE_BACK_XN},\n'
+             '  {"XNU Payload",       0xF0000000, 0x04000000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},\n', 'memory map')
+    mm.write_text(t)
+
+    # DOHA_WILLOW=path to a willow-hackios tree: BDS starts its XNU loader from the payload (see add_xnu_boot).
+    if os.environ.get('DOHA_WILLOW'):
+        add_xnu_boot(mu, dst, Path(os.environ['DOHA_WILLOW']))
 
     build = dst / 'DeviceBuild.py'
     t = build.read_text()
