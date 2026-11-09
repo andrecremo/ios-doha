@@ -580,3 +580,24 @@ doha também escreve na tela o que faz. Primeiro boot com só o loader no pacote
     platform doha
     payload entry 'loader.efi' size 11e00
     no kernel in payload
+
+Kernel: willow-hackios + o patch, `xnu-8796.121.2`, compilado no WSL (theos com `iPhoneOS16.5.sdk`, `xnu-deps/setup.sh`,
+`xnu/apply.sh`, `./xnu-build.sh -j6 -k`; o `-k` é obrigatório, a checagem de exportações falha depois do link). Resultado:
+`mach.development.bcm2837`, 15760312 bytes, `Darwin Kernel Version 22.5.0`, com a linha de botões do doha. O loader passa a
+ser ligado em `0x61000000` (`LOADER_BASE`), fora de `0x80000000`-`0xF0000000`, o maior bloco livre da UEFI, que o XNU usa.
+
+Primeiro boot do kernel (pacote: `loader.efi`, `kernel`, `cmdline` `-v cpus=1`; imagem de 8 MB): o XNU sobe e escreve na
+tela. `GICv3 ... virtual timer on interrupt 19`, mapas de VM e zonas sem erro, `GenericARMPE: platform "D22AP"`,
+`GenericARMCPU: cpu 0 ... registered`, AMFI e Sandbox substitutos, `mbinit`, `dlil_init`, e por último
+`MiniIOMobileFramebuffer: display 1125x2436 on a panel of 1080x2280 (4320 bytes per row)`. Sem disco raiz no pacote.
+
+Na volta ao loader, o kernel deixava ligada a interrupção do seu timer (19) com o timer armado; a UEFI não a trata e escrevia
+`Spurious GIC interrupt: 0x13` sem fim (`ArmGicV3Dxe`). O patch agora a desliga em `gic_v3_irq_quiesce`. `run-doha-kernel.sh`
+copia `xnu/files/` para a árvore já criada, porque `xnu/apply.sh` só o faz ao criá-la.
+
+Segundo boot do kernel (compilado 2026-11-09 07:31): depois do framebuffer, `GenericARMPE: the slower cores started too:
+1 processors running`, `BSD`, `Waiting on <dict>... IOMedia ... Content Apple_HFS ...`, `Still waiting for root device`, e o
+panic `Failed to mount root device` com `Boot args: debug=0x8 device=doha -v cpus=1`, `Stackshot Succeeded` e reboot. Sem o
+loop do GIC. O XNU sobe inteiro no doha até montar a raiz.
+
+Próximo: o volume do iOS. A imagem reduzida do willow (~2,5 GB) cabe na `system_b` (3238002688 bytes) sem apagar a `userdata`.

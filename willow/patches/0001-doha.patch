@@ -1,6 +1,6 @@
-From 235077f1141f250f12cc037bad4ae71ec3c539b5 Mon Sep 17 00:00:00 2001
+From 2e6974463db33e1e9879b076a9225f825187d2bc Mon Sep 17 00:00:00 2001
 From: ios-doha <ios-doha@users.noreply.github.com>
-Date: Sun, 8 Nov 2026 18:34:50 -0300
+Date: Sun, 8 Nov 2026 19:05:47 -0300
 Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
 
 The loader tells devices apart by the framebuffer base, which doha's UEFI
@@ -9,11 +9,13 @@ willow's SoC values and nothing of willow's board. With no logdump and no
 USB link yet, the loader leaves its screen up 30 s before its reset on doha.
 In the kernel, doha uses the SM6125's timer interrupt like willow, and has
 its own row of buttons (the PM6125's power-on block; volume up on its GPIO9).
+Going back to the loader, the kernel switches its timer's interrupt off: the
+UEFI has no handler for it and saw it without end.
 ---
  xnu/files/bsd/dev/redwood_buttons.c |  3 +++
- xnu/files/osfmk/arm64/gic_v3_irq.c  |  4 ++--
+ xnu/files/osfmk/arm64/gic_v3_irq.c  | 12 ++++++++++--
  xnuloader/loader.c                  | 26 +++++++++++++++++++++++++-
- 3 files changed, 30 insertions(+), 3 deletions(-)
+ 3 files changed, 38 insertions(+), 3 deletions(-)
 
 diff --git a/xnu/files/bsd/dev/redwood_buttons.c b/xnu/files/bsd/dev/redwood_buttons.c
 index 593ed6e..619bd93 100644
@@ -30,10 +32,25 @@ index 593ed6e..619bd93 100644
  static const struct board *board = &boards[0];
  
 diff --git a/xnu/files/osfmk/arm64/gic_v3_irq.c b/xnu/files/osfmk/arm64/gic_v3_irq.c
-index ce5452a..62a6911 100644
+index ce5452a..00b41f0 100644
 --- a/xnu/files/osfmk/arm64/gic_v3_irq.c
 +++ b/xnu/files/osfmk/arm64/gic_v3_irq.c
-@@ -500,8 +500,8 @@ gic_v3_irq_cpu_init(void)
+@@ -424,6 +424,14 @@ gic_v3_irq_quiesce(void)
+ 		__builtin_arm_isb(ISB_SY);
+ 		gic_active_iar[cpu] = 0;
+ 	}
++	/*
++	 * The timer's interrupt is this kernel's too. Left enabled, with the virtual timer still armed, it reaches
++	 * the loader's UEFI, which has no handler for it (19 on the SM6125: the UEFI's own timer is another one):
++	 * doha's showed "Spurious GIC interrupt: 0x13" without end and never got to the loader.
++	 */
++	if (gicr_cpu_base[cpu] != 0) {
++		gic_write32(gicr_cpu_base[cpu] + GICR_ICENABLER0, 1u << gic_vtimer);
++	}
+ }
+ 
+ /*
+@@ -500,8 +508,8 @@ gic_v3_irq_cpu_init(void)
  			char device[16] = "";
  			uint32_t ppi = 0;
  
