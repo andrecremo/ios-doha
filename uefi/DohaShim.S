@@ -8,7 +8,12 @@
 #define FD_SIZE     0x300000
 #define TEXT_OFFSET 0x80000
 #define IMAGE_SIZE  0x400000    /* this page and the FD, in 2 MiB units; mkdohaimg.py raises it for a payload */
-#define PAYLOAD_BASE 0xF0000000 /* willow-hackios's: "XNU Payload" in the memory map, 64 MiB */
+/*
+ * "XNU Payload" in the memory map, 64 MiB. Not willow-hackios's 0xF0000000: that cut the free RAM from 0x80000000
+ * to 0x13FFFFFFF in two and left XNU 1.75 GB of it; here, below 0x80000000 (RAM Android had, 0x5F800000-0x7DCFFFFF),
+ * the whole of it is the kernel's. The XNU loader is built with the same PAYLOAD_BASE.
+ */
+#define PAYLOAD_BASE 0x78000000
 #define FB_BASE     0x5C000000
 #define FB_STRIDE   4320
 

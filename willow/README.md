@@ -26,8 +26,7 @@ without changing either tree:
   with its patch and its `XnuLoader.c`: when BDS has nothing to boot, it starts `loader.efi` from the container;
 - `uefi/build-doha.sh` takes `DOHA_WILLOW` and `DOHA_PAYLOAD` (the image is then `doha-uefi-DEBUG-xnu.img`).
 
-Not to be used on doha: `gpu=1` (the redwood GPU driver decides by the SoC base, which doha shares with redwood),
-`ufs_write=`, and anything from
+Not to be used on doha: `ufs_write=`, and anything from
 `prebuilt/`.
 
 The patch also adds doha's touch screen, `bsd/dev/redwood_focaltech.c` (`touchscreen=1` with `device=doha`): a
@@ -36,5 +35,11 @@ FocalTech FT8719 on the same SPI engine and pins as willow's Novatek, its protoc
 (`/vendor/firmware/focaltech-ft8719-a0-0000-doha.bin`, not in this repository) into its RAM without touching its reset
 line, which is the panel's too. `patches/userland/0001-doha-ft8719-firmware.patch` (on willow-hackios's `userland`
 branch, `0ffde01`) puts that file into the small image as `fw/focaltech_ts_fw.bin` from `fw-touch/`.
+
+`gpu=1` works on doha too: the patch lets `redwood_a610.c`, `redwood_rpm.c` and `redwood_osm.c` take `device=doha`,
+keeps `redwood_adreno.c` (redwood's Adreno 642L) off as on willow, and puts the zap shader where doha's device tree has
+its `gpu_region` (`0x57115000`; willow's is `0x57515000`). The firmware is the phone's (`a610_zap.*` from its `modem`
+partition, `a630_sqe.fw` from `/vendor/firmware`), in `fw-a610/`. With a `GL=1` small image and `gpu=1 fb_gpu=1
+fbwidth=1080 fbheight=2280` the home screen draws in 35-99 ms a frame instead of 1749.
 
 Not done yet: the loader's log, which goes to a `logdump` partition doha does not have.

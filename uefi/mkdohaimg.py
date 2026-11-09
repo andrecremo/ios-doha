@@ -5,7 +5,7 @@ own: header v2.
   mkdohaimg.py SHIM.bin SILICIUM_UEFI.fd DTB OUT.img [PAYLOAD.bin]
 
 The payload is a complete "XNUP" container (willow-hackios's xnuloader/mkpayload.py); the shim copies it to
-0xF0000000, where the UEFI's BootManagerLib finds the XNU loader in it.
+0x78000000 (DohaShim.S), where the UEFI's BootManagerLib finds the XNU loader in it.
 """
 import gzip
 import hashlib

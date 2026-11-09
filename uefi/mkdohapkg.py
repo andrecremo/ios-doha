@@ -149,7 +149,7 @@ def show_xnu_loader_log(path):
 
 
 def add_xnu_boot(mu, dst, willow):
-    """BDS starts willow-hackios's XNU loader ("loader.efi" in the XNUP payload at 0xF0000000) instead of giving up.
+    """BDS starts willow-hackios's XNU loader ("loader.efi" in the XNUP payload at 0x78000000) instead of giving up.
 
     willow-hackios patches Mu-Silicium's BootManagerLib in place (uefi/mu-silicium.patch, on its uefi/BASE commit);
     here the patched library is made in dohaPkg from that same base, so that neither tree is changed and nothing of
@@ -174,6 +174,10 @@ def add_xnu_boot(mu, dst, willow):
         for name in ('XnuLoader.c', 'XnuLoader.h'):
             shutil.copy(willow / 'uefi/files' / rel / name, work / name)
         show_xnu_loader_log(work / 'XnuLoader.c')
+        # the payload where DohaShim.S puts it (0x78000000: XNU keeps the RAM above 0x80000000 in one piece)
+        h = work / 'XnuLoader.h'
+        h.write_text(sub1(h.read_text(), '#define XNU_PAYLOAD_BASE      0xF0000000ULL',
+                          '#define XNU_PAYLOAD_BASE      0x78000000ULL', 'XnuLoader.h'))
         shutil.copytree(work, lib)
     if 'XnuLoaderMain ()' not in (lib / 'BootManager.c').read_text() or 'XnuLoader.c' not in (lib / 'BootManagerLib.inf').read_text():
         raise SystemExit('BootManagerLib: willow-hackios patch did not give the XNU loader hook')
@@ -303,7 +307,7 @@ def main():
              '  {"TZApps",            0x46D00000, 0x02200000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},\n', 'memory map')
     t = sub1(t, '  {"Info Blk",          0x5FFFF000, 0x00001000, AddMem, SYS_MEM, SYS_MEM_CAP, RtData, WRITE_BACK_XN},\n',
              '  {"Info Blk",          0x5FFFF000, 0x00001000, AddMem, SYS_MEM, SYS_MEM_CAP, RtData, WRITE_BACK_XN},\n'
-             '  {"XNU Payload",       0xF0000000, 0x04000000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},\n', 'memory map')
+             '  {"XNU Payload",       0x78000000, 0x04000000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},\n', 'memory map')
     mm.write_text(t)
 
     # DOHA_WILLOW=path to a willow-hackios tree: BDS starts its XNU loader from the payload (see add_xnu_boot).

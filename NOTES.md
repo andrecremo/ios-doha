@@ -663,3 +663,22 @@ o driver nunca o toca e usa o caminho de recuperação sem reset da Motorola. O 
 Lineage, fora do repositório; o `userland/build.sh` o põe em `fw/` (`willow/patches/userland/`). O painel
 `fb_hud=1` mostra "Touch ok, FT8719, 100 Hz", e o iOS reage ao dedo. A tela continua a ~1 quadro por segundo
 (1749 ms por quadro desenhados pela CPU): o próximo passo é a GPU (Adreno 610).
+
+**GPU (Adreno 610) desenhando o iOS (2026-11-09).** O `redwood_a610.c` do willow serve ao doha com o patch 0001:
+`device=doha` aceito nele, no `redwood_rpm.c` (os barramentos bimc/snoc e o ce1, recursos do SoC) e no `redwood_osm.c`;
+o `redwood_adreno.c` (Adreno 642L do redwood) fica de fora no doha como no willow; e a região do zap shader é a do
+device tree do doha, `gpu_region@57115000` (8 KB, dentro do "PIL Reserved" da UEFI), não a do willow (`0x57515000`).
+Firmware do aparelho, fora do repositório: `a610_zap.mdt`/`.b00`-`.b02` da partição `modem_a` (ext4, montada
+`ro,noload` pelo recovery; a pasta `image` inteira, 204 arquivos, guardada) e `a630_sqe.fw` da `vendor_a`, em
+`fw-a610/`. Com `gpu=1` o painel diz "GPU kept on at 745 MHz" (zap autenticado pela TrustZone, fim do modo seguro).
+Com `GL=1` (o Mesa 25.0.7 do willow, freedreno; meson 1.6.1 do pip, porque o do Ubuntu 24.04 é 1.3) e
+`gpu=1 fb_gpu=1 fbwidth=1080 fbheight=2280`: a tela inicial passa de 1749 ms por quadro para 35-99 ms (9-27 fps).
+
+Memória: o mapa da UEFI (`memmap=1` no loader, só no doha: a lista na tela por 20 s) mostrou RAM livre de `0x80000000`
+a `0x13FFFFFFF` cortada pelo payload em `0xF0000000` (o endereço do willow): o kernel ficava com `0x80000000`-`0xF0000000`,
+1792 MB, e `0xF4000000`-`0x140000000` (1216 MB) sobrava. O payload passa a `0x78000000` (`uefi/DohaShim.S`, o mapa de
+memória e o `XnuLoader.h` em `mkdohapkg.py`; o loader com `PAYLOAD_BASE=0x78000000` no build), dentro do bloco livre
+`0x6176b000`-`0x7dd00000`. O kernel fica com 3 GB: "available" 2585 MB no logo e ~1500 MB na tela inicial (era 530-760).
+`sb_statusbar=1` troca a barra vermelha `rdar:45025538` pela de verdade. A Biblioteca de Apps ainda leva até 1231 ms
+por quadro, com a GPU mostrando o quadro em 6 ms: o gargalo é a CPU (os Gold a 300 MHz). `CPUMASK=0x0e GLASYNC=1`
+juntos reiniciaram depois do loader: a testar um de cada vez.

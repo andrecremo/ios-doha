@@ -1,19 +1,75 @@
-From 858d6ccc12bbed8ddfda10573338da120627c45c Mon Sep 17 00:00:00 2001
+From 2319bcbb320f9787d5cac839f6122ed19b27c9ff Mon Sep 17 00:00:00 2001
 From: andrecremo <andreljsantos@gmail.com>
-Date: Mon, 9 Nov 2026 15:29:51 -0300
+Date: Mon, 9 Nov 2026 16:43:19 -0300
 Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
 
 ---
+ xnu/files/bsd/dev/redwood_a610.c      |  15 +-
+ xnu/files/bsd/dev/redwood_adreno.c    |   5 +-
  xnu/files/bsd/dev/redwood_buttons.c   |   3 +
  xnu/files/bsd/dev/redwood_focaltech.c | 918 ++++++++++++++++++++++++++
  xnu/files/bsd/dev/redwood_input.c     |   1 +
+ xnu/files/bsd/dev/redwood_osm.c       |   3 +-
+ xnu/files/bsd/dev/redwood_rpm.c       |   3 +-
  xnu/files/bsd/sys/redwood_input.h     |   1 +
  xnu/files/osfmk/arm64/gic_v3_irq.c    |  12 +-
  xnu/redwood.patch                     |   9 +-
- xnuloader/loader.c                    |  43 +-
- 7 files changed, 979 insertions(+), 8 deletions(-)
+ xnuloader/build.sh                    |   3 +-
+ xnuloader/loader.c                    |  59 +-
+ 12 files changed, 1017 insertions(+), 15 deletions(-)
  create mode 100644 xnu/files/bsd/dev/redwood_focaltech.c
 
+diff --git a/xnu/files/bsd/dev/redwood_a610.c b/xnu/files/bsd/dev/redwood_a610.c
+index 6ce395a..644eecd 100644
+--- a/xnu/files/bsd/dev/redwood_a610.c
++++ b/xnu/files/bsd/dev/redwood_a610.c
+@@ -917,7 +917,9 @@ scm3(const char *what, uint64_t function, uint64_t arguments, uint64_t first, ui
+  */
+ #define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
+ #define SCM_THREE_VALUES        3
+-#define ZAP_REGION_PHYS         0x57515000UL
++/* willow's; doha's device tree has gpu_region@57115000 instead (redwood_a610_init() sets it) */
++static unsigned long zap_region_phys = 0x57515000UL;
++#define ZAP_REGION_PHYS         zap_region_phys
+ #define ZAP_REGION_SIZE         0x2000UL
+ #define MDT_RELOCATABLE         (1u << 27)
+ #define MDT_TYPE(flags)         (((flags) >> 24) & 7)
+@@ -2238,9 +2240,18 @@ redwood_a610_init(void)
+ 	char device[16] = "";
+ 	thread_t thread;
+ 
+-	if (!PE_parse_boot_arg_str("device", device, sizeof(device)) || strcmp(device, "willow") != 0) {
++	if (!PE_parse_boot_arg_str("device", device, sizeof(device)) ||
++	    (strcmp(device, "willow") != 0 && strcmp(device, "doha") != 0)) {
+ 		return;
+ 	}
++	if (strcmp(device, "doha") == 0) {
++		/*
++		 * The Moto G8 Plus (doha): the same SM6125 and Adreno 610, everything above the SoC's; only the
++		 * zap shader's region is the board's -- doha's device tree: gpu_region@57115000, 8 KB, "no-map",
++		 * inside the UEFI's "PIL Reserved" (0x4ab00000-0x57d00000)
++		 */
++		zap_region_phys = 0x57115000UL;
++	}
+ 	redwood_osm_report();
+ 	if (!PE_parse_boot_argn("a610", &steps, sizeof(steps))) {
+ 		if (!(PE_parse_boot_argn("gpu", &gpu, sizeof(gpu)) && gpu)) {
+diff --git a/xnu/files/bsd/dev/redwood_adreno.c b/xnu/files/bsd/dev/redwood_adreno.c
+index 65d7cbd..7d248a0 100644
+--- a/xnu/files/bsd/dev/redwood_adreno.c
++++ b/xnu/files/bsd/dev/redwood_adreno.c
+@@ -4064,8 +4064,9 @@ start_by_itself(void)
+ 
+ 	char device[16] = "";
+ 
+-	if (PE_parse_boot_arg_str("device", device, sizeof(device)) && strcmp(device, "willow") == 0) {
+-		return false;                   /* the willow's GPU is redwood_a610.c's (gpu=1 there too) */
++	if (PE_parse_boot_arg_str("device", device, sizeof(device)) &&
++	    (strcmp(device, "willow") == 0 || strcmp(device, "doha") == 0)) {
++		return false;                   /* the willow's and doha's GPU is redwood_a610.c's (gpu=1 there too) */
+ 	}
+ 	if (pe_arm_get_soc_base_phys() != REDWOOD_SOC_BASE) {
+ 		printf("adreno: THE GPU IS NOT STARTED: gpu=1 is for the phone, and this is not it\n");
 diff --git a/xnu/files/bsd/dev/redwood_buttons.c b/xnu/files/bsd/dev/redwood_buttons.c
 index 593ed6e..619bd93 100644
 --- a/xnu/files/bsd/dev/redwood_buttons.c
@@ -964,6 +1020,34 @@ index 5f0ee3e..d0b6b0a 100644
  	redwood_buttons_init();
  	redwood_battery_init();
  	redwood_ufs_init();
+diff --git a/xnu/files/bsd/dev/redwood_osm.c b/xnu/files/bsd/dev/redwood_osm.c
+index 1546703..7566156 100755
+--- a/xnu/files/bsd/dev/redwood_osm.c
++++ b/xnu/files/bsd/dev/redwood_osm.c
+@@ -134,7 +134,8 @@ redwood_osm_init(void)
+ 	thread_t thread;
+ 
+ 	if (!PE_parse_boot_argn("osm_dump", &dump, sizeof(dump)) || !dump ||
+-	    !PE_parse_boot_arg_str("device", device, sizeof(device)) || strcmp(device, "willow") != 0) {
++	    !PE_parse_boot_arg_str("device", device, sizeof(device)) ||
++	    (strcmp(device, "willow") != 0 && strcmp(device, "doha") != 0)) {
+ 		return;
+ 	}
+ 	if (kernel_thread_start(osm_thread, NULL, &thread) == KERN_SUCCESS) {
+diff --git a/xnu/files/bsd/dev/redwood_rpm.c b/xnu/files/bsd/dev/redwood_rpm.c
+index 7d3bb87..3efe4b6 100644
+--- a/xnu/files/bsd/dev/redwood_rpm.c
++++ b/xnu/files/bsd/dev/redwood_rpm.c
+@@ -429,7 +429,8 @@ redwood_rpm_init(void)
+ 	char device[16] = "";
+ 	thread_t thread;
+ 
+-	if (!PE_parse_boot_arg_str("device", device, sizeof(device)) || strcmp(device, "willow") != 0) {
++	if (!PE_parse_boot_arg_str("device", device, sizeof(device)) ||
++	    (strcmp(device, "willow") != 0 && strcmp(device, "doha") != 0)) {
+ 		return;
+ 	}
+ 	if (!PE_parse_boot_argn("rpm", &steps, sizeof(steps))) {
 diff --git a/xnu/files/bsd/sys/redwood_input.h b/xnu/files/bsd/sys/redwood_input.h
 index 3e701f0..deb3dd6 100644
 --- a/xnu/files/bsd/sys/redwood_input.h
@@ -1054,11 +1138,35 @@ index acff88b..bfce152 100644
   bsd/kern/kern_symfile.c			standard
   bsd/kern/kern_descrip.c			standard
   bsd/kern/kern_guarded.c			standard
+diff --git a/xnuloader/build.sh b/xnuloader/build.sh
+index 3073c14..b28c3d3 100755
+--- a/xnuloader/build.sh
++++ b/xnuloader/build.sh
+@@ -3,7 +3,8 @@
+ set -e
+ cd "$(dirname "$0")"
+ clang --target=aarch64-unknown-windows -ffreestanding -fno-builtin -fno-stack-protector -fshort-wchar \
+-  -mgeneral-regs-only -O1 -Wall -Wextra -Wno-unused-parameter -c loader.c -o loader.obj
++  -mgeneral-regs-only -O1 -Wall -Wextra -Wno-unused-parameter ${PAYLOAD_BASE:+-DPAYLOAD_BASE=${PAYLOAD_BASE}ULL} \
++  -c loader.c -o loader.obj
+ # /base: UEFI loads an image at its preferred address when that is free. The PE default (0x140000000)
+ # is in the middle of the phone's largest block of RAM, which XNU needs in one piece. Another device
+ # whose largest block holds 0xA1000000 sets LOADER_BASE (common/devices/<name>.conf) to free RAM outside it.
 diff --git a/xnuloader/loader.c b/xnuloader/loader.c
-index 256397e..b9c3442 100644
+index 256397e..31ac78e 100644
 --- a/xnuloader/loader.c
 +++ b/xnuloader/loader.c
-@@ -541,6 +541,7 @@ struct platform {
+@@ -15,7 +15,9 @@
+ /* ------------------------------------------------------------------------ */
+ /* Fixed conventions shared with the boot shim, the packer and the kernel   */
+ 
++#ifndef PAYLOAD_BASE                    /* build.sh: PAYLOAD_BASE=... (doha's UEFI puts it at 0x78000000) */
+ #define PAYLOAD_BASE        0xF0000000ULL
++#endif
+ #define PAYLOAD_MAGIC       0x50554E58u /* "XNUP" */
+ 
+ struct payload_header { uint32_t magic; uint32_t size; };
+@@ -541,6 +543,7 @@ struct platform {
  	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
  	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
  	uint64_t fb_base;                /* the framebuffer the firmware reports (GOP): it tells this device apart */
@@ -1066,7 +1174,7 @@ index 256397e..b9c3442 100644
  	const struct store_part *store;  /* the partition a write may reach; NULL: none */
  	const struct store_part *data_store;     /* ... with ufs_write=data instead: a filesystem's, whole */
  };
-@@ -619,10 +620,27 @@ static const struct platform platform_willow = {
+@@ -619,10 +622,27 @@ static const struct platform platform_willow = {
  	 */
  	.small_cores = 0xf0,
  	.fb_base = 0x5C000000,           /* Mu-Silicium willowPkg: "Display Reserved", 1080 x 2340 */
@@ -1094,7 +1202,7 @@ index 256397e..b9c3442 100644
  /* The slower cores of this run: the platform's, unless willow_osm() has raised the Gold cluster's clock. */
  static uint32_t small_cores_now;
  
-@@ -655,6 +673,7 @@ platform_mpidr_core(const struct platform *plat, uint64_t mpidr)
+@@ -655,6 +675,7 @@ platform_mpidr_core(const struct platform *plat, uint64_t mpidr)
  static const struct platform *const platforms[] = {
  	&platform_redwood,
  	&platform_willow,
@@ -1102,16 +1210,30 @@ index 256397e..b9c3442 100644
  };
  
  /* ------------------------------------------------------------------------ */
-@@ -3330,7 +3349,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -3330,7 +3351,21 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  		}
  	}
  	small_cores_now = PLAT->small_cores;
 -	if (PLAT == &platform_willow) {
++	if (PLAT == &platform_doha) {
++		/*
++		 * doha, "memmap=1": the UEFI's memory map on the screen, 20 s to read it -- where the RAM the kernel's
++		 * window could grow into is (doha has no USB link for `oem memmap`)
++		 */
++		for (const char *c = pi.cmdline; *c; c++) {
++			if (starts_with(c, "memmap=1") && (c == pi.cmdline || c[-1] == ' ')) {
++				print_memory_map();
++				print("memmap=1: 20 s to read this\n");
++				BS->stall(20000000);
++				break;
++			}
++		}
++	}
 +	if (PLAT == &platform_willow || PLAT == &platform_doha) {
  		for (const char *c = pi.cmdline; *c; c++) {
  			if (starts_with(c, "osm=") && (c == pi.cmdline || c[-1] == ' ') && (c[4] == '1' || c[4] == '2') &&
  			    (c[5] == 0 || c[5] == ' ')) {
-@@ -3341,6 +3360,20 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -3341,6 +3376,20 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  				for (int k = 0; k < 2; k++) {
  					volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)osm[k];
  
@@ -1132,7 +1254,7 @@ index 256397e..b9c3442 100644
  					for (int core = 0; core < 4; core++) {
  						r[0x920 / 4 + core] = row[k];
  					}
-@@ -4503,7 +4536,8 @@ efi_main(efi_handle image, efi_system_table *st)
+@@ -4503,7 +4552,8 @@ efi_main(efi_handle image, efi_system_table *st)
  		SCREEN.height = GOP->mode->info->height;
  		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
  		for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++)
@@ -1142,7 +1264,7 @@ index 256397e..b9c3442 100644
  				PLAT = platforms[i];
  		if (PLAT == &platform_qemu_virt)
  			ramfb_phone_screen();
-@@ -4524,6 +4558,11 @@ efi_main(efi_handle image, efi_system_table *st)
+@@ -4524,6 +4574,11 @@ efi_main(efi_handle image, efi_system_table *st)
  	if (have_payload) {
  		run_kernel(0, 0);
  	}
