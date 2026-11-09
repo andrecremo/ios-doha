@@ -600,4 +600,47 @@ Segundo boot do kernel (compilado 2026-11-09 07:31): depois do framebuffer, `Gen
 panic `Failed to mount root device` com `Boot args: debug=0x8 device=doha -v cpus=1`, `Stackshot Succeeded` e reboot. Sem o
 loop do GIC. O XNU sobe inteiro no doha até montar a raiz.
 
-Próximo: o volume do iOS. A imagem reduzida do willow (~2,5 GB) cabe na `system_b` (3238002688 bytes) sem apagar a `userdata`.
+O armazenamento pelo loader (`ufs=2`): o kernel não tem driver de eMMC nem de UFS; o loader fica no núcleo 0 e lê blocos com
+o `BlockIo` da própria UEFI para o kernel, que roda no núcleo 3 (`bootcpu=3`), por uma página compartilhada
+(`ufs_shared_pa=`). Nada nesse caminho é de UFS: as partições vêm da GPT pelo nome (`/dev/ufs_system_b` etc.). O driver do
+kernel (`redwood_ufs_init`) só sobe depois que a raiz é montada (`bsd_init.c`, junto do `devfs`), então o teste leva o
+`hello` do willow-userland como RAM disk (o mockfs o roda como processo 1).
+
+Teste de leitura (cmdline `-v bootcpu=3 cpus=1 ufs=2 ufs_check=2`, `ramdisk=hello`; nada escreve): `BSD root: md0`,
+`ufs: 77 partitions of the phone's storage as /dev/ufs_NAME ...`, `ufs: check: 80 partitions ... through the loader's page`,
+444 pedidos, 460 MB em 2,6 s (~195 MB/s). Os hashes FNV-1a lidos pelo kernel são os mesmos calculados pelo adb no Lineage:
+
+| Partição (a e b) | Bytes | FNV-1a 64 |
+|---|---|---|
+| `xbl` | 3706880 | `83629509a8eace72` |
+| `tz` | 3710976 | `6d98f58b25c1e86b` |
+| `abl` | 208896 | `c48ee2ef07fbe16d` |
+| `bluetooth` | 503808 | `c621d721e28c546` |
+
+`hyp`, `modem` e `dsp` falham com status 2: o teste usa os tamanhos do willow, maiores que essas partições no doha.
+
+O volume do iOS: o do willow no flash (o volume inteiro da Apple e os cryptexes, ~8,4 GB) não cabe na `system_b`
+(3238002688 bytes); a imagem reduzida (~2,5 GB) vai em RAM, mandada por USB ao loader, que o doha ainda não tem. Duas saídas:
+a reduzida mais o cryptex refeito na `system_b` (apertado, com mudança no `init`), ou a receita do willow inteira na `userdata`
+(sem o Lineage). Decidir na hora de gravar.
+
+A receita de RAM não cabe: a maior RAM contínua do doha é `0x80000000`-`0x13FFFFFFF` (~3 GB, `/proc/iomem`), e o
+`system.apfs` (2,5 GB) mais os 768 MB que o loader reserva ao kernel passam disso. Vale a do willow, pelo flash.
+
+**iOS 16.5 na tela inicial (2026-11-09).** A receita do flash do willow, com a `userdata` no lugar da `system` dele:
+
+- `userdata` (`mmcblk0p80`, LBA 17924096, 53359918592 bytes): o volume raiz da Apple (`rootfs.dmg`, UDIF com LZFSE,
+  aberto por `tools/apfs/dmg.py` no contêiner APFS bruto de 5628755968 bytes), o cryptex do sistema (2726297600) e o de
+  apps (10485760), como a Apple os entrega, um atrás do outro: 8365539328 bytes, contêineres 0, 1 e 2 de
+  `/dev/ufs_userdata` (o `init` monta `,c=1` e `,c=2`). sha256 da imagem `9efb156f...3735560`.
+- O bootloader da Motorola recusa `fastboot flash userdata` (`flash permission denied`; antes, o fastboot 36.0.2 dava
+  `bad_alloc` com a imagem bruta; `tools/mksparse.py` faz a versão sparse e confere que ela expande igual). A gravação foi pelo recovery do Lineage (Advanced >
+  Enable ADB, `adb exec-in dd`, 6,8 MB/s) e conferida lendo de volta depois de `drop_caches`.
+- A `fstab` do doha tem a `userdata` como `formattable`: um boot do Android a formataria. `boot_a` e `boot_b` levam a
+  nossa UEFI (backup de boot, dtbo e vbmeta dos dois slots guardado fora do repositório). Para voltar ao Lineage: os
+  `boot` do backup e "Format data" no recovery.
+- Na RAM, só o `root.apfs` e o `flashboot.apfs` (4 MB cada; `FLASHBOOT=1 CRYPTEXES=flash`, `RC_JOBS=rc.jobs.unlock`).
+  cmdline `bootcpu=3 cpus=1 ufs=2 root_apfs=ufs_userdata`. Nada escreve (`/private/var` em memória).
+
+Resultado: launchd, SpringBoard e a tela inicial com o dock, desenhados pela CPU no framebuffer da UEFI. Com `-v` o
+console do kernel corre por cima; sem `epoch=` o relógio começa em 31/12/1969.
