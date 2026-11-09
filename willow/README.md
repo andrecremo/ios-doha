@@ -12,7 +12,7 @@ cd willow-hackios && git checkout 796e42b && git am path/to/ios-doha/willow/patc
 
 | Patch | What it does |
 |---|---|
-| `0001` | A platform of its own for doha in `xnuloader/loader.c`. The loader tells devices apart by the framebuffer base, which doha's UEFI shares with willow (`0x5C000000`), so it now also compares the height (2280 on doha, 2340 on willow). doha gets willow's SoC values (I/O window, GIC, clusters) and nothing of willow's board: no partition to write, no OSM, no RPM voltages, no touch panel. With no logdump and no USB link to the loader yet, its screen is the only log on doha, so the loader leaves it up 30 s before its final reset. In the kernel, `device=doha` uses the SM6125's timer interrupt like willow (`gic_v3_irq.c`), and has its own row of buttons (`redwood_buttons.c`: the PM6125's power-on block for power and volume down, GPIO9 of the PM6125 for volume up, read from doha's device tree). |
+| `0001` | A platform of its own for doha in `xnuloader/loader.c`. The loader tells devices apart by the framebuffer base, which doha's UEFI shares with willow (`0x5C000000`), so it now also compares the height (2280 on doha, 2340 on willow). doha gets willow's SoC values (I/O window, GIC, clusters) and nothing of willow's board: no partition to write, no RPM voltages, no touch panel. `osm=1` works on doha too, asking for a row of the OSM table doha's own firmware wrote, and only for a cluster whose OSM the firmware has on (Silver; Gold is left at 300 MHz) and a row between 300 and 2100 MHz. With no logdump and no USB link to the loader yet, its screen is the only log on doha, so the loader leaves it up 30 s before its final reset. In the kernel, `device=doha` uses the SM6125's timer interrupt like willow (`gic_v3_irq.c`), and has its own row of buttons (`redwood_buttons.c`: the PM6125's power-on block for power and volume down, GPIO9 of the PM6125 for volume up, read from doha's device tree). |
 
 ## Starting the loader from doha's UEFI
 
@@ -27,7 +27,7 @@ without changing either tree:
 - `uefi/build-doha.sh` takes `DOHA_WILLOW` and `DOHA_PAYLOAD` (the image is then `doha-uefi-DEBUG-xnu.img`).
 
 Not to be used on doha: `gpu=1` (the redwood GPU driver decides by the SoC base, which doha shares with redwood),
-`osm=`, `ufs_write=`, `touchscreen=1` (willow's Novatek panel; doha has a FocalTech FT8719), and anything from
+`ufs_write=`, `touchscreen=1` (willow's Novatek panel; doha has a FocalTech FT8719), and anything from
 `prebuilt/`.
 
 Not done yet: the loader's log, which goes to a `logdump` partition doha does not have.

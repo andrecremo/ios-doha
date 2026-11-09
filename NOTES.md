@@ -644,3 +644,10 @@ A receita de RAM não cabe: a maior RAM contínua do doha é `0x80000000`-`0x13F
 
 Resultado: launchd, SpringBoard e a tela inicial com o dock, desenhados pela CPU no framebuffer da UEFI. Com `-v` o
 console do kernel corre por cima; sem `epoch=` o relógio começa em 31/12/1969.
+
+Clock dos núcleos (`osm=1`): o firmware do doha deixa o OSM dos Silver ligado (`f521000`, enable 3) e o dos Gold
+desligado (`f523000`, enable 2), como no willow. O loader passa a aceitar `osm=1` no doha, só onde o OSM está ligado e
+para uma linha entre 300 e 2100 MHz da tabela do próprio firmware: Silver na linha 7, 1804 MHz (medido "982 MHz if one
+add a cycle", ~2 ciclos por volta do laço); Gold fica em 300 MHz. Cmdline padrão agora `bootcpu=3 cpus=8 ufs=2
+root_apfs=ufs_userdata osm=1 epoch=...`, sem `-v`: a tela inicial chega mais depressa, ainda devagar (a interface é
+desenhada pela CPU).

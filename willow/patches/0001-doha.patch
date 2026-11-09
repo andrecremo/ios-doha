@@ -1,21 +1,13 @@
-From 2e6974463db33e1e9879b076a9225f825187d2bc Mon Sep 17 00:00:00 2001
-From: ios-doha <ios-doha@users.noreply.github.com>
-Date: Sun, 8 Nov 2026 19:05:47 -0300
+From 7f981c03eb0996bc5c069a069404339791b62059 Mon Sep 17 00:00:00 2001
+From: andrecremo <andreljsantos@gmail.com>
+Date: Mon, 9 Nov 2026 12:27:46 -0300
 Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
 
-The loader tells devices apart by the framebuffer base, which doha's UEFI
-shares with willow (0x5C000000): it now also compares the height. doha gets
-willow's SoC values and nothing of willow's board. With no logdump and no
-USB link yet, the loader leaves its screen up 30 s before its reset on doha.
-In the kernel, doha uses the SM6125's timer interrupt like willow, and has
-its own row of buttons (the PM6125's power-on block; volume up on its GPIO9).
-Going back to the loader, the kernel switches its timer's interrupt off: the
-UEFI has no handler for it and saw it without end.
 ---
- xnu/files/bsd/dev/redwood_buttons.c |  3 +++
- xnu/files/osfmk/arm64/gic_v3_irq.c  | 12 ++++++++++--
- xnuloader/loader.c                  | 26 +++++++++++++++++++++++++-
- 3 files changed, 38 insertions(+), 3 deletions(-)
+ xnu/files/bsd/dev/redwood_buttons.c |  3 ++
+ xnu/files/osfmk/arm64/gic_v3_irq.c  | 12 ++++++--
+ xnuloader/loader.c                  | 43 +++++++++++++++++++++++++++--
+ 3 files changed, 54 insertions(+), 4 deletions(-)
 
 diff --git a/xnu/files/bsd/dev/redwood_buttons.c b/xnu/files/bsd/dev/redwood_buttons.c
 index 593ed6e..619bd93 100644
@@ -62,7 +54,7 @@ index ce5452a..00b41f0 100644
  			if (PE_parse_boot_argn("vtimer_ppi", &ppi, sizeof(ppi)) && ppi >= 16 && ppi < 32) {
  				gic_vtimer = ppi;
 diff --git a/xnuloader/loader.c b/xnuloader/loader.c
-index 256397e..bc00b1d 100644
+index 256397e..b9c3442 100644
 --- a/xnuloader/loader.c
 +++ b/xnuloader/loader.c
 @@ -541,6 +541,7 @@ struct platform {
@@ -73,7 +65,7 @@ index 256397e..bc00b1d 100644
  	const struct store_part *store;  /* the partition a write may reach; NULL: none */
  	const struct store_part *data_store;     /* ... with ufs_write=data instead: a filesystem's, whole */
  };
-@@ -619,10 +620,26 @@ static const struct platform platform_willow = {
+@@ -619,10 +620,27 @@ static const struct platform platform_willow = {
  	 */
  	.small_cores = 0xf0,
  	.fb_base = 0x5C000000,           /* Mu-Silicium willowPkg: "Display Reserved", 1080 x 2340 */
@@ -85,8 +77,9 @@ index 256397e..bc00b1d 100644
 +/*
 + * Moto G8 Plus (doha, SM6125, github.com/andrecremo/ios-doha): the same SoC as willow, so the same peripherals,
 + * GIC and clusters, and its UEFI (dohaPkg) puts the framebuffer at the same 0x5C000000; the screen is 1080 x 2280,
-+ * which tells it from willow. No partition is written yet (no store), and nothing of willow's board: not its OSM
-+ * settings, nor its RPM voltages, nor its touch panel (the kernel's drivers check device=).
++ * which tells it from willow. No partition is written yet (no store), and nothing of willow's board: not its RPM
++ * voltages, nor its touch panel (the kernel's drivers check device=). osm=1 asks the clusters' OSM for a row of the
++ * table doha's own firmware wrote, as on willow (and only where that OSM is on, see below).
 + */
 +static const struct platform platform_doha = {
 +	.name = "doha", .io_base = 0x00400000, .io_size = 0x3FC00000,
@@ -100,7 +93,7 @@ index 256397e..bc00b1d 100644
  /* The slower cores of this run: the platform's, unless willow_osm() has raised the Gold cluster's clock. */
  static uint32_t small_cores_now;
  
-@@ -655,6 +672,7 @@ platform_mpidr_core(const struct platform *plat, uint64_t mpidr)
+@@ -655,6 +673,7 @@ platform_mpidr_core(const struct platform *plat, uint64_t mpidr)
  static const struct platform *const platforms[] = {
  	&platform_redwood,
  	&platform_willow,
@@ -108,7 +101,37 @@ index 256397e..bc00b1d 100644
  };
  
  /* ------------------------------------------------------------------------ */
-@@ -4503,7 +4521,8 @@ efi_main(efi_handle image, efi_system_table *st)
+@@ -3330,7 +3349,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 		}
+ 	}
+ 	small_cores_now = PLAT->small_cores;
+-	if (PLAT == &platform_willow) {
++	if (PLAT == &platform_willow || PLAT == &platform_doha) {
+ 		for (const char *c = pi.cmdline; *c; c++) {
+ 			if (starts_with(c, "osm=") && (c == pi.cmdline || c[-1] == ' ') && (c[4] == '1' || c[4] == '2') &&
+ 			    (c[5] == 0 || c[5] == ' ')) {
+@@ -3341,6 +3360,20 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 				for (int k = 0; k < 2; k++) {
+ 					volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)osm[k];
+ 
++					/*
++					 * doha: the same SoC and the same OSM, its table written by doha's own firmware, so a row
++					 * of it is doha's own frequency and voltage. Still only a cluster whose OSM the firmware
++					 * has on (enable 3), and a row of a frequency that makes sense for a Kryo 260.
++					 */
++					if (PLAT == &platform_doha) {
++						uint64_t mhz = (uint64_t)(r[(0x110 + 32 * row[k]) / 4] & 0xff) * 192 / 10;
++
++						print("osm %x: enable %x, row %d: %d MHz\n", osm[k], (uint64_t)r[0], (uint64_t)row[k], mhz);
++						if (r[0] != 3 || mhz < 300 || mhz > 2100) {
++							print("osm %x: left as the firmware has it\n", osm[k]);
++							continue;
++						}
++					}
+ 					for (int core = 0; core < 4; core++) {
+ 						r[0x920 / 4 + core] = row[k];
+ 					}
+@@ -4503,7 +4536,8 @@ efi_main(efi_handle image, efi_system_table *st)
  		SCREEN.height = GOP->mode->info->height;
  		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
  		for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++)
@@ -118,7 +141,7 @@ index 256397e..bc00b1d 100644
  				PLAT = platforms[i];
  		if (PLAT == &platform_qemu_virt)
  			ramfb_phone_screen();
-@@ -4524,6 +4543,11 @@ efi_main(efi_handle image, efi_system_table *st)
+@@ -4524,6 +4558,11 @@ efi_main(efi_handle image, efi_system_table *st)
  	if (have_payload) {
  		run_kernel(0, 0);
  	}
@@ -130,3 +153,6 @@ index 256397e..bc00b1d 100644
  	reboot();
  	return 0;
  }
+-- 
+2.43.0
+
