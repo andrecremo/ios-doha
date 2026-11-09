@@ -27,7 +27,14 @@ without changing either tree:
 - `uefi/build-doha.sh` takes `DOHA_WILLOW` and `DOHA_PAYLOAD` (the image is then `doha-uefi-DEBUG-xnu.img`).
 
 Not to be used on doha: `gpu=1` (the redwood GPU driver decides by the SoC base, which doha shares with redwood),
-`ufs_write=`, `touchscreen=1` (willow's Novatek panel; doha has a FocalTech FT8719), and anything from
+`ufs_write=`, and anything from
 `prebuilt/`.
+
+The patch also adds doha's touch screen, `bsd/dev/redwood_focaltech.c` (`touchscreen=1` with `device=doha`): a
+FocalTech FT8719 on the same SPI engine and pins as willow's Novatek, its protocol from Motorola's GPL driver
+(`focaltech_0flash_mmi`). It has no flash; the driver loads the phone's own firmware
+(`/vendor/firmware/focaltech-ft8719-a0-0000-doha.bin`, not in this repository) into its RAM without touching its reset
+line, which is the panel's too. `patches/userland/0001-doha-ft8719-firmware.patch` (on willow-hackios's `userland`
+branch, `0ffde01`) puts that file into the small image as `fw/focaltech_ts_fw.bin` from `fw-touch/`.
 
 Not done yet: the loader's log, which goes to a `logdump` partition doha does not have.

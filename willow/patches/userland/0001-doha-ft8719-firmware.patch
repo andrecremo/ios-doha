@@ -1,0 +1,18 @@
+diff --git a/userland/build.sh b/userland/build.sh
+index 7f3aaf4..eba61b8 100755
+--- a/userland/build.sh
++++ b/userland/build.sh
+@@ -558,6 +558,13 @@ if [ -f ../fw-touch/novatek_ts_fw.bin ]; then
+ 	mkdir -p root/fw
+ 	install -m 0644 ../fw-touch/novatek_ts_fw.bin root/fw/
+ fi
++# ... and doha's (Moto G8 Plus): the FocalTech FT8719 has no flash either, and its firmware is the phone's
++# /vendor/firmware/focaltech-ft8719-a0-0000-doha.bin, into ../fw-touch as focaltech_ts_fw.bin
++# (bsd/dev/redwood_focaltech.c; 64 KB, FocalTech's and not in the repository)
++if [ -f ../fw-touch/focaltech_ts_fw.bin ]; then
++	mkdir -p root/fw
++	install -m 0644 ../fw-touch/focaltech_ts_fw.bin root/fw/
++fi
+ # ... and willow's GPU (Adreno 610): its zap shader and the command processor's microcode, from the
+ # phone's /vendor/firmware into ../fw-a610 (bsd/dev/redwood_a610.c; 60 KB)
+ if [ -f ../fw-a610/a610_zap.mdt ]; then

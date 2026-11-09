@@ -651,3 +651,15 @@ para uma linha entre 300 e 2100 MHz da tabela do próprio firmware: Silver na li
 add a cycle", ~2 ciclos por volta do laço); Gold fica em 300 MHz. Cmdline padrão agora `bootcpu=3 cpus=8 ufs=2
 root_apfs=ufs_userdata osm=1 epoch=...`, sem `-v`: a tela inicial chega mais depressa, ainda devagar (a interface é
 desenhada pela CPU).
+
+**Touch (FocalTech FT8719) funciona (2026-11-09).** `bsd/dev/redwood_focaltech.c` (patch 0001), com `touchscreen=1` e
+`device=doha`. O mesmo motor SPI do willow (`spi@4a88000`, QUP0 SE2, GPIO 6 a 9, interrupção no GPIO 88), em modo SPI 1;
+o protocolo é o do driver GPL da Motorola (`motorola-kernel-modules`, tag `MMI-RPI31.Q2-42-25`,
+`focaltech_0flash_mmi`: `focaltech_spi_v1_1.c`, `focaltech_flash_ft8719.c`). O FT8719 não tem flash: depois da UEFI ele
+espera na ROM (boot id `87 19`, estado 2) e o firmware vai para a RAM dele a cada boot, pacotes `0xae`, ecc
+conferida (`0xcc`/`0xce`/`0xcd`), `0x08` para rodar. O reset (GPIO 87) é o mesmo do painel (`share_reset_gpio`):
+o driver nunca o toca e usa o caminho de recuperação sem reset da Motorola. O firmware é o do aparelho,
+`/vendor/firmware/focaltech-ft8719-a0-0000-doha.bin` (64920 bytes; a `vendor_a` é EROFS), copiado pelo recovery do
+Lineage, fora do repositório; o `userland/build.sh` o põe em `fw/` (`willow/patches/userland/`). O painel
+`fb_hud=1` mostra "Touch ok, FT8719, 100 Hz", e o iOS reage ao dedo. A tela continua a ~1 quadro por segundo
+(1749 ms por quadro desenhados pela CPU): o próximo passo é a GPU (Adreno 610).
