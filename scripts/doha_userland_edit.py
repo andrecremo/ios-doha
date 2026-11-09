@@ -21,6 +21,26 @@ if [ -f ../fw-touch/focaltech_ts_fw.bin ]; then
 	install -m 0644 ../fw-touch/focaltech_ts_fw.bin root/fw/
 fi
 """
+# the store of /private/var on doha: userdata past the iOS volume (src/var_store.c), after willow's, which have
+# no userdata of that kind (/dev/rufs_system does not exist on doha, whose system is system_a and system_b)
+vs = tree / 'userland/src/var_store.c'
+v = vs.open(encoding='utf-8', newline='').read()
+vold = """	{ "darwin", 0x80000000LL },
+	{ "system", 0x40000000LL },
+};"""
+vnew = """	{ "darwin", 0x80000000LL },
+	{ "system", 0x40000000LL },
+	/* doha (Moto G8 Plus): userdata, 50 GiB, with the same image in its first 8365539328 bytes */
+	{ "userdata", 0x80000000LL },
+};"""
+if '"userdata", 0x80000000LL' in v:
+    print("userland/src/var_store.c: has doha's store already")
+elif v.count(vold) != 1:
+    raise SystemExit(f'userland/src/var_store.c: expected 1x the STORES table, found {v.count(vold)}')
+else:
+    vs.open('w', encoding='utf-8', newline='').write(v.replace(vold, vnew))
+    print("ok userland/src/var_store.c: doha's store, userdata")
+
 if 'focaltech_ts_fw.bin' in t:
     print('userland/build.sh: has the FT8719 firmware already')
 elif t.count(old) != 1:

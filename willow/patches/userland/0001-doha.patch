@@ -16,3 +16,16 @@ index 7f3aaf4..eba61b8 100755
  # ... and willow's GPU (Adreno 610): its zap shader and the command processor's microcode, from the
  # phone's /vendor/firmware into ../fw-a610 (bsd/dev/redwood_a610.c; 60 KB)
  if [ -f ../fw-a610/a610_zap.mdt ]; then
+diff --git a/userland/src/var_store.c b/userland/src/var_store.c
+index 74ff71d..70060ec 100644
+--- a/userland/src/var_store.c
++++ b/userland/src/var_store.c
+@@ -85,6 +85,8 @@ static const struct {
+ } STORES[] = {
+ 	{ "darwin", 0x80000000LL },
+ 	{ "system", 0x40000000LL },
++	/* doha (Moto G8 Plus): userdata, 50 GiB, with the same image in its first 8365539328 bytes */
++	{ "userdata", 0x80000000LL },
+ };
+ 
+ static char store_device[48];           /* /dev/rufs_NAME of the store: pick_store() */

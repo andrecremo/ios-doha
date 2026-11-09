@@ -1,6 +1,6 @@
-From 2319bcbb320f9787d5cac839f6122ed19b27c9ff Mon Sep 17 00:00:00 2001
+From ce2947adfb7868e58f1fa6d7b0b87dcd207306da Mon Sep 17 00:00:00 2001
 From: andrecremo <andreljsantos@gmail.com>
-Date: Mon, 9 Nov 2026 16:43:19 -0300
+Date: Mon, 9 Nov 2026 17:24:19 -0300
 Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
 
 ---
@@ -11,12 +11,13 @@ Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
  xnu/files/bsd/dev/redwood_input.c     |   1 +
  xnu/files/bsd/dev/redwood_osm.c       |   3 +-
  xnu/files/bsd/dev/redwood_rpm.c       |   3 +-
+ xnu/files/bsd/dev/redwood_ufs.c       |   5 +
  xnu/files/bsd/sys/redwood_input.h     |   1 +
  xnu/files/osfmk/arm64/gic_v3_irq.c    |  12 +-
  xnu/redwood.patch                     |   9 +-
  xnuloader/build.sh                    |   3 +-
- xnuloader/loader.c                    |  59 +-
- 12 files changed, 1017 insertions(+), 15 deletions(-)
+ xnuloader/loader.c                    |  72 +-
+ 13 files changed, 1035 insertions(+), 15 deletions(-)
  create mode 100644 xnu/files/bsd/dev/redwood_focaltech.c
 
 diff --git a/xnu/files/bsd/dev/redwood_a610.c b/xnu/files/bsd/dev/redwood_a610.c
@@ -1048,6 +1049,22 @@ index 7d3bb87..3efe4b6 100644
  		return;
  	}
  	if (!PE_parse_boot_argn("rpm", &steps, sizeof(steps))) {
+diff --git a/xnu/files/bsd/dev/redwood_ufs.c b/xnu/files/bsd/dev/redwood_ufs.c
+index fce766f..952e572 100644
+--- a/xnu/files/bsd/dev/redwood_ufs.c
++++ b/xnu/files/bsd/dev/redwood_ufs.c
+@@ -92,6 +92,11 @@ static const struct ufs_store {
+ 	 * filesystem iOS's data lives in. Its block device writes, so it can be mounted for writing.
+ 	 */
+ 	{ "userdata", 31031296, 91111391, 512, 0, true },
++	/*
++	 * doha: userdata, mmcblk0p80, its 50 GiB that were Android's data, with the iOS volume and both cryptexes in
++	 * its first 8365539328 bytes: the store (ufs_write=1, not a filesystem), past them like willow's system.
++	 */
++	{ "userdata", 17924096, 104218591, 512, UFS_WRITE_FIRST, false },
+ };
+ static uint64_t ufs_write_first = UFS_WRITE_FIRST;      /* the store's of this run, in blocks of 4096 */
+ static bool ufs_write_fs;                               /* the store of this run is the data store */
 diff --git a/xnu/files/bsd/sys/redwood_input.h b/xnu/files/bsd/sys/redwood_input.h
 index 3e701f0..deb3dd6 100644
 --- a/xnu/files/bsd/sys/redwood_input.h
@@ -1153,7 +1170,7 @@ index 3073c14..b28c3d3 100755
  # is in the middle of the phone's largest block of RAM, which XNU needs in one piece. Another device
  # whose largest block holds 0xA1000000 sets LOADER_BASE (common/devices/<name>.conf) to free RAM outside it.
 diff --git a/xnuloader/loader.c b/xnuloader/loader.c
-index 256397e..31ac78e 100644
+index 256397e..c7e3a64 100644
 --- a/xnuloader/loader.c
 +++ b/xnuloader/loader.c
 @@ -15,7 +15,9 @@
@@ -1174,7 +1191,7 @@ index 256397e..31ac78e 100644
  	const struct store_part *store;  /* the partition a write may reach; NULL: none */
  	const struct store_part *data_store;     /* ... with ufs_write=data instead: a filesystem's, whole */
  };
-@@ -619,10 +622,27 @@ static const struct platform platform_willow = {
+@@ -619,10 +622,40 @@ static const struct platform platform_willow = {
  	 */
  	.small_cores = 0xf0,
  	.fb_base = 0x5C000000,           /* Mu-Silicium willowPkg: "Display Reserved", 1080 x 2340 */
@@ -1186,10 +1203,22 @@ index 256397e..31ac78e 100644
 +/*
 + * Moto G8 Plus (doha, SM6125, github.com/andrecremo/ios-doha): the same SoC as willow, so the same peripherals,
 + * GIC and clusters, and its UEFI (dohaPkg) puts the framebuffer at the same 0x5C000000; the screen is 1080 x 2280,
-+ * which tells it from willow. No partition is written yet (no store), and nothing of willow's board: not its RPM
-+ * voltages, nor its touch panel (the kernel's drivers check device=). osm=1 asks the clusters' OSM for a row of the
-+ * table doha's own firmware wrote, as on willow (and only where that OSM is on, see below).
++ * which tells it from willow. Nothing of willow's board: not its RPM voltages, nor its touch panel (the kernel's
++ * drivers check device=). osm=1 asks the clusters' OSM for a row of the table doha's own firmware wrote, as on willow
++ * (and only where that OSM is on, see below).
 + */
++/*
++ * userdata (mmcblk0p80), doha's 50 GiB that were Android's data: the iOS volume and both cryptexes fill its first
++ * 8365539328 bytes, as they fill willow's system (written from Lineage's recovery, 2026-11-09), so a write goes from
++ * the same block, and the data of iOS (userland/src/var_store.c) goes behind them. Its GUIDs as doha's GPT has them.
++ */
++static const struct store_part doha_store = {
++	.name = "userdata",
++	.type = { 0x1b81e7e6, 0xf50d, 0x419b, { 0xa7, 0x39, 0x2a, 0xee, 0xf8, 0xda, 0x33, 0x35 } },
++	.uniq = { 0x6c51ad71, 0x9097, 0xc9ae, { 0x97, 0x69, 0xe8, 0x34, 0x0b, 0xf4, 0xf4, 0x68 } },
++	.first_lba = 17924096, .last_lba = 122142686, .block_size = 512, .write_first = BLOCK_WRITE_FIRST,
++};
++
 +static const struct platform platform_doha = {
 +	.name = "doha", .io_base = 0x00400000, .io_size = 0x3FC00000,
 +	.gic_dist = 0x0F200000, .gic_redist = 0x0F300000, .uart = 0, .log_other_cpu = 1,
@@ -1197,12 +1226,13 @@ index 256397e..31ac78e 100644
 +	.small_cores = 0xf0,             /* as on willow: Gold stays at its lowest clock with no OSM */
 +	.fb_base = 0x5C000000,           /* dohaPkg: "Display Reserved", what ABL scans out, 1080 x 2280 */
 +	.fb_height = 2280,
++	.store = &doha_store,
 +};
 +
  /* The slower cores of this run: the platform's, unless willow_osm() has raised the Gold cluster's clock. */
  static uint32_t small_cores_now;
  
-@@ -655,6 +675,7 @@ platform_mpidr_core(const struct platform *plat, uint64_t mpidr)
+@@ -655,6 +688,7 @@ platform_mpidr_core(const struct platform *plat, uint64_t mpidr)
  static const struct platform *const platforms[] = {
  	&platform_redwood,
  	&platform_willow,
@@ -1210,7 +1240,7 @@ index 256397e..31ac78e 100644
  };
  
  /* ------------------------------------------------------------------------ */
-@@ -3330,7 +3351,21 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -3330,7 +3364,21 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  		}
  	}
  	small_cores_now = PLAT->small_cores;
@@ -1233,7 +1263,7 @@ index 256397e..31ac78e 100644
  		for (const char *c = pi.cmdline; *c; c++) {
  			if (starts_with(c, "osm=") && (c == pi.cmdline || c[-1] == ' ') && (c[4] == '1' || c[4] == '2') &&
  			    (c[5] == 0 || c[5] == ' ')) {
-@@ -3341,6 +3376,20 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -3341,6 +3389,20 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  				for (int k = 0; k < 2; k++) {
  					volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)osm[k];
  
@@ -1254,7 +1284,7 @@ index 256397e..31ac78e 100644
  					for (int core = 0; core < 4; core++) {
  						r[0x920 / 4 + core] = row[k];
  					}
-@@ -4503,7 +4552,8 @@ efi_main(efi_handle image, efi_system_table *st)
+@@ -4503,7 +4565,8 @@ efi_main(efi_handle image, efi_system_table *st)
  		SCREEN.height = GOP->mode->info->height;
  		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
  		for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++)
@@ -1264,7 +1294,7 @@ index 256397e..31ac78e 100644
  				PLAT = platforms[i];
  		if (PLAT == &platform_qemu_virt)
  			ramfb_phone_screen();
-@@ -4524,6 +4574,11 @@ efi_main(efi_handle image, efi_system_table *st)
+@@ -4524,6 +4587,11 @@ efi_main(efi_handle image, efi_system_table *st)
  	if (have_payload) {
  		run_kernel(0, 0);
  	}

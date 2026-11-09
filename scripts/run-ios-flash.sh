@@ -119,6 +119,10 @@ GPUARG=; [ "${GPU:-0}" = 1 ] && GPUARG=" gpu=1"; [ "${FBGPU:-0}" = 1 ] && GPUARG
 # The default is 0x15: smoother than all 8 cores with the Gold ones at 300 MHz (2026-11-09). CPUS=N: cpus=N instead.
 if [ -n "$CPUS" ]; then CPUARG="cpus=$CPUS"; else CPUARG="cpumask=${CPUMASK:-0x15}"; fi
 [ "${MEMMAP:-0}" = 1 ] && GPUARG="$GPUARG memmap=1"
+# PERSIST=1: /private/var kept between boots (userland/src/var_store.c): ufs_write=1 lets the store, userdata past
+# the iOS volume (the kernel's ufs_stores and the loader's doha_store), take writes; var_store=1 loads the last
+# save at boot and runs the saver; var_save_every=SAVE_EVERY (120 s) saves by itself, as doha has no orderly end of a run
+[ "${PERSIST:-0}" = 1 ] && GPUARG="$GPUARG ufs_write=1 var_store=1 var_save_every=${SAVE_EVERY:-120}"
 CMD="${VERBOSE:+-v }${HUD:+fb_hud=1 }${GPUARG:+${GPUARG# } }bootcpu=3 $CPUARG ufs=2 root_apfs=ufs_userdata${OSMARG}${TOUCHARG} epoch=$(date +%s)"
 echo "cmdline: $CMD"
 python3 xnuloader/mkpayload.py -o ~/doha-xnu/uefi/payload-ios.bin \

@@ -686,3 +686,13 @@ era o `cpumask=0x0e`: os bits são posições na lista de núcleos do loader, o 
 do loader), e sem o bit 0 o kernel entra em pânico ("the boot CPU must be enabled"). `cpumask=0x15` (só os Silver 3, 2,
 1) ficou mais fluido que os 8 núcleos com os Gold a 300 MHz. Padrão agora: `gpu=1 fb_gpu=1 fbwidth=1080 fbheight=2280
 sb_statusbar=1 glasync=1 bootcpu=3 cpumask=0x15 ufs=2 root_apfs=ufs_userdata osm=1 touchscreen=1 epoch=...`.
+
+**Persistência (2026-11-09).** O `var_store` do willow (redwood): `/private/var` continua em memória, empacotado num
+arquivo no flash e desempacotado no boot (`var_store=1`), salvo a cada `var_save_every=120` s pelo job
+`com.redwood.varstore` (o doha não tem fim de sessão ordenado como o willow). O lugar é a `userdata` depois da imagem
+do iOS: a mesma conta do willow, escrita só a partir do bloco 2042368 de 4096, e o arquivo em duas cópias a partir de
+8 GiB. As travas: no loader, `doha_store` (os GUIDs da entrada 80 da GPT, lidos pelo recovery: tipo
+`1b81e7e6-f50d-419b-a739-2aeef8da3335`, único `6c51ad71-9097-c9ae-9769-e8340bf4f468`, LBA 17924096-122142686); no
+kernel, uma entrada de `ufs_stores` com o mesmo início, tamanho e primeiro bloco; no `var_store`, `userdata` na lista
+`STORES` (patch da userland). Com `ufs_write=1 var_store=1 var_save_every=120` (`PERSIST=1` no script), um ícone
+movido na tela inicial continua no lugar depois de desligar e ligar.

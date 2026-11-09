@@ -44,10 +44,22 @@ sub1(L, """/* The slower cores of this run: the platform's, unless willow_osm() 
 """, """/*
  * Moto G8 Plus (doha, SM6125, github.com/andrecremo/ios-doha): the same SoC as willow, so the same peripherals,
  * GIC and clusters, and its UEFI (dohaPkg) puts the framebuffer at the same 0x5C000000; the screen is 1080 x 2280,
- * which tells it from willow. No partition is written yet (no store), and nothing of willow's board: not its RPM
- * voltages, nor its touch panel (the kernel's drivers check device=). osm=1 asks the clusters' OSM for a row of the
- * table doha's own firmware wrote, as on willow (and only where that OSM is on, see below).
+ * which tells it from willow. Nothing of willow's board: not its RPM voltages, nor its touch panel (the kernel's
+ * drivers check device=). osm=1 asks the clusters' OSM for a row of the table doha's own firmware wrote, as on willow
+ * (and only where that OSM is on, see below).
  */
+/*
+ * userdata (mmcblk0p80), doha's 50 GiB that were Android's data: the iOS volume and both cryptexes fill its first
+ * 8365539328 bytes, as they fill willow's system (written from Lineage's recovery, 2026-11-09), so a write goes from
+ * the same block, and the data of iOS (userland/src/var_store.c) goes behind them. Its GUIDs as doha's GPT has them.
+ */
+static const struct store_part doha_store = {
+	.name = "userdata",
+	.type = { 0x1b81e7e6, 0xf50d, 0x419b, { 0xa7, 0x39, 0x2a, 0xee, 0xf8, 0xda, 0x33, 0x35 } },
+	.uniq = { 0x6c51ad71, 0x9097, 0xc9ae, { 0x97, 0x69, 0xe8, 0x34, 0x0b, 0xf4, 0xf4, 0x68 } },
+	.first_lba = 17924096, .last_lba = 122142686, .block_size = 512, .write_first = BLOCK_WRITE_FIRST,
+};
+
 static const struct platform platform_doha = {
 	.name = "doha", .io_base = 0x00400000, .io_size = 0x3FC00000,
 	.gic_dist = 0x0F200000, .gic_redist = 0x0F300000, .uart = 0, .log_other_cpu = 1,
@@ -55,6 +67,7 @@ static const struct platform platform_doha = {
 	.small_cores = 0xf0,             /* as on willow: Gold stays at its lowest clock with no OSM */
 	.fb_base = 0x5C000000,           /* dohaPkg: "Display Reserved", what ABL scans out, 1080 x 2280 */
 	.fb_height = 2280,
+	.store = &doha_store,
 };
 
 /* The slower cores of this run: the platform's, unless willow_osm() has raised the Gold cluster's clock. */
@@ -202,6 +215,16 @@ sub1(A6, """	if (!PE_parse_boot_arg_str("device", device, sizeof(device)) || str
 		zap_region_phys = 0x57115000UL;
 	}
 	redwood_osm_report();""")
+# doha's store: userdata past the iOS volume and the cryptexes (ufs_write=1), the same bounds as the loader's doha_store
+sub1('xnu/files/bsd/dev/redwood_ufs.c', """	{ "userdata", 31031296, 91111391, 512, 0, true },
+""", """	{ "userdata", 31031296, 91111391, 512, 0, true },
+	/*
+	 * doha: userdata, mmcblk0p80, its 50 GiB that were Android's data, with the iOS volume and both cryptexes in
+	 * its first 8365539328 bytes: the store (ufs_write=1, not a filesystem), past them like willow's system.
+	 */
+	{ "userdata", 17924096, 104218591, 512, UFS_WRITE_FIRST, false },
+""")
+
 # the RPM (the SoC's buses for the GPU) and the OSM report: the SoC's, so doha's too
 sub1('xnu/files/bsd/dev/redwood_rpm.c', """	if (!PE_parse_boot_arg_str("device", device, sizeof(device)) || strcmp(device, "willow") != 0) {
 		return;
