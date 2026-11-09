@@ -680,5 +680,9 @@ a `0x13FFFFFFF` cortada pelo payload em `0xF0000000` (o endereço do willow): o 
 memória e o `XnuLoader.h` em `mkdohapkg.py`; o loader com `PAYLOAD_BASE=0x78000000` no build), dentro do bloco livre
 `0x6176b000`-`0x7dd00000`. O kernel fica com 3 GB: "available" 2585 MB no logo e ~1500 MB na tela inicial (era 530-760).
 `sb_statusbar=1` troca a barra vermelha `rdar:45025538` pela de verdade. A Biblioteca de Apps ainda leva até 1231 ms
-por quadro, com a GPU mostrando o quadro em 6 ms: o gargalo é a CPU (os Gold a 300 MHz). `CPUMASK=0x0e GLASYNC=1`
-juntos reiniciaram depois do loader: a testar um de cada vez.
+por quadro, com a GPU mostrando o quadro em 6 ms: o gargalo é a CPU (os Gold a 300 MHz). `glasync=1` sozinho (o flush do GL sem
+esperar o quadro, do willow): Biblioteca de Apps de até 1231 ms para 37 ms por quadro, tela inicial 30 fps. O reinício
+era o `cpumask=0x0e`: os bits são posições na lista de núcleos do loader, o de boot primeiro (3, 4, 2, 5, 1, 6, 7; o 0 é
+do loader), e sem o bit 0 o kernel entra em pânico ("the boot CPU must be enabled"). `cpumask=0x15` (só os Silver 3, 2,
+1) ficou mais fluido que os 8 núcleos com os Gold a 300 MHz. Padrão agora: `gpu=1 fb_gpu=1 fbwidth=1080 fbheight=2280
+sb_statusbar=1 glasync=1 bootcpu=3 cpumask=0x15 ufs=2 root_apfs=ufs_userdata osm=1 touchscreen=1 epoch=...`.
