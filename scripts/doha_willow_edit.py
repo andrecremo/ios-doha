@@ -100,6 +100,97 @@ sub1(L, """	/* One-shot mode: run the kernel that came with the image, then rese
 	}
 	reboot();""")
 
+sub1(L, """	if (PLAT == &platform_willow) {
+		for (const char *c = pi.cmdline; *c; c++) {
+			if (starts_with(c, "osmdump=1") && (c == pi.cmdline || c[-1] == ' ')) {
+				osm_dump();
+				break;
+			}
+		}
+	}""", """	if (PLAT == &platform_willow || PLAT == &platform_doha) {
+		for (const char *c = pi.cmdline; *c; c++) {
+			if (starts_with(c, "osmdump=1") && (c == pi.cmdline || c[-1] == ' ')) {
+				if (PLAT != &platform_doha) {
+					osm_dump();
+				}
+				if (PLAT == &platform_doha) {
+					/* the words that differ, four to a line so that all fit on the screen: offset silver/gold */
+					volatile uint32_t *s = (volatile uint32_t *)(uintptr_t)0x0F521000ULL;
+					volatile uint32_t *g = (volatile uint32_t *)(uintptr_t)0x0F523000ULL;
+					unsigned on_line = 0, differ = 0;
+
+					print("osm Silver/Gold, the words that differ (table 0x110..0x30f left out):\\n");
+					for (uint32_t off = 0; off < 0x1400; off += 4) {
+						if ((off >= 0x110 && off < 0x310) || s[off / 4] == g[off / 4]) {
+							continue;
+						}
+						differ++;
+						print("%x:%x/%x%s", (uint64_t)off, (uint64_t)s[off / 4], (uint64_t)g[off / 4],
+						    ++on_line % 4 == 0 ? "\\n" : "  ");
+					}
+					print("%s%d differ; 20 s to read this, then the tables\\n", on_line % 4 ? "\\n" : "", (uint64_t)differ);
+					BS->stall(20000000);
+				}
+				if (PLAT == &platform_doha) {
+					/*
+					 * doha: both clusters' enables and the first rows of their tables (Linux's clk_osm_read_lut:
+					 * 0x110 + 32 * row, [31:30] source (0: the 300 MHz one), [7:0] L of 19.2 MHz; 0x114 + 32 * row,
+					 * [21:16] virtual corner, [11:0] open loop mV) -- whether the firmware wrote Gold's -- 30 s on screen
+					 */
+					volatile uint32_t *osm[2] = { (volatile uint32_t *)(uintptr_t)0x0F521000ULL,
+						                      (volatile uint32_t *)(uintptr_t)0x0F523000ULL };
+
+					print("osm enable: Silver %x, Gold %x\\n", (uint64_t)osm[0][0], (uint64_t)osm[1][0]);
+					{
+						/*
+						 * The copy uefi/DohaShim.S took of both blocks as ABL left them, before the UEFI ran (0x7BE00000
+						 * Silver, +0x2000 Gold, "OSMS" at +0x4000): Gold's enable and configuration words then, and how
+						 * much of Gold's block the UEFI has changed since
+						 */
+						volatile uint32_t *snap = (volatile uint32_t *)(uintptr_t)0x7BE00000ULL;
+
+						if (snap[0x4000 / 4] == 0x534d534fu) {
+							uint32_t then_set = 0, now_set = 0, changed = 0;
+
+							for (uint32_t at = 0x1c; at <= 0xb8; at += 4) {
+								then_set += snap[(0x2000 + at) / 4] != 0;
+								now_set += osm[1][at / 4] != 0;
+							}
+							for (uint32_t at = 0; at < 0x1400; at += 4) {
+								changed += snap[(0x2000 + at) / 4] != osm[1][at / 4];
+							}
+							print("osm as ABL left it: enable Silver %x Gold %x; Gold's config set then %d now %d of 40; "
+							    "%d words of Gold's block changed since\\n", (uint64_t)snap[0], (uint64_t)snap[0x2000 / 4],
+							    (uint64_t)then_set, (uint64_t)now_set, (uint64_t)changed);
+							print("osm as ABL left it, Gold: 2c %x 54 %x 84 %x 700 %x 720 %x 920 %x row7 %x %x\\n",
+							    (uint64_t)snap[(0x2000 + 0x2c) / 4], (uint64_t)snap[(0x2000 + 0x54) / 4],
+							    (uint64_t)snap[(0x2000 + 0x84) / 4], (uint64_t)snap[(0x2000 + 0x700) / 4],
+							    (uint64_t)snap[(0x2000 + 0x720) / 4], (uint64_t)snap[(0x2000 + 0x920) / 4],
+							    (uint64_t)snap[(0x2000 + 0x110 + 32 * 7) / 4], (uint64_t)snap[(0x2000 + 0x114 + 32 * 7) / 4]);
+						} else {
+							print("osm as ABL left it: no copy from the shim (%x at 0x7BE04000)\\n", (uint64_t)snap[0x4000 / 4]);
+						}
+					}
+					for (uint32_t row = 0; row < 16; row++) {
+						uint32_t f[2], v[2];
+
+						for (int k = 0; k < 2; k++) {
+							f[k] = osm[k][(0x110 + 32 * row) / 4];
+							v[k] = osm[k][(0x114 + 32 * row) / 4];
+						}
+						print("row %d: S %d MHz c%d %d mV | G %d MHz c%d %d mV (%x %x)\\n", (uint64_t)row,
+						    (uint64_t)((f[0] >> 30) ? (f[0] & 0xff) * 192 / 10 : 300), (uint64_t)(v[0] >> 16 & 0x3f),
+						    (uint64_t)(v[0] & 0xfff), (uint64_t)((f[1] >> 30) ? (f[1] & 0xff) * 192 / 10 : 300),
+						    (uint64_t)(v[1] >> 16 & 0x3f), (uint64_t)(v[1] & 0xfff), (uint64_t)f[1], (uint64_t)v[1]);
+					}
+					print("osmdump=1: 20 s to read this\\n");
+					BS->stall(20000000);
+				}
+				break;
+			}
+		}
+	}""")
+
 sub1(L, """	small_cores_now = PLAT->small_cores;
 	if (PLAT == &platform_willow) {""", """	small_cores_now = PLAT->small_cores;
 	if (PLAT == &platform_doha) {
@@ -327,6 +418,29 @@ battery_look(void)
 		redwood_status(REDWOOD_STATUS_BATTERY, "PMI632 gauge reads %d mV (raw %02x%02x): not used", mv, v[1], v[0]);
 		return;
 	}
+	/*
+	 * A cell's voltage sags while the cores draw (the Gold ones at 1804 MHz more so), and one low reading made the
+	 * status bar show 16% when the panel said 44%. The level is taken from the highest of the last minute's readings
+	 * (12, 5 s apart: the least loaded, the nearest the resting voltage), and it never rises without a cable nor
+	 * falls with one; a cable in or out starts over.
+	 */
+	static int recent[12], filled, next, last_soc = -1, last_plugged = -1;
+	int plugged_now = (usb & 0x10) != 0, high = 0;
+
+	if (plugged_now != last_plugged) {
+		filled = next = 0;
+		last_soc = -1;
+		last_plugged = plugged_now;
+	}
+	recent[next] = mv;
+	next = (next + 1) % 12;
+	if (filled < 12) {
+		filled++;
+	}
+	for (int i = 0; i < filled; i++) {
+		high = recent[i] > high ? recent[i] : high;
+	}
+	mv = high;
 	if (mv <= 3300) {
 		soc = 0;
 	} else if (mv < 3700) {
@@ -344,6 +458,10 @@ battery_look(void)
 	if (state == 5) {
 		soc = 100;      /* the charger says it has finished: full */
 	}
+	if (last_soc >= 0 && (plugged_now ? soc < last_soc : soc > last_soc)) {
+		soc = last_soc;
+	}
+	last_soc = soc;
 	redwood_battery_direct(soc, mv, (usb & 0x10) != 0, state >= 1 && state <= 4, android);
 }
 
@@ -440,6 +558,62 @@ sub1('xnu/files/bsd/dev/redwood_ufs.c', """	{ "userdata", 31031296, 91111391, 51
 	 */
 	{ "userdata", 17924096, 104218591, 512, UFS_WRITE_FIRST, false },
 """)
+
+# doha: uefi_cpu=probe (what Qualcomm's ClockDxe says of each core's performance levels, read only) stays on screen:
+# whether the UEFI's own clock driver can put the Gold cluster at a level, the OSM set up by the firmware itself
+sub1(L, """					print("uefi clock: the clock protocol, version %x\\n", clock->version);
+					uefi_cpu_probe(clock);
+				}
+				break;""", """					print("uefi clock: the clock protocol, version %x\\n", clock->version);
+					uefi_cpu_probe(clock);
+					if (PLAT == &platform_doha) {
+						print("uefi_cpu=probe: 25 s to read this\\n");
+						BS->stall(25000000);
+					}
+				}
+				break;""")
+
+# the OSM report (osm_dump=1) in short on the panel's CPU line: Gold's enable, how many of its configuration words
+# (0x1c..0xb8, all set on Silver, all zero on Gold before its cores were up) are set now, and the cores' speed
+OSMF = 'xnu/files/bsd/dev/redwood_osm.c'
+sub1(OSMF, """	printf("osm: %u lines of the blocks not zero\\n", lines);
+""", """	printf("osm: %u lines of the blocks not zero\\n", lines);
+	static uint32_t gold_enable, gold_set;
+	{
+		uint32_t s_set = 0, g_set = 0;
+
+		for (uint32_t at = 0x1c; at <= 0xb8; at += 4) {
+			s_set += rd(osm + OSM_SILVER + at) != 0;
+			g_set += rd(osm + OSM_GOLD + at) != 0;
+		}
+		redwood_status(REDWOOD_STATUS_CPU, "OSM %us: enable S %x G %x; config set S %u G %u of 40", after,
+		    rd(osm + OSM_SILVER), rd(osm + OSM_GOLD), s_set, g_set);
+		gold_enable = rd(osm + OSM_GOLD);
+		gold_set = g_set;
+	}
+""")
+sub1(OSMF, """		printf("osm: cpu %d (on cpu %d): 100M loops in %llu us: %llu million a second\\n", cpu, cpu_number(), ns / 1000,
+		    ns ? 100000000000ull / ns : 0);""", """		printf("osm: cpu %d (on cpu %d): 100M loops in %llu us: %llu million a second\\n", cpu, cpu_number(), ns / 1000,
+		    ns ? 100000000000ull / ns : 0);
+		{
+			static char speeds[48];
+			size_t used = strlen(speeds);
+
+			snprintf(speeds + used, sizeof(speeds) - used, "%s%llu", used ? " " : "", ns ? 100000000000ull / ns : 0);
+			redwood_status(REDWOOD_STATUS_CPU, "G en %x cfg %u/40; Mloop/s: %s", gold_enable, gold_set, speeds);
+		}""")
+
+# osmc=f523000:ROW (each Gold core asks for a row as it comes up, as doha's own clk-cpu-osm.c does) on the panel's CPU
+# line: Gold's OSM enable before and after the core asked, the row it reads back, and each core's speed (cpuprobe=1)
+sub1(A6, """			printf("osm: core %d: enable %x then %x, desired %x, cycles %x then %x; %u MHz if one add a cycle\\n", core,
+			    seen[0], seen[1], seen[2], seen[3], seen[4], redwood_cpu_mhz[core]);""",
+     """			printf("osm: core %d: enable %x then %x, desired %x, cycles %x then %x; %u MHz if one add a cycle\\n", core,
+			    seen[0], seen[1], seen[2], seen[3], seen[4], redwood_cpu_mhz[core]);
+			if (core >= 4 && seen[5] != 0) {
+				redwood_status(REDWOOD_STATUS_CPU, "G%x>%x r%x %u %u %u %u|%u %u %u %u", seen[0], seen[1], seen[2],
+				    redwood_cpu_mhz[0], redwood_cpu_mhz[1], redwood_cpu_mhz[2], redwood_cpu_mhz[3], redwood_cpu_mhz[4],
+				    redwood_cpu_mhz[5], redwood_cpu_mhz[6], redwood_cpu_mhz[7]);
+			}""")
 
 # the RPM (the SoC's buses for the GPU) and the OSM report: the SoC's, so doha's too
 sub1('xnu/files/bsd/dev/redwood_rpm.c', """	if (!PE_parse_boot_arg_str("device", device, sizeof(device)) || strcmp(device, "willow") != 0) {

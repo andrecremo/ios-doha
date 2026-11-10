@@ -730,3 +730,36 @@ um pulso entre duas olhadas se perdia, e um "dedo levantado" perdido fazia o toq
 primeiro ("dois cliques" nos menus). Agora o detector de interrupção do TLMM memoriza a borda (INTR_CFG +0x8: raw
 status bit 4, descida `2 << 2`, polaridade bit 1, entrega bit 0 desligada; INTR_STATUS +0xC bit 0, zerado a cada
 leitura; o layout do `pinctrl-trinket.c`), e o driver lê o relatório a cada borda memorizada. Um toque abre o item.
+
+Núcleos Gold (2026-11-10), encerrado: o `clk-cpu-osm.c` do kernel do doha só lê a tabela do OSM e escreve os pedidos de
+linha (0x920 + 4 × núcleo); nunca liga o bloco (ENABLE_REG 0). Com `osmdump=1` o loader mostrou: Silver enable 3,
+Gold 2; a tabela dos Gold escrita pelo firmware (300, 652, 902, 1056, 1401, 1536, 1804, 2016 MHz, corners c0-c7,
+588-904 mV, as faixas dos Silver); mas os 40 registradores de configuração de 0x1c a 0xb8 (sequenciador,
+temporizadores, limites) todos 0 nos Gold, e 0x2c, 0x54, 0x84 e 0x700-0x784 (PLL, CPR, regulador) só em parte. O
+controlador dos Gold não foi inicializado; ligá-lo assim deixaria a frequência e a tensão do cluster com parâmetros
+em zero. E ler esses blocos com os Gold ligados (o `osm_dump=1` do kernel, 70 s depois, com `cpus=8`) reinicia o
+aparelho (o mesmo `cpus=8` sem ele liga). Sem documentação do sequenciador não há caminho seguro: os Gold ficam de
+fora (`cpumask=0x15`). Não usar `osm_dump=1` com os Gold ligados.
+
+Gold revisitado (2026-11-10): suspeita de que a UEFI apagasse o OSM dos Gold deixado pelo ABL (no Redmi Note 8, mesmo
+SM6125, o Linux mainline sai direto do ABL e roda os Gold a 2016 MHz). O `DohaShim.S` passou a copiar os dois blocos
+(0x1400 bytes cada) para 0x7BE00000 antes da UEFI, e o `osmdump=1` do loader compara. Resultado: como o ABL deixou,
+Silver enable 3, Gold 2; configuração dos Gold 6 de 40 palavras antes e depois; 0 palavras do bloco Gold mudadas pela
+UEFI; pedido de linha dos Gold (0x920) em 0 (300 MHz), dos Silver em 4. A UEFI não toca nos Gold: é o estado do
+firmware da Motorola, o mesmo com que o Android do doha roda, e o `clk-cpu-osm.c` dele só escreve 0x920 + 4 × núcleo.
+
+Gold destravado (2026-11-10): `CPUS=8 OSMGOLD=3` (`osmc=f523000:3 cpuprobe=1`: cada Gold, ao subir, pede a linha 3 em
+0x920 + 4 × núcleo). HUD: `G3>3 r3 0 1804 1804 1804|1055 1055 1055 1055`. O enable dos Gold já é 3 quando o núcleo
+sobe: o firmware liga o OSM dos Gold no CPU_ON do PSCI (o loader lê antes, por isso via 2). Os Gold aceitam o pedido
+e rodam a 1055 MHz (o núcleo 0 é do loader, sem medida). Sem reinício. `OSMGOLD=6`: `G3>3 r6 0 1804 1804 1804|1804
+1804 1804 1804`, os oito núcleos a 1804 MHz, estável. Padrão agora: `cpus=8` com `osmc=f523000:6 cpuprobe=1`
+(`run-ios-flash.sh`; `OSMGOLD=0` deixa os Gold a 300 MHz, `CPUMASK=0x15` só os Silver).
+
+Pendências vistas com os Gold a 1804 MHz (2026-11-10):
+- Rodinha (tela preta com o indicador de espera, alguns segundos, e a interface volta): provavelmente o `backboardd`
+  reiniciando (o README do willow-hackios cita SIGBUS dele com `glasync=1` e `/var` em disco). Com `SAVE_EVERY=600`
+  sumiu numa rodada e voltou noutra; a relação com o save não está confirmada. Rápida, pouco incômoda.
+- Bateria: o nível estimado pela tensão pulava com a carga (barra 16% com o HUD em 44%). Agora vem da maior leitura do
+  último minuto, só desce sem cabo e só sobe com ele; a barra acompanha o HUD, mas pulou de 55% para 38% numa rodada
+  (provavelmente ao tirar o cabo: a tensão de carga infla a estimativa). A ver: a corrente do medidor (QG) para
+  compensar a carga.

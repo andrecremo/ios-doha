@@ -16,6 +16,14 @@
 #define PAYLOAD_BASE 0x78000000
 #define FB_BASE     0x5C000000
 #define FB_STRIDE   4320
+/*
+ * A copy of both CPU clusters' OSM blocks as ABL leaves them (the Silver one at 0x0F521000, the Gold one at
+ * 0x0F523000, 0x1400 bytes each), taken before the UEFI starts, which puts the cores at its 288 MHz and leaves Gold's
+ * OSM off and its configuration zero. Linux started straight from ABL finds Gold's OSM on (mainline's
+ * qcom-cpufreq-hw on the Redmi Note 8, same SM6125: 2016 MHz). In the "XNU Payload" region, past any payload and
+ * below the loader's panic log (PAYLOAD_BASE + 63 MiB); "OSMS" after both copies says it is there. The loader reads it.
+ */
+#define OSM_SNAP    0x7BE00000
 
 	.text
 	.globl	_head
@@ -43,6 +51,29 @@ band:
 	str	w6, [x4], #4
 	subs	x5, x5, #1
 	b.ne	band
+	dsb	sy
+
+	/* the two OSM blocks, a 32-bit word at a time (device registers): Silver to OSM_SNAP, Gold to OSM_SNAP + 0x2000 */
+	ldr	x4, =0x0F521000
+	ldr	x5, =OSM_SNAP
+	mov	x6, #(0x1400 / 4)
+osm_silver:
+	ldr	w2, [x4], #4
+	str	w2, [x5], #4
+	subs	x6, x6, #1
+	b.ne	osm_silver
+	ldr	x4, =0x0F523000
+	ldr	x5, =(OSM_SNAP + 0x2000)
+	mov	x6, #(0x1400 / 4)
+osm_gold:
+	ldr	w2, [x4], #4
+	str	w2, [x5], #4
+	subs	x6, x6, #1
+	b.ne	osm_gold
+	ldr	x5, =(OSM_SNAP + 0x4000)
+	movz	w2, #0x534f
+	movk	w2, #0x534d, lsl #16		/* 0x534d534f: the bytes 'O' 'S' 'M' 'S' */
+	str	w2, [x5]
 	dsb	sy
 
 	adr	x4, fd

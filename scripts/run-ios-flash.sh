@@ -119,15 +119,31 @@ GPUARG=; [ "${GPU:-0}" = 1 ] && GPUARG=" gpu=1"; [ "${FBGPU:-0}" = 1 ] && GPUARG
 # (bit 0, which must be set: the kernel panics without it), then by distance from it: 3, 4, 2, 5, 1, 6, 7 (core 0 is
 # the loader's). 0x15: the Silver cores 3, 2, 1 alone, without the Gold ones the firmware leaves at 300 MHz.
 # MEMMAP=1: memmap=1, the loader shows the UEFI's memory map for 20 s before the kernel
-# The default is 0x15: smoother than all 8 cores with the Gold ones at 300 MHz (2026-11-09). CPUS=N: cpus=N instead.
-if [ -n "$CPUS" ]; then CPUARG="cpus=$CPUS"; else CPUARG="cpumask=${CPUMASK:-0x15}"; fi
+# The default is cpus=8, all the cores, the Gold ones at 1804 MHz (OSMGOLD=6 below, 2026-11-10); before Gold could be
+# clocked, 0x15 was smoother than the 8 with Gold at 300 MHz. CPUS=N: cpus=N instead.
+if [ -n "$CPUS" ]; then CPUARG="cpus=$CPUS"; elif [ -n "$CPUMASK" ]; then CPUARG="cpumask=$CPUMASK"; else CPUARG="cpus=8"; fi
 [ "${MEMMAP:-0}" = 1 ] && GPUARG="$GPUARG memmap=1"
 # UEFILOG=1: uefilog=1, the loader shows the lines of the UEFI's own log about the charger for 25 s before the kernel
 [ "${UEFILOG:-0}" = 1 ] && GPUARG="$GPUARG uefilog=1"
-# PERSIST=1: /private/var kept between boots (userland/src/var_store.c): ufs_write=1 lets the store, userdata past
+# OSMDUMP=1: osmdump=1, the loader shows both clusters' OSM (enable, the words that differ, the tables' first rows)
+# for 30 s before the kernel
+[ "${OSMDUMP:-0}" = 1 ] && GPUARG="$GPUARG osmdump=1"
+# OSMREPORT=1: osm_dump=1, the kernel reads both clusters' OSM 70 s in (with CPUS=8 the Gold cores are up by then)
+# and puts a summary on the panel's CPU line: Gold's enable, its configuration words set, each core's speed
+[ "${OSMREPORT:-0}" = 1 ] && GPUARG="$GPUARG osm_dump=1"
+# UEFICPU=1: uefi_cpu=probe, the loader shows what Qualcomm's ClockDxe says of each core's performance levels
+# (read only) for 25 s before the kernel
+[ "${UEFICPU:-0}" = 1 ] && GPUARG="$GPUARG uefi_cpu=probe"
+# OSMGOLD=ROW (default 6, 1804 MHz; OSMGOLD=0 leaves it out, Gold at 300 MHz): each Gold core asks for row ROW of Gold's OSM table as it comes up (osmc=f523000:ROW, the
+# request doha's own clk-cpu-osm.c writes; enable and configuration left alone), cpuprobe=1 measures each core; the panel's
+# CPU line: "G<enable before>><after> r<row read back> <MHz of cores 0-3>|<4-7>". Rows: 3 1056, 5 1536, 6 1804, 7 2016 MHz
+# (7 not used: nothing in this port watches the temperature; the SoC's own limits hardware still does). The firmware
+# turns Gold's OSM on (enable 3) as PSCI powers a Gold core: the loader, before that, reads 2
+[ "${OSMGOLD:-6}" != 0 ] && GPUARG="$GPUARG osmc=f523000:${OSMGOLD:-6} cpuprobe=1"
+# PERSIST=1 (default; PERSIST=0 leaves it out, a boot with an empty /var that writes nothing): /private/var kept between boots (userland/src/var_store.c): ufs_write=1 lets the store, userdata past
 # the iOS volume (the kernel's ufs_stores and the loader's doha_store), take writes; var_store=1 loads the last
 # save at boot and runs the saver; var_save_every=SAVE_EVERY (120 s) saves by itself, as doha has no orderly end of a run
-[ "${PERSIST:-0}" = 1 ] && GPUARG="$GPUARG ufs_write=1 var_store=1 var_save_every=${SAVE_EVERY:-120}"
+[ "${PERSIST:-1}" = 1 ] && GPUARG="$GPUARG ufs_write=1 var_store=1 var_save_every=${SAVE_EVERY:-120}"
 CMD="${VERBOSE:+-v }${HUD:+fb_hud=1 }${GPUARG:+${GPUARG# } }bootcpu=3 $CPUARG ufs=2 root_apfs=ufs_userdata${OSMARG}${TOUCHARG} epoch=$(date +%s)"
 echo "cmdline: $CMD"
 python3 xnuloader/mkpayload.py -o ~/doha-xnu/uefi/payload-ios.bin \
