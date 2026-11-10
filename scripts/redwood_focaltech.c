@@ -91,6 +91,14 @@ sleep_ms(uint32_t ms)
 #define TLMM_SIZE               0x100000UL
 #define GPIO_CFG(n)             (tlmm + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
 #define GPIO_IO(n)              (tlmm + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
+/*
+ * The pin's interrupt detector (Linux pinctrl-msm.c with pinctrl-trinket.c's layout): [0] deliver it, [1] polarity,
+ * [3:2] detection (2: falling edge), [4] raw status -- the edge is latched in INTR_STATUS bit 0 even while it is not
+ * delivered. The chip says a report is waiting with a short low pulse, which a look at the level every 10 ms misses
+ * (and a lost "finger up" made a tap need a second one); the latched edge does not. Nothing is delivered to the GIC.
+ */
+#define GPIO_INTR_CFG(n)        (tlmm + 0x1000UL * (n) + 8)
+#define GPIO_INTR_STATUS(n)     (tlmm + 0x1000UL * (n) + 0xc)
 #define PULL_NONE               0
 #define PULL_UP                 3
 
@@ -880,10 +888,27 @@ focaltech_thread(__unused void *parameter, __unused wait_result_t result)
 		printf("focaltech: the firmware runs: chip id %#x, firmware version %#x\n", chip, version);
 	}
 
+	/* the falling edge latched, never delivered: raw status on, falling edge, delivery off; then the status cleared */
+	{
+		uint32_t cfg = rd(GPIO_INTR_CFG(PIN_INT));
+
+		cfg &= ~(1u | 1u << 1 | 3u << 2);
+		cfg |= 1u << 4 | 2u << 2 | 1u << 1;
+		wr(GPIO_INTR_CFG(PIN_INT), cfg);
+		wr(GPIO_INTR_STATUS(PIN_INT), 0);
+		printf("focaltech: the interrupt line's falling edge latched (INTR_CFG %#x), not delivered\n",
+		    rd(GPIO_INTR_CFG(PIN_INT)));
+	}
 	printf("focaltech: watching the interrupt line every %u us\n", poll_us);
 	redwood_status(REDWOOD_STATUS_TOUCH, "ok, FT8719, %u Hz", 1000000 / poll_us);
 	for (unsigned tick = 1;; tick++) {
-		if (!gpio_get(PIN_INT)) {
+		/* a report since the last look: the latched edge (a pulse however short), or the line held low */
+		bool edge = (rd(GPIO_INTR_STATUS(PIN_INT)) & 1) != 0;
+
+		if (edge) {
+			wr(GPIO_INTR_STATUS(PIN_INT), 0);
+		}
+		if (edge || !gpio_get(PIN_INT)) {
 			fts_poll();
 		}
 		if (tick % (60 * 1000000 / poll_us) == 0) {

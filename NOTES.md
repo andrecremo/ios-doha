@@ -723,3 +723,10 @@ cópia, conferidos antes e lidos de volta; os originais em `F:\doha-ios\backup\g
 disse `slot-successful:a: yes`. Mas `fastboot flash boot_a` tira a marca e volta as tentativas a 7. Na prática: com
 a UEFI nos dois slots, uns 14 boots até os dois se esgotarem (o `b` liga o iOS igual); depois, `fastboot --set-active=a`.
 Para não precisar disso, o loader teria de pôr a marca ele mesmo, como o Android.
+
+Touch, um toque só (2026-11-10): o FT8719 avisa cada relatório com um pulso curto, de descida, na linha de interrupção
+(GPIO 88; o device tree diz `interrupts = <0x58 0x2>`), e o driver só lia quando via a linha baixa, olhando a cada 10 ms:
+um pulso entre duas olhadas se perdia, e um "dedo levantado" perdido fazia o toque seguinte servir só para soltar o
+primeiro ("dois cliques" nos menus). Agora o detector de interrupção do TLMM memoriza a borda (INTR_CFG +0x8: raw
+status bit 4, descida `2 << 2`, polaridade bit 1, entrega bit 0 desligada; INTR_STATUS +0xC bit 0, zerado a cada
+leitura; o layout do `pinctrl-trinket.c`), e o driver lê o relatório a cada borda memorizada. Um toque abre o item.
