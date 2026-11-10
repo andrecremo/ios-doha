@@ -713,3 +713,13 @@ nunca marca o boot como bem-sucedido e o ABL gasta as tentativas. Para carregar:
 `fastboot --set-active=a`, desligar pelo menu com o carregador (o modo de carga do Android não monta a `userdata`:
 não segurar Power nele, o Android normal a formataria); depois a UEFI de volta no `boot_a`. A carregar ainda: o
 carregamento com o iOS rodando, a marca de boot bem-sucedido, um nível mais preciso que o da tensão.
+
+Os slots A/B (2026-11-10): o estado fica nos atributos das entradas `boot_a`/`boot_b` da GPT (bits 48-49 prioridade, 50
+ativo, 51-53 tentativas, 54 bem-sucedido, 55 não inicializável). O ABL gasta uma tentativa por boot de um slot sem a
+marca de bem-sucedido, que no Android o próprio sistema põe (boot control HAL); a nossa UEFI nunca a põe, então depois
+de 7 boots o ABL passa ao outro slot. O recovery do Lineage não tem `bootctl`; a marca foi posta à mão (o bit 54 do
+`boot_a`, `0x0037000000000048` para `0x0077000000000048`, nas duas cópias da GPT com os CRCs refeitos: 9 bytes por
+cópia, conferidos antes e lidos de volta; os originais em `F:\doha-ios\backup\gpt-*-2026-11-10.bin`), e o fastboot
+disse `slot-successful:a: yes`. Mas `fastboot flash boot_a` tira a marca e volta as tentativas a 7. Na prática: com
+a UEFI nos dois slots, uns 14 boots até os dois se esgotarem (o `b` liga o iOS igual); depois, `fastboot --set-active=a`.
+Para não precisar disso, o loader teria de pôr a marca ele mesmo, como o Android.
