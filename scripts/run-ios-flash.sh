@@ -102,6 +102,9 @@ PAYLOAD_BASE=0x78000000 LOADER_BASE=0x61000000 bash xnuloader/build.sh
 OSMARG=; [ "${OSM:-1}" = 1 ] && OSMARG=" osm=1"
 # TOUCH=1 (default): touchscreen=1, the FT8719 driver (bsd/dev/redwood_focaltech.c, device=doha); TOUCH=0: left out
 TOUCHARG=; [ "${TOUCH:-1}" = 1 ] && TOUCHARG=" touchscreen=1"
+# BATTERY=1 (default): battery=1, the battery's level for the status bar: the loader asks Qualcomm's ChargerEx in
+# doha's UEFI (read-only: present, charger plugged, voltage; the level estimated from the voltage); BATTERY=0: left out
+[ "${BATTERY:-1}" = 1 ] && TOUCHARG="$TOUCHARG battery=1"
 # HUD=1: fb_hud=1, a line for each part of the phone (the drivers' redwood_status()) drawn over the picture
 # GPU=1: gpu=1, the Adreno 610 started and kept for the system (redwood_a610.c; the RPM's buses first, the zap shader,
 # 745 MHz); FBGPU=1 too: fb_gpu=1, frames onto the panel by the GPU's 2D engine (with a GL=1 small image)
@@ -119,6 +122,8 @@ GPUARG=; [ "${GPU:-0}" = 1 ] && GPUARG=" gpu=1"; [ "${FBGPU:-0}" = 1 ] && GPUARG
 # The default is 0x15: smoother than all 8 cores with the Gold ones at 300 MHz (2026-11-09). CPUS=N: cpus=N instead.
 if [ -n "$CPUS" ]; then CPUARG="cpus=$CPUS"; else CPUARG="cpumask=${CPUMASK:-0x15}"; fi
 [ "${MEMMAP:-0}" = 1 ] && GPUARG="$GPUARG memmap=1"
+# UEFILOG=1: uefilog=1, the loader shows the lines of the UEFI's own log about the charger for 25 s before the kernel
+[ "${UEFILOG:-0}" = 1 ] && GPUARG="$GPUARG uefilog=1"
 # PERSIST=1: /private/var kept between boots (userland/src/var_store.c): ufs_write=1 lets the store, userdata past
 # the iOS volume (the kernel's ufs_stores and the loader's doha_store), take writes; var_store=1 loads the last
 # save at boot and runs the saver; var_save_every=SAVE_EVERY (120 s) saves by itself, as doha has no orderly end of a run

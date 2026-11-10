@@ -696,3 +696,20 @@ do iOS: a mesma conta do willow, escrita só a partir do bloco 2042368 de 4096, 
 kernel, uma entrada de `ufs_stores` com o mesmo início, tamanho e primeiro bloco; no `var_store`, `userdata` na lista
 `STORES` (patch da userland). Com `ufs_write=1 var_store=1 var_save_every=120` (`PERSIST=1` no script), um ícone
 movido na tela inicial continua no lugar depois de desligar e ligar.
+
+**Bateria (2026-11-10).** O caminho do willow/redwood (o loader lê o carregador pelos protocolos `ChargerEx` e
+`QcomCharger` da UEFI e passa a página ao kernel, `battery=1`) não serve ao doha: os dois protocolos não existem
+(`EFI_NOT_FOUND`, `r0x5a030e0e` no painel), embora `ChargerExDxe` e `QcomChargerDxeLA` estejam no FD e no APRIORI;
+o "Log Buffer" (`0x5FFF7000`) guarda o log do XBL, não o da UEFI, e não diz por quê. Em vez disso o kernel lê o PMI632
+(slave 2) pelo leitor SPMI do `redwood_buttons.c`, só leitura, a cada 5 s: a tensão do gauge (`qgauge@4800`,
+`QG_LAST_ADC_V_DATA0` 0xC0, 194,637 uV por passo), o cabo (`usb@1300`, INT_RT_STS bit 4), o estado do carregador
+(`chgr@1000`, 0x06) e o nível que o Android deixou no SDAM do gauge (`qg-sdam@b100`, 0x47); o nível sai da tensão
+(a curva do `soc_from_voltage` do loader) e só tensões de 2,8 a 4,6 V são usadas. O ícone do iOS mostra o nível
+(`kern.redwood.battery_soc`, a biblioteca injetada no SpringBoard). Com o cabo, `cable 1`; `chg 0` perto de cheia.
+
+A bateria se esgotou (2,97 V e caindo no fastboot, que não carrega): o modo de carga do bootloader (desligado com o
+cabo) inicia o `boot` do slot ativo, que é a nossa UEFI. E o slot ativo tinha passado a `b` sozinho, porque a UEFI
+nunca marca o boot como bem-sucedido e o ABL gasta as tentativas. Para carregar: o `boot_a` do Lineage de volta,
+`fastboot --set-active=a`, desligar pelo menu com o carregador (o modo de carga do Android não monta a `userdata`:
+não segurar Power nele, o Android normal a formataria); depois a UEFI de volta no `boot_a`. A carregar ainda: o
+carregamento com o iOS rodando, a marca de boot bem-sucedido, um nível mais preciso que o da tensão.

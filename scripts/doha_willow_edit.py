@@ -115,6 +115,45 @@ sub1(L, """	small_cores_now = PLAT->small_cores;
 				break;
 			}
 		}
+		/*
+		 * doha, "uefilog=1": the lines of the UEFI's own log (dohaPkg's "Log Buffer", 32 KB at 0x5FFF7000, where
+		 * DEBUG () goes) that say "harg" or "attery" -- why Qualcomm's charger drivers did not come up -- for 25 s
+		 */
+		for (const char *c = pi.cmdline; *c; c++) {
+			if (starts_with(c, "uefilog=1") && (c == pi.cmdline || c[-1] == ' ')) {
+				const char *log = (const char *)(uintptr_t)0x5FFF7000ULL;
+				char line[160];
+				int shown = 0;
+
+				print("uefilog=1: the UEFI log's lines about the charger:\\n");
+				for (uint64_t i = 0, start = 0; i <= 0x8000 && shown < 40; i++) {
+					if (i == 0x8000 || log[i] == '\\n' || log[i] == 0) {
+						uint64_t len = i - start, k = 0;
+						int match = 0;
+
+						for (uint64_t j = start; j + 4 <= i; j++) {
+							if ((log[j] == 'h' && log[j + 1] == 'a' && log[j + 2] == 'r' && log[j + 3] == 'g') ||
+							    (log[j] == 'a' && log[j + 1] == 't' && log[j + 2] == 't' && log[j + 3] == 'e')) {
+								match = 1;
+							}
+						}
+						if (match && len > 0) {
+							for (uint64_t j = start; j < i && k < sizeof(line) - 2; j++) {
+								line[k++] = (log[j] >= 32 && log[j] < 127) ? log[j] : '.';
+							}
+							line[k++] = '\\n';
+							line[k] = 0;
+							print("%s", line);
+							shown++;
+						}
+						start = i + 1;
+					}
+				}
+				print("uefilog=1: %d lines; 25 s to read this\\n", (uint64_t)shown);
+				BS->stall(25000000);
+				break;
+			}
+		}
 	}
 	if (PLAT == &platform_willow || PLAT == &platform_doha) {""")
 
@@ -215,6 +254,183 @@ sub1(A6, """	if (!PE_parse_boot_arg_str("device", device, sizeof(device)) || str
 		zap_region_phys = 0x57115000UL;
 	}
 	redwood_osm_report();""")
+# doha's battery (battery=1): Qualcomm's ChargerEx in doha's own UEFI, read-only queries alone -- the battery there,
+# a charger plugged in, the cell's voltage -- and the state of charge estimated from that voltage; QcomCharger (the
+# gauge's own figure) is left alone on doha: its initialize() is the charger driver's, and the layout of what it hands
+# back was measured on redwood
+sub1(L, """	if (charger_enabled || PLAT != &platform_redwood) {
+		return;
+	}
+	ex_status = BS->locate_protocol(&charger_ex_guid, NULL, (void **)&CHARGER_EX);
+	qcom_status = BS->locate_protocol(&qcom_charger_guid, NULL, (void **)&QCOM_CHARGER);
+	if (!EFI_ERROR(qcom_status) && QCOM_CHARGER != NULL) {""", """	if (charger_enabled || (PLAT != &platform_redwood && PLAT != &platform_doha)) {
+		return;
+	}
+	ex_status = BS->locate_protocol(&charger_ex_guid, NULL, (void **)&CHARGER_EX);
+	qcom_status = BS->locate_protocol(&qcom_charger_guid, NULL, (void **)&QCOM_CHARGER);
+	/*
+	 * What the two locates said, for the kernel's line of the panel (bsd/dev/redwood_battery.c): 0x5a in the top
+	 * byte, then bit 17 / 16 an error of QcomCharger / ChargerEx, and the low byte of each status (bits 15-8 / 7-0)
+	 */
+	charger_shared.reserved = 0x5a000000u | (EFI_ERROR(qcom_status) ? 0x20000u : 0) | (EFI_ERROR(ex_status) ? 0x10000u : 0) |
+	    (uint32_t)(qcom_status & 0xff) << 8 | (uint32_t)(ex_status & 0xff);
+	if (PLAT == &platform_doha) {
+		/* doha: ChargerEx's read-only queries alone, the state of charge from the voltage (charger_poll) */
+		QCOM_CHARGER = NULL;
+		qcom_status = 1;
+	}
+	if (!EFI_ERROR(qcom_status) && QCOM_CHARGER != NULL) {""")
+
+# doha's battery, from the PMI632 on the SPMI bus: reads only, by the buttons' reader and its lock
+BTN = 'xnu/files/bsd/dev/redwood_buttons.c'
+sub1(BTN, """static struct peripheral pon, pin;
+""", """static struct peripheral pon, pin;
+/*
+ * doha, battery=1: the PMI632 (slave 2; doha's device tree, qcom,pmi632@2) -- its gauge (qgauge@4800), its USB input
+ * and its charger (qcom,qpnp-smb5: usb@1300, chgr@1000) and the gauge's SDAM (qg-sdam@b100) -- read and never written
+ */
+static struct peripheral qg, usbin, chgr, qgsdam;
+static bool battery_direct;
+""")
+sub1(BTN, """static void
+buttons_thread(void *parameter, __unused wait_result_t result)
+{""", """/*
+ * doha: one look at the battery (Qualcomm's qg-reg.h, qg-defs.h, qg-sdam.c, smb5-reg.h of doha's kernel): the gauge's
+ * last ADC reading of the cell (QG_LAST_ADC_V_DATA0, 2 bytes, 194.637 uV a step), a cable at USB in (its INT_RT_STS,
+ * USBIN_PLUGIN bit 4), the charger's state (BATTERY_CHARGER_STATUS_1, bits 2:0: 1-4 charging, 5 done), and the level
+ * Android's gauge driver last kept in the SDAM (offset 0x47, valid at 0x46). The level from the voltage, as the
+ * loader's soc_from_voltage(): a cable lifts the voltage, so it reads high while charging.
+ */
+extern void redwood_battery_direct(int soc, int voltage_mv, int plugged, int charging, int android_soc);
+
+static void
+battery_look(void)
+{
+	static unsigned complaints;
+	uint8_t v[2] = { 0, 0 }, usb = 0, state = 0, sdam[2] = { 0, 0 };
+	const char *problem;
+	int mv, soc, android = -1;
+
+	if ((problem = spmi_read(&qg, 0xc0, v, 2)) != NULL || (problem = spmi_read(&usbin, 0x10, &usb, 1)) != NULL ||
+	    (problem = spmi_read(&chgr, 0x06, &state, 1)) != NULL) {
+		if (complaints++ < 5) {
+			printf("battery: the PMI632 does not answer: %s\\n", problem);
+		}
+		return;
+	}
+	if (qgsdam.found && spmi_read(&qgsdam, 0x46, sdam, 2) == NULL && sdam[0] != 0 && sdam[1] <= 100) {
+		android = sdam[1];
+	}
+	mv = (int)(((uint32_t)v[0] | (uint32_t)v[1] << 8) * 194637ULL / 1000000ULL);
+	if (mv < 2800 || mv > 4600) {
+		/* not a Li-ion cell's voltage: a reading to distrust, never a level to hand iOS (0% would mean empty) */
+		redwood_status(REDWOOD_STATUS_BATTERY, "PMI632 gauge reads %d mV (raw %02x%02x): not used", mv, v[1], v[0]);
+		return;
+	}
+	if (mv <= 3300) {
+		soc = 0;
+	} else if (mv < 3700) {
+		soc = (mv - 3300) * 10 / 400;
+	} else if (mv < 3900) {
+		soc = 10 + (mv - 3700) * 40 / 200;
+	} else if (mv < 4200) {
+		soc = 50 + (mv - 3900) * 40 / 300;
+	} else if (mv < 4400) {
+		soc = 90 + (mv - 4200) * 10 / 200;
+	} else {
+		soc = 100;
+	}
+	state &= 7;
+	if (state == 5) {
+		soc = 100;      /* the charger says it has finished: full */
+	}
+	redwood_battery_direct(soc, mv, (usb & 0x10) != 0, state >= 1 && state <= 4, android);
+}
+
+static void
+buttons_thread(void *parameter, __unused wait_result_t result)
+{""")
+sub1(BTN, """	find_channel(&pon, channels);
+	find_channel(&pin, channels);
+""", """	find_channel(&pon, channels);
+	find_channel(&pin, channels);
+	if (battery_direct) {
+		find_channel(&qg, channels);
+		find_channel(&usbin, channels);
+		find_channel(&chgr, channels);
+		find_channel(&qgsdam, channels);
+		battery_direct = qg.found && usbin.found && chgr.found;
+		if (battery_direct) {
+			battery_look();
+		}
+	}
+""")
+sub1(BTN, """	for (unsigned tick = 1;; tick++) {
+		buttons_poll();
+""", """	for (unsigned tick = 1;; tick++) {
+		buttons_poll();
+		if (battery_direct && tick % (5000 / POLL_MS) == 0) {
+			battery_look();
+		}
+""")
+sub1(BTN, """	pon = (struct peripheral){ .name = board->pon_name, .id = board->pon_id };
+""", """	pon = (struct peripheral){ .name = board->pon_name, .id = board->pon_id };
+	if (strcmp(board->device, "doha") == 0) {
+		uint32_t battery = 0;
+
+		if (PE_parse_boot_argn("battery", &battery, sizeof(battery)) && battery) {
+			battery_direct = true;
+			qg = (struct peripheral){ .name = "the PMI632's gauge", .id = 0x248 };
+			usbin = (struct peripheral){ .name = "the PMI632's USB input", .id = 0x213 };
+			chgr = (struct peripheral){ .name = "the PMI632's charger", .id = 0x210 };
+			qgsdam = (struct peripheral){ .name = "the PMI632's gauge SDAM", .id = 0x2b1 };
+		}
+	}
+""")
+
+# the battery's line of the panel (fb_hud=1): what the loader's cache says, and why nothing comes if nothing does
+BAT = 'xnu/files/bsd/dev/redwood_battery.c'
+# doha: read straight from the PMI632 by the buttons' SPMI reader (redwood_buttons.c), Qualcomm's UEFI charger drivers
+# not coming up there; published here like the loader's
+sub1(BAT, """static uint64_t battery_updates, battery_failures;
+""", """static uint64_t battery_updates, battery_failures;
+static int battery_android_soc = -1;    /* doha: the level Android's gauge driver last kept in the PMI632's SDAM */
+
+/*
+ * doha (bsd/dev/redwood_buttons.c, battery=1): what the PMI632 says, read on the SPMI bus -- the cell's voltage from
+ * its gauge, the level estimated from it, a cable at USB in, the charger's state -- in place of the loader's cache.
+ */
+void redwood_battery_direct(int soc, int voltage_mv, int plugged, int charging, int android_soc);
+void
+redwood_battery_direct(int soc, int voltage_mv, int plugged, int charging, int android_soc)
+{
+	battery_soc_percent = soc;
+	battery_voltage_mv = voltage_mv;
+	battery_present = 1;
+	battery_charger_present = plugged;
+	battery_charging = charging;
+	battery_soc_estimated = 1;
+	battery_android_soc = android_soc;
+	battery_updates++;
+}
+""")
+sub1(BAT, """	for (unsigned tick = 0;; tick++) {
+		battery_poll();
+""", """	for (unsigned tick = 0;; tick++) {
+		battery_poll();
+		redwood_status(REDWOOD_STATUS_BATTERY, "%d%%%s %d mV, cable %d, chg %d; Android %d%%; L %#x",
+		    battery_soc_percent, battery_soc_estimated ? "~" : "", battery_voltage_mv, battery_charger_present,
+		    battery_charging, battery_android_soc, shared_battery->reserved);
+""")
+sub1(BAT, """		printf("battery: xnuloader did not provide battery_shared_pa\\n");
+		return;""", """		printf("battery: xnuloader did not provide battery_shared_pa\\n");
+		redwood_status(REDWOOD_STATUS_BATTERY, "FAILED: no battery_shared_pa from the loader");
+		return;""")
+sub1(BAT, """		    shared_battery->magic, shared_battery->version, shared_battery->size);
+		return;""", """		    shared_battery->magic, shared_battery->version, shared_battery->size);
+		redwood_status(REDWOOD_STATUS_BATTERY, "FAILED: bad loader cache (magic %#llx)", shared_battery->magic);
+		return;""")
+
 # doha's store: userdata past the iOS volume and the cryptexes (ufs_write=1), the same bounds as the loader's doha_store
 sub1('xnu/files/bsd/dev/redwood_ufs.c', """	{ "userdata", 31031296, 91111391, 512, 0, true },
 """, """	{ "userdata", 31031296, 91111391, 512, 0, true },

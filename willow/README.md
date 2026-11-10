@@ -41,6 +41,10 @@ small image as `fw/focaltech_ts_fw.bin` from `fw-touch/`, and gives `var_store` 
 has them), which take writes only past the iOS volume and both cryptexes (block 2042368 of 4096), as willow's
 `system`; `var_store` keeps its two slots from 8 GiB in.
 
+The battery's level comes from the PMI632 itself on doha: Qualcomm's charger protocols are not there in its UEFI,
+so with `battery=1` the buttons' SPMI reader (`redwood_buttons.c`) reads the gauge's last voltage, the USB input and
+the charger's state every 5 s, read only, and `redwood_battery.c` publishes the level estimated from the voltage.
+
 `gpu=1` works on doha too: the patch lets `redwood_a610.c`, `redwood_rpm.c` and `redwood_osm.c` take `device=doha`,
 keeps `redwood_adreno.c` (redwood's Adreno 642L) off as on willow, and puts the zap shader where doha's device tree has
 its `gpu_region` (`0x57115000`; willow's is `0x57515000`). The firmware is the phone's (`a610_zap.*` from its `modem`
