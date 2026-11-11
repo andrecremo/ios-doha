@@ -825,3 +825,22 @@ Carga e nível da bateria, pelo kernel do LineageOS 23 do doha (`christiaan/andr
   todas as fotos; Ajustes 29-59 fps (maior engasgo 17-57 ms; antes, com a cópia, 21-30 fps e 150-470 ms), tela
   inicial 23 fps, Relógio 30; GPU 33-63%, copy/blit 0, espera da tela 6-156 ms/s. **Nenhuma rodinha.** Resta um pouco
   de rastro e um atraso no desenho (o quadro aparece na varredura seguinte à troca).
+- Leitura no HUD (sessão principal, 2026-11-11): `W62/8c`, ou seja, watchdog ligado ao conectar (0x51 bit 1) e a
+  mordida desliga a carga (0x53 bit 7), como no SM7125. `charge=1` (`CHARGE=1`), a partir do port
+  `qdizax-w/hakios-sm7125` (`drivers/power/hakios.miatoll_battery.c`): alimenta o watchdog (MISC 0x43 bit 0) a cada 5 s
+  com cabo, pelo canal de escrita do árbitro (chnls 0x1E00000 + 0x10000 × canal, só se o canal do MISC 0x216 for
+  deste sistema); a única escrita. HUD: "chg+" alimentando, "chg!" escrita recusada.
+
+Governador dos núcleos (`cpu_gov`, 2026-11-10/11):
+- Primeira forma (carga medida por `processor_info(PROCESSOR_CPU_LOAD_INFO)` a cada 50 ms): começando no boot, travou em
+  "jumping to"; começando aos 60 s, reiniciou o aparelho na hora, mesmo sem escrever nada (`cpu_gov=2`, que nunca chegou
+  a mostrar o primeiro passo). A culpa é da medição (o `recount` desta versão de desenvolvimento), não das escritas.
+- Teste das escritas (`cpu_gov=2`, segunda forma): pedidos de linha dos Silver e dos Gold reescritos, Silver na linha
+  3 por 10 s, Gold na linha 3 por 10 s, tudo de um núcleo Silver (cpu 2, MPIDR 0x2): "all steps passed". Escrever o
+  OSM dos Gold a partir de um Silver é seguro.
+- Segunda forma (`cpu_gov=1`): a linha segue a atividade (quadro entregue ao painel em `present()` ou toque em
+  `redwood_touch_post()`): o topo até 400 ms depois de uma, depois uma linha a menos a cada 50 ms até `cpu_gov_min`
+  (linha 1, 614 MHz).
+- Medido (2026-11-11), tela inicial parada, sem cabo, média de 30 s da corrente do QG (escala do subtipo 3, 152,588
+  uA/passo; as leituras anteriores estavam em dobro): sem governador 527 mA; `cpu_gov=1` 442 mA (CPU em 614 MHz, 0% no
+  topo); `cpu_gov=1` com GPU a 600 MHz e bimc a 400 MHz 394 mA. A tela parada ainda entrega ~9 quadros por segundo.

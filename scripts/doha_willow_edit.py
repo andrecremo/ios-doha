@@ -1268,3 +1268,753 @@ sub1(FBF, """	redwood_status(kStatusScreen, "%u fps; longest gap %u ms; %u ms sh
 		redwood_status(kStatusScreen, "%u fps; longest gap %u ms; %u ms showing it", fHudFps, fHudWorstShownUs / 1000,
 		    fHudDriverUs / 1000);
 	}""")
+
+# cpu_gov=1, doha (2026-11-10): the cores' clocks follow the load. All eight ran at 1804 MHz all the time, the battery
+# giving 1.2 to 1.9 A on the home screen (the PMI632 gauge's current on the HUD). Every 50 ms the busiest core's share of
+# that time decides a row of the OSM tables for both clusters: 70% or more, the top (Silver row 7, Gold row 6), held for
+# 250 ms at least; less, the lowest row fast enough for that load at 70%, at most two rows down a step. Only the rows
+# asked for are written (0x920 + 4 * core, as doha's own clk-cpu-osm.c and osmc= do); the tables and the OSMs' set-up are
+# the firmware's.
+OSM = 'xnu/files/bsd/dev/redwood_osm.c'
+sub1(OSM, """void
+redwood_osm_init(void)
+{""", """/* ---- cpu_gov=1 (doha): the rows of both clusters' OSM tables by the load ---- */
+#include <mach/processor_info.h>
+#include <mach/machine.h>
+extern kern_return_t processor_info(processor_t processor, processor_flavor_t flavor, host_t *host, processor_info_t info,
+    mach_msg_type_number_t *count);
+
+#define GOV_PERIOD_MS           50
+extern uint32_t redwood_osm_seen[8][6];         /* osfmk/arm/arm_init.c, osm_ask(): [core][5] set once a core came up */
+#define GOV_UP_PERCENT          70              /* a core this busy: the top row */
+#define GOV_HOLD_PERIODS        5               /* ... held so long at least */
+static const uint32_t gov_silver_mhz[8] = { 300, 614, 864, 1017, 1305, 1420, 1612, 1804 };      /* doha's firmware's table */
+#define GOV_TOP                 7
+#define GOV_GOLD_TOP            6               /* Gold's row 6, 1804 MHz (7 is 2016: nothing here watches the heat) */
+
+static void
+gov_thread(void *parameter, __unused wait_result_t result)
+{
+	uint32_t mode = (uint32_t)(uintptr_t)parameter;        /* 1: the rows follow the load; 2: measured only */
+	vm_offset_t osm = ml_io_map(OSM_PHYS, OSM_SIZE);
+	natural_t last[8][CPU_STATE_MAX];
+	bool seen[8] = { false };
+	uint32_t row = GOV_TOP, written = ~0u, hold = 0, min_row = 0, periods = 0, at_top = 0, load_sum = 0, peak = 0;
+	uint64_t since = mach_absolute_time();
+
+	PE_parse_boot_argn("cpu_gov_min", &min_row, sizeof(min_row));
+	min_row = min_row > GOV_TOP ? GOV_TOP : min_row;
+	bzero(last, sizeof(last));
+	/*
+	 * Not before the system is up (the first run, starting at once, stopped the boot before the panel's HUD): 60 s,
+	 * the Gold cores up by then (they come up ~57 s in), and Gold's rows written only once a Gold core has said so
+	 * (osmc=, osfmk/arm/arm_init.c): its OSM is not written while that cluster is off
+	 */
+	delay_for_interval(60, NSEC_PER_SEC);
+	/*
+	 * The second run rebooted the phone as the governor began: Gold's OSM written from a Silver core. Linux's driver
+	 * and osmc= (which worked) write a cluster's requests from that cluster's own cores; so does this now. Which
+	 * processor is which cluster: each one's MPIDR (Aff1 1: Gold), read on it once.
+	 */
+	int gold_cpu = -1, silver_cpu = -1;
+
+	/*
+	 * cpu_gov=2 rebooted the phone too, about 15 s after it began, nothing written: so it is the measuring or the
+	 * moving between processors. With cpu_gov=2 each step now says itself on the panel's CPU line first and waits:
+	 * 20 s of measuring the load alone, then each processor in turn, 3 s before and 2 s after moving there.
+	 */
+	if (mode == 2) {
+		for (int i = 0; i < 20; i++) {
+			uint32_t got = 0;
+
+			for (int cpu = 0; cpu < 8; cpu++) {
+				processor_t processor = cpu_to_processor(cpu);
+				struct processor_cpu_load_info info;
+				mach_msg_type_number_t count = PROCESSOR_CPU_LOAD_INFO_COUNT;
+				host_t host;
+
+				if (processor != PROCESSOR_NULL &&
+				    processor_info(processor, PROCESSOR_CPU_LOAD_INFO, &host, (processor_info_t)&info, &count) == KERN_SUCCESS) {
+					got |= 1u << cpu;
+				}
+			}
+			redwood_status(REDWOOD_STATUS_CPU, "gov test 1: measuring, %d s; processors %#x", i, got);
+			delay_for_interval(1, NSEC_PER_SEC);
+		}
+	}
+	for (int cpu = 0; cpu < 8; cpu++) {
+		processor_t processor = cpu_to_processor(cpu);
+		uint64_t cluster;
+
+		if (processor == PROCESSOR_NULL) {
+			continue;
+		}
+		if (mode == 2) {
+			redwood_status(REDWOOD_STATUS_CPU, "gov test 2: moving to processor %d", cpu);
+			delay_for_interval(3, NSEC_PER_SEC);
+		}
+		thread_bind(processor);
+		thread_block(THREAD_CONTINUE_NULL);
+		cluster = (__builtin_arm_rsr64("MPIDR_EL1") >> 8) & 0xff;
+		if (mode == 2) {
+			redwood_status(REDWOOD_STATUS_CPU, "gov test 2: on processor %d, MPIDR %#llx", cpu,
+			    __builtin_arm_rsr64("MPIDR_EL1") & 0xffff);
+			delay_for_interval(2, NSEC_PER_SEC);
+		}
+		if (cluster == 1 && gold_cpu < 0) {
+			gold_cpu = cpu;
+		} else if (cluster == 0 && silver_cpu < 0) {
+			silver_cpu = cpu;
+		}
+	}
+	/* the governor itself on a Silver core, where Silver's requests are written; Gold's from a Gold one */
+	thread_bind(silver_cpu >= 0 ? cpu_to_processor(silver_cpu) : PROCESSOR_NULL);
+	thread_block(THREAD_CONTINUE_NULL);
+	printf("cpu_gov: on processor %d (Silver); Gold's requests from processor %d\\n", silver_cpu, gold_cpu);
+	if (silver_cpu < 0) {
+		thread_terminate(current_thread());
+	}
+	printf("cpu_gov: the cores' rows follow the load every %u ms (top at %u%% busy, lowest row %u)\\n", GOV_PERIOD_MS,
+	    GOV_UP_PERCENT, min_row);
+	for (;;) {
+		uint32_t load = 0;
+
+		delay_for_interval(GOV_PERIOD_MS, NSEC_PER_MSEC);
+		for (int cpu = 0; cpu < 8; cpu++) {
+			processor_t processor = cpu_to_processor(cpu);
+			struct processor_cpu_load_info info;
+			mach_msg_type_number_t count = PROCESSOR_CPU_LOAD_INFO_COUNT;
+			host_t host;
+			uint32_t busy, total;
+
+			if (processor == PROCESSOR_NULL ||
+			    processor_info(processor, PROCESSOR_CPU_LOAD_INFO, &host, (processor_info_t)&info, &count) != KERN_SUCCESS) {
+				continue;
+			}
+			busy = (info.cpu_ticks[CPU_STATE_USER] - last[cpu][CPU_STATE_USER]) +
+			    (info.cpu_ticks[CPU_STATE_SYSTEM] - last[cpu][CPU_STATE_SYSTEM]);
+			total = busy + (info.cpu_ticks[CPU_STATE_IDLE] - last[cpu][CPU_STATE_IDLE]);
+			memcpy(last[cpu], info.cpu_ticks, sizeof(last[cpu]));
+			if (seen[cpu] && total != 0 && busy * 100 / total > load) {
+				load = busy * 100 / total;
+			}
+			seen[cpu] = true;
+		}
+		if (load >= GOV_UP_PERCENT) {
+			row = GOV_TOP;
+			hold = GOV_HOLD_PERIODS;
+		} else if (hold > 0) {
+			hold--;
+		} else {
+			uint32_t want = gov_silver_mhz[GOV_TOP] * load / GOV_UP_PERCENT, target = min_row;
+
+			while (target < GOV_TOP && gov_silver_mhz[target] < want) {
+				target++;
+			}
+			row = target >= row ? target : (row - target > 2 ? row - 2 : target);
+		}
+		/* written when it changes, and every second besides (a Gold core powered off and on again forgets its row) */
+		if (mode != 2 && (row != written || periods % (1000 / GOV_PERIOD_MS) == 0)) {
+			uint32_t gold = row > GOV_GOLD_TOP ? GOV_GOLD_TOP : row;
+
+			bool gold_up = false;
+			static uint32_t gold_written = ~0u;
+
+			for (int core = 4; core < 8; core++) {
+				gold_up = gold_up || redwood_osm_seen[core][5] != 0;
+			}
+			for (int core = 0; core < 4; core++) {
+				*(volatile uint32_t *)(osm + OSM_SILVER + 0x920 + 4 * core) = row;
+			}
+			if (gold_up && gold_cpu >= 0 && (gold != gold_written || periods % (1000 / GOV_PERIOD_MS) == 0)) {
+				thread_bind(cpu_to_processor(gold_cpu));
+				thread_block(THREAD_CONTINUE_NULL);
+				if (((__builtin_arm_rsr64("MPIDR_EL1") >> 8) & 0xff) == 1) {
+					for (int core = 0; core < 4; core++) {
+						*(volatile uint32_t *)(osm + OSM_GOLD + 0x920 + 4 * core) = gold;
+					}
+					__asm__ volatile ("dsb sy" ::: "memory");
+					gold_written = gold;
+				}
+				thread_bind(cpu_to_processor(silver_cpu));
+				thread_block(THREAD_CONTINUE_NULL);
+			}
+			__asm__ volatile ("dsb sy" ::: "memory");
+			written = row;
+		}
+		periods++;
+		at_top += row == GOV_TOP;
+		load_sum += load;
+		peak = load > peak ? load : peak;
+		{
+			uint64_t ns;
+
+			absolutetime_to_nanoseconds(mach_absolute_time() - since, &ns);
+			if (ns >= NSEC_PER_SEC) {
+				redwood_status(REDWOOD_STATUS_CPU, "gov %u MHz; load %u%% (peak %u%%); top %u%% of the time",
+				    gov_silver_mhz[row], load_sum / periods, peak, at_top * 100 / periods);
+				periods = at_top = load_sum = peak = 0;
+				since = mach_absolute_time();
+			}
+		}
+	}
+}
+
+void
+redwood_osm_init(void)
+{
+	{
+		uint32_t gov = 0;
+		char where[16] = "";
+		thread_t thread;
+
+		if (PE_parse_boot_argn("cpu_gov", &gov, sizeof(gov)) && gov != 0 &&
+		    PE_parse_boot_arg_str("device", where, sizeof(where)) && strcmp(where, "doha") == 0 &&
+		    kernel_thread_start(gov_thread, (void *)(uintptr_t)gov, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		}
+	}""")
+
+# doha, "lastpanic=1" (2026-11-10): the kernel's panic log of the run before, if the RAM kept it through the reset --
+# the loader zeroes that region (PANIC_LOG_BASE) for every run, so it is read before that: the printable text in it,
+# 30 s on the screen. For reboots with no message (the governor's, cpu_gov=2)
+sub1(L, """				print("mdssdump=1: 30 s to read this\\n");
+				BS->stall(30000000);
+				break;
+			}
+		}
+""", """				print("mdssdump=1: 30 s to read this\\n");
+				BS->stall(30000000);
+				break;
+			}
+		}
+		for (const char *c = pi.cmdline; *c; c++) {
+			if (starts_with(c, "lastpanic=1") && (c == pi.cmdline || c[-1] == ' ')) {
+				const unsigned char *log = (const unsigned char *)(uintptr_t)PANIC_LOG_BASE;
+				char line[120];
+				uint64_t at = 0, shown = 0, lines = 0, nonzero = 0;
+
+				for (uint64_t i = 0; i < PANIC_LOG_SIZE; i++) {
+					nonzero += log[i] != 0;
+				}
+				print("lastpanic=1: the panic log region (%x, %x bytes): %d bytes not zero\\n", (uint64_t)PANIC_LOG_BASE,
+				    (uint64_t)PANIC_LOG_SIZE, nonzero);
+				/* runs of printable text 8 or more long, broken into lines, 40 lines at most */
+				while (at < PANIC_LOG_SIZE && lines < 40) {
+					uint64_t run = 0;
+
+					while (at + run < PANIC_LOG_SIZE && ((log[at + run] >= 32 && log[at + run] < 127) || log[at + run] == 10)) {
+						run++;
+					}
+					if (run >= 8) {
+						uint64_t k = 0;
+
+						for (uint64_t j = 0; j < run && lines < 40; j++) {
+							char ch = (char)log[at + j];
+
+							if (ch == 10 || k == sizeof(line) - 2) {
+								line[k] = 0;
+								print("%s\\n", line);
+								lines++;
+								k = 0;
+								if (ch == 10) {
+									continue;
+								}
+							}
+							line[k++] = ch;
+						}
+						if (k > 0 && lines < 40) {
+							line[k] = 0;
+							print("%s\\n", line);
+							lines++;
+						}
+						shown += run;
+					}
+					at += run + 1;
+				}
+				print("lastpanic=1: %d characters shown; 30 s to read this\\n", shown);
+				BS->stall(30000000);
+				break;
+			}
+		}
+""")
+
+# doha, battery step 2 (2026-11-11): charge=1, the charger's watchdog petted. The PMI632's SMB5 starts a watchdog
+# whenever a cable is in (MISC 0x51 bit 1, read as W62 on the panel) whose bite stops the charging (MISC 0x53 bit 7, read
+# as /8c); Android's driver pets it, under this kernel nobody did. As qdizax-w/hakios-sm7125 does for its SM7125
+# (drivers/power/hakios.miatoll_battery.c, "charging under iOS"): BARK_BITE_WDOG_PET (MISC 0x43) bit 0 written 1 every
+# 5 s while the cable is in, through the arbiter's write channel for MISC if it is ours (owner = this system), the
+# only write; voltage, current and temperature limits stay the firmware's. Stops for good on a refused write.
+sub1(BTN, """static struct peripheral dcdc, misc;    /* the charger's DCDC (0x1100) and MISC (0x1600) blocks: read for the panel only */
+""", """static struct peripheral dcdc, misc;    /* the charger's DCDC (0x1100) and MISC (0x1600) blocks: read for the panel only */
+/*
+ * charge=1 (doha): the charger's watchdog petted (BARK_BITE_WDOG_PET, MISC 0x43 bit 0) while a cable is in, through
+ * the arbiter's write channel for the PMI632's MISC block ("chnls" at 0x1E00000 in doha's spmi@1c40000, 0x10000 a
+ * channel; command 0x00, status 0x08, write data 0x10; write opcode 0), if this system owns that channel
+ */
+#define DOHA_ARB_CHNLS          0x01E00000UL
+#define CHANNEL_WDATA0          0x10
+#define COMMAND_WRITE           (0u << 27)
+static vm_offset_t pet_channel;
+static uint16_t pet_channel_n;
+static bool pet_stopped;
+static uint32_t pets;
+
+static void
+pet_setup(uint32_t channels)
+{
+	for (uint32_t n = 0; n < channels; n++) {
+		uint32_t map = rd(arb_core + ARB_CHANNEL(n));
+
+		if (map != 0 && ((map >> 8) & 0xfff) == 0x216 && (rd(arb_cnfg + ARB_OWNER(n)) & 7) == ARB_SYSTEM) {
+			pet_channel_n = (uint16_t)n;
+			pet_channel = ml_io_map(DOHA_ARB_CHNLS + 0x10000UL * n, 0x1000);
+			printf("battery: charge=1: the charger's watchdog will be petted (channel %u, MISC 0x43)\\n", n);
+			return;
+		}
+	}
+	printf("battery: charge=1, but no channel of the charger's MISC block is ours to write through: nothing petted\\n");
+}
+
+static void
+pet(void)
+{
+	uint64_t start, interval;
+	uint32_t status;
+
+	if (pet_channel == 0 || pet_stopped) {
+		return;
+	}
+	if (((rd(arb_core + ARB_CHANNEL(pet_channel_n)) >> 8) & 0xfff) != 0x216) {
+		pet_stopped = true;
+		printf("battery: the arbiter's channel %u is no longer the charger's MISC: not petted any more\\n", pet_channel_n);
+		return;
+	}
+	nanoseconds_to_absolutetime(READ_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
+	redwood_spmi_lock();
+	wr(pet_channel + CHANNEL_WDATA0, 0x01);
+	wr(pet_channel + OBSERVER_COMMAND, COMMAND_WRITE | 0x43u << 4);
+	start = mach_absolute_time();
+	do {
+		status = rd(pet_channel + OBSERVER_STATUS);
+	} while (!(status & STATUS_DONE) && mach_absolute_time() - start < interval);
+	redwood_spmi_unlock();
+	if (!(status & STATUS_DONE) || (status & (STATUS_DENIED | STATUS_FAILURE))) {
+		pet_stopped = true;
+		printf("battery: the charger's watchdog not petted any more: %s (status %#x)\\n",
+		    !(status & STATUS_DONE) ? "no answer from the arbiter" : "the write was refused", status);
+		return;
+	}
+	pets++;
+}
+""")
+sub1(BTN, """		find_channel(&dcdc, channels);
+		find_channel(&misc, channels);
+""", """		find_channel(&dcdc, channels);
+		find_channel(&misc, channels);
+		{
+			uint32_t charge = 0;
+
+			if (PE_parse_boot_argn("charge", &charge, sizeof(charge)) && charge) {
+				pet_setup(channels);
+			}
+		}
+""")
+sub1(BTN, """	redwood_battery_direct(soc, mv, (usb & 0x10) != 0, state >= 1 && state <= 4, android);
+	{
+""", """	if ((usb & 0x10) != 0) {
+		pet();
+	}
+	redwood_battery_direct(soc, mv, (usb & 0x10) != 0, state >= 1 && state <= 4, android);
+	{
+""")
+sub1(BTN, """		redwood_status(REDWOOD_STATUS_WIFI, "chg S%02x/%02x E%02x C%02x U%02x L%02x P%02x W%02x/%02x T%02x I%lldmA",
+		    st[0], st[1], en, cfg2, il, icl, pp, wd[0], wd[2], sub, ma);""", """		redwood_status(REDWOOD_STATUS_WIFI, "chg%s S%02x/%02x E%02x C%02x U%02x L%02x P%02x W%02x/%02x T%02x I%lldmA",
+		    pet_stopped ? "!" : pets != 0 ? "+" : "", st[0], st[1], en, cfg2, il, icl, pp, wd[0], wd[2], sub, ma);""")
+
+# cpu_gov, second form (2026-11-11): processor_info() rebooted the phone (cpu_gov=2 never said its first step), so the
+# rows follow what the phone does -- a frame handed to the panel or a touch -- instead of a measured load; cpu_gov=2 is a
+# step-by-step test of the writes alone (bsd/dev/redwood_osm.c)
+sub1(OSM, """static void
+gov_thread(void *parameter, __unused wait_result_t result)
+{
+	uint32_t mode = (uint32_t)(uintptr_t)parameter;        /* 1: the rows follow the load; 2: measured only */
+	vm_offset_t osm = ml_io_map(OSM_PHYS, OSM_SIZE);
+	natural_t last[8][CPU_STATE_MAX];
+	bool seen[8] = { false };
+	uint32_t row = GOV_TOP, written = ~0u, hold = 0, min_row = 0, periods = 0, at_top = 0, load_sum = 0, peak = 0;
+	uint64_t since = mach_absolute_time();
+
+	PE_parse_boot_argn("cpu_gov_min", &min_row, sizeof(min_row));
+	min_row = min_row > GOV_TOP ? GOV_TOP : min_row;
+	bzero(last, sizeof(last));
+	/*
+	 * Not before the system is up (the first run, starting at once, stopped the boot before the panel's HUD): 60 s,
+	 * the Gold cores up by then (they come up ~57 s in), and Gold's rows written only once a Gold core has said so
+	 * (osmc=, osfmk/arm/arm_init.c): its OSM is not written while that cluster is off
+	 */
+	delay_for_interval(60, NSEC_PER_SEC);
+	/*
+	 * The second run rebooted the phone as the governor began: Gold's OSM written from a Silver core. Linux's driver
+	 * and osmc= (which worked) write a cluster's requests from that cluster's own cores; so does this now. Which
+	 * processor is which cluster: each one's MPIDR (Aff1 1: Gold), read on it once.
+	 */
+	int gold_cpu = -1, silver_cpu = -1;
+
+	/*
+	 * cpu_gov=2 rebooted the phone too, about 15 s after it began, nothing written: so it is the measuring or the
+	 * moving between processors. With cpu_gov=2 each step now says itself on the panel's CPU line first and waits:
+	 * 20 s of measuring the load alone, then each processor in turn, 3 s before and 2 s after moving there.
+	 */
+	if (mode == 2) {
+		for (int i = 0; i < 20; i++) {
+			uint32_t got = 0;
+
+			for (int cpu = 0; cpu < 8; cpu++) {
+				processor_t processor = cpu_to_processor(cpu);
+				struct processor_cpu_load_info info;
+				mach_msg_type_number_t count = PROCESSOR_CPU_LOAD_INFO_COUNT;
+				host_t host;
+
+				if (processor != PROCESSOR_NULL &&
+				    processor_info(processor, PROCESSOR_CPU_LOAD_INFO, &host, (processor_info_t)&info, &count) == KERN_SUCCESS) {
+					got |= 1u << cpu;
+				}
+			}
+			redwood_status(REDWOOD_STATUS_CPU, "gov test 1: measuring, %d s; processors %#x", i, got);
+			delay_for_interval(1, NSEC_PER_SEC);
+		}
+	}
+	for (int cpu = 0; cpu < 8; cpu++) {
+		processor_t processor = cpu_to_processor(cpu);
+		uint64_t cluster;
+
+		if (processor == PROCESSOR_NULL) {
+			continue;
+		}
+		if (mode == 2) {
+			redwood_status(REDWOOD_STATUS_CPU, "gov test 2: moving to processor %d", cpu);
+			delay_for_interval(3, NSEC_PER_SEC);
+		}
+		thread_bind(processor);
+		thread_block(THREAD_CONTINUE_NULL);
+		cluster = (__builtin_arm_rsr64("MPIDR_EL1") >> 8) & 0xff;
+		if (mode == 2) {
+			redwood_status(REDWOOD_STATUS_CPU, "gov test 2: on processor %d, MPIDR %#llx", cpu,
+			    __builtin_arm_rsr64("MPIDR_EL1") & 0xffff);
+			delay_for_interval(2, NSEC_PER_SEC);
+		}
+		if (cluster == 1 && gold_cpu < 0) {
+			gold_cpu = cpu;
+		} else if (cluster == 0 && silver_cpu < 0) {
+			silver_cpu = cpu;
+		}
+	}
+	/* the governor itself on a Silver core, where Silver's requests are written; Gold's from a Gold one */
+	thread_bind(silver_cpu >= 0 ? cpu_to_processor(silver_cpu) : PROCESSOR_NULL);
+	thread_block(THREAD_CONTINUE_NULL);
+	printf("cpu_gov: on processor %d (Silver); Gold's requests from processor %d\\n", silver_cpu, gold_cpu);
+	if (silver_cpu < 0) {
+		thread_terminate(current_thread());
+	}
+	printf("cpu_gov: the cores' rows follow the load every %u ms (top at %u%% busy, lowest row %u)\\n", GOV_PERIOD_MS,
+	    GOV_UP_PERCENT, min_row);
+	for (;;) {
+		uint32_t load = 0;
+
+		delay_for_interval(GOV_PERIOD_MS, NSEC_PER_MSEC);
+		for (int cpu = 0; cpu < 8; cpu++) {
+			processor_t processor = cpu_to_processor(cpu);
+			struct processor_cpu_load_info info;
+			mach_msg_type_number_t count = PROCESSOR_CPU_LOAD_INFO_COUNT;
+			host_t host;
+			uint32_t busy, total;
+
+			if (processor == PROCESSOR_NULL ||
+			    processor_info(processor, PROCESSOR_CPU_LOAD_INFO, &host, (processor_info_t)&info, &count) != KERN_SUCCESS) {
+				continue;
+			}
+			busy = (info.cpu_ticks[CPU_STATE_USER] - last[cpu][CPU_STATE_USER]) +
+			    (info.cpu_ticks[CPU_STATE_SYSTEM] - last[cpu][CPU_STATE_SYSTEM]);
+			total = busy + (info.cpu_ticks[CPU_STATE_IDLE] - last[cpu][CPU_STATE_IDLE]);
+			memcpy(last[cpu], info.cpu_ticks, sizeof(last[cpu]));
+			if (seen[cpu] && total != 0 && busy * 100 / total > load) {
+				load = busy * 100 / total;
+			}
+			seen[cpu] = true;
+		}
+		if (load >= GOV_UP_PERCENT) {
+			row = GOV_TOP;
+			hold = GOV_HOLD_PERIODS;
+		} else if (hold > 0) {
+			hold--;
+		} else {
+			uint32_t want = gov_silver_mhz[GOV_TOP] * load / GOV_UP_PERCENT, target = min_row;
+
+			while (target < GOV_TOP && gov_silver_mhz[target] < want) {
+				target++;
+			}
+			row = target >= row ? target : (row - target > 2 ? row - 2 : target);
+		}
+		/* written when it changes, and every second besides (a Gold core powered off and on again forgets its row) */
+		if (mode != 2 && (row != written || periods % (1000 / GOV_PERIOD_MS) == 0)) {
+			uint32_t gold = row > GOV_GOLD_TOP ? GOV_GOLD_TOP : row;
+
+			bool gold_up = false;
+			static uint32_t gold_written = ~0u;
+
+			for (int core = 4; core < 8; core++) {
+				gold_up = gold_up || redwood_osm_seen[core][5] != 0;
+			}
+			for (int core = 0; core < 4; core++) {
+				*(volatile uint32_t *)(osm + OSM_SILVER + 0x920 + 4 * core) = row;
+			}
+			if (gold_up && gold_cpu >= 0 && (gold != gold_written || periods % (1000 / GOV_PERIOD_MS) == 0)) {
+				thread_bind(cpu_to_processor(gold_cpu));
+				thread_block(THREAD_CONTINUE_NULL);
+				if (((__builtin_arm_rsr64("MPIDR_EL1") >> 8) & 0xff) == 1) {
+					for (int core = 0; core < 4; core++) {
+						*(volatile uint32_t *)(osm + OSM_GOLD + 0x920 + 4 * core) = gold;
+					}
+					__asm__ volatile ("dsb sy" ::: "memory");
+					gold_written = gold;
+				}
+				thread_bind(cpu_to_processor(silver_cpu));
+				thread_block(THREAD_CONTINUE_NULL);
+			}
+			__asm__ volatile ("dsb sy" ::: "memory");
+			written = row;
+		}
+		periods++;
+		at_top += row == GOV_TOP;
+		load_sum += load;
+		peak = load > peak ? load : peak;
+		{
+			uint64_t ns;
+
+			absolutetime_to_nanoseconds(mach_absolute_time() - since, &ns);
+			if (ns >= NSEC_PER_SEC) {
+				redwood_status(REDWOOD_STATUS_CPU, "gov %u MHz; load %u%% (peak %u%%); top %u%% of the time",
+				    gov_silver_mhz[row], load_sum / periods, peak, at_top * 100 / periods);
+				periods = at_top = load_sum = peak = 0;
+				since = mach_absolute_time();
+			}
+		}
+	}
+}""", """/*
+ * The governor, second form (2026-11-11). Measuring each processor's load (processor_info, PROCESSOR_CPU_LOAD_INFO)
+ * rebooted the phone at once, before anything was written (cpu_gov=2, the first step never said itself). So the load is
+ * not measured: what the phone is doing is. A frame handed to the panel (MiniIOMobileFramebuffer's present()) or a touch
+ * (redwood_touch_post()) stamps redwood_activity; within 400 ms of one, the top row; after that, a row down every 50 ms to
+ * the lowest (cpu_gov_min, row 1 by default, 614 MHz). Nothing moves between processors.
+ *
+ * cpu_gov=2: a test of the writes alone, each step said on the panel's CPU line before it is taken, 4 s apart: Silver's
+ * request written again as it is (row 7), Gold's again as it is (row 6, from whichever processor this runs on), then
+ * Silver at row 3 for 10 s, then Gold at row 3 for 10 s. The last line seen before a reboot names the step.
+ */
+volatile uint64_t redwood_activity;     /* mach_absolute_time of the last frame handed to the panel or touch */
+
+static void
+gov_rows(vm_offset_t osm, int silver, int gold)
+{
+	bool gold_up = false;
+
+	for (int core = 4; core < 8; core++) {
+		gold_up = gold_up || redwood_osm_seen[core][5] != 0;
+	}
+	for (int core = 0; core < 4; core++) {
+		if (silver >= 0) {
+			*(volatile uint32_t *)(osm + OSM_SILVER + 0x920 + 4 * core) = (uint32_t)silver;
+		}
+		if (gold >= 0 && gold_up) {
+			*(volatile uint32_t *)(osm + OSM_GOLD + 0x920 + 4 * core) = (uint32_t)gold;
+		}
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+static void
+gov_say(const char *step)
+{
+	redwood_status(REDWOOD_STATUS_CPU, "gov test %s (cpu %d, MPIDR %#llx)", step, cpu_number(),
+	    __builtin_arm_rsr64("MPIDR_EL1") & 0xffff);
+	printf("cpu_gov: test %s\\n", step);
+	delay_for_interval(4, NSEC_PER_SEC);
+}
+
+static void
+gov_thread(void *parameter, __unused wait_result_t result)
+{
+	uint32_t mode = (uint32_t)(uintptr_t)parameter;        /* 1: the rows follow what the phone does; 2: the test */
+	vm_offset_t osm = ml_io_map(OSM_PHYS, OSM_SIZE);
+	uint32_t row = GOV_TOP, written = ~0u, min_row = 1, periods = 0, at_top = 0;
+	uint64_t since, quiet;
+
+	PE_parse_boot_argn("cpu_gov_min", &min_row, sizeof(min_row));
+	min_row = min_row > GOV_TOP ? GOV_TOP : min_row;
+	nanoseconds_to_absolutetime(400 * NSEC_PER_MSEC, &quiet);
+	/* not before the system is up and the Gold cores with it (~57 s) */
+	delay_for_interval(60, NSEC_PER_SEC);
+	if (mode == 2) {
+		gov_say("A: running, nothing written yet");
+		gov_say("B: Silver's request again, row 7");
+		gov_rows(osm, GOV_TOP, -1);
+		gov_say("B done; C: Gold's request again, row 6");
+		gov_rows(osm, -1, GOV_GOLD_TOP);
+		gov_say("C done; D: Silver at row 3 for 10 s");
+		gov_rows(osm, 3, -1);
+		delay_for_interval(10, NSEC_PER_SEC);
+		gov_rows(osm, GOV_TOP, -1);
+		gov_say("D done; E: Gold at row 3 for 10 s");
+		gov_rows(osm, -1, 3);
+		delay_for_interval(10, NSEC_PER_SEC);
+		gov_rows(osm, -1, GOV_GOLD_TOP);
+		gov_say("E done: all steps passed");
+		thread_terminate(current_thread());
+	}
+	printf("cpu_gov: the top row within 400 ms of a frame or a touch, down to row %u otherwise\\n", min_row);
+	since = mach_absolute_time();
+	for (;;) {
+		uint64_t now, ns;
+
+		delay_for_interval(GOV_PERIOD_MS, NSEC_PER_MSEC);
+		now = mach_absolute_time();
+		if (now - redwood_activity < quiet) {
+			row = GOV_TOP;
+		} else if (row > min_row) {
+			row--;
+		}
+		/* written when it changes, and every second besides (a Gold core powered off and on again forgets its row) */
+		if (row != written || periods % (1000 / GOV_PERIOD_MS) == 0) {
+			gov_rows(osm, (int)row, (int)(row > GOV_GOLD_TOP ? GOV_GOLD_TOP : row));
+			written = row;
+		}
+		periods++;
+		at_top += row == GOV_TOP;
+		absolutetime_to_nanoseconds(now - since, &ns);
+		if (ns >= NSEC_PER_SEC) {
+			redwood_status(REDWOOD_STATUS_CPU, "gov %u MHz now; at the top %u%% of the last second", gov_silver_mhz[row],
+			    at_top * 100 / periods);
+			periods = at_top = 0;
+			since = now;
+		}
+	}
+}""")
+sub1('xnu/files/bsd/dev/redwood_input.c', """void
+redwood_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
+{
+""", """extern volatile uint64_t redwood_activity;     /* bsd/dev/redwood_osm.c (cpu_gov): the last frame or touch */
+
+void
+redwood_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
+{
+	redwood_activity = mach_absolute_time();
+""")
+sub1(FBF, """IOMobileFramebuffer::present(const uint8_t * swap)
+{
+""", """IOMobileFramebuffer::present(const uint8_t * swap)
+{
+	redwood_activity = mach_absolute_time();        /* (cpu_gov: the phone is drawing) */
+""")
+sub1(FBF, """extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern "C" void flush_dcache(vm_offset_t addr, unsigned count, int phys);
+""", """extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern "C" void flush_dcache(vm_offset_t addr, unsigned count, int phys);
+extern "C" volatile uint64_t redwood_activity;  /* bsd/dev/redwood_osm.c (cpu_gov): the last frame or touch */
+""")
+
+# cpu_gov=1, first run (2026-11-11): at rest on the home screen it stayed at the top all the time -- the home screen
+# hands the panel ~9 frames a second even when nothing moves, and each frame counted as activity. Now a touch keeps the
+# top for 400 ms, and frames only when they come at 20 a second or more (5 in the last 250 ms): something is moving
+sub1(OSM, """volatile uint64_t redwood_activity;     /* mach_absolute_time of the last frame handed to the panel or touch */
+""", """volatile uint64_t redwood_activity;     /* mach_absolute_time of the last touch */
+volatile uint32_t redwood_frames;       /* frames handed to the panel (MiniIOMobileFramebuffer's present()), counted */
+""")
+sub1(OSM, """	uint32_t row = GOV_TOP, written = ~0u, min_row = 1, periods = 0, at_top = 0;
+""", """	uint32_t row = GOV_TOP, written = ~0u, min_row = 1, periods = 0, at_top = 0, frames[5] = { 0 }, slot = 0;
+""")
+sub1(OSM, """		now = mach_absolute_time();
+		if (now - redwood_activity < quiet) {
+			row = GOV_TOP;""", """		now = mach_absolute_time();
+		/* frames in the last 250 ms: the count now against the one five periods ago */
+		uint32_t count = redwood_frames, moving = count - frames[slot];
+
+		frames[slot] = count;
+		slot = (slot + 1) % 5;
+		if (now - redwood_activity < quiet || moving >= 5) {
+			row = GOV_TOP;""")
+sub1(OSM, """			redwood_status(REDWOOD_STATUS_CPU, "gov %u MHz now; at the top %u%% of the last second", gov_silver_mhz[row],
+			    at_top * 100 / periods);""", """			redwood_status(REDWOOD_STATUS_CPU, "gov %u MHz now; at the top %u%% of the last second", gov_silver_mhz[row],
+			    at_top * 100 / periods);""")
+sub1(FBF, """	redwood_activity = mach_absolute_time();        /* (cpu_gov: the phone is drawing) */
+""", """	redwood_frames++;                               /* (cpu_gov: frames handed over, counted) */
+""")
+sub1(FBF, """extern "C" volatile uint64_t redwood_activity;  /* bsd/dev/redwood_osm.c (cpu_gov): the last frame or touch */
+""", """extern "C" volatile uint32_t redwood_frames;    /* bsd/dev/redwood_osm.c (cpu_gov): frames handed to the panel */
+""")
+
+# doha, battery (2026-11-11): the battery's current steady enough to compare runs -- sampled every second (the gauge's
+# last reading, QG 0xC2) into a ring of 30, shown with the instant one; and its scale by the gauge's subtype, as
+# qg_iraw_to_ua does: subtype 3 (QG_ADC_IBAT_5A) 152.588 uA a step, otherwise 305.176 (before, 305.176 always). The
+# panel's Wi-Fi line drops the fields read once (C, L, P, T) to make room
+sub1(BTN, """static uint32_t pets;
+""", """static uint32_t pets;
+static int32_t current_ring[30];        /* the battery's current, mA (> 0 out of the battery), one a second */
+static uint32_t current_count, current_next;
+static uint8_t gauge_subtype = 0xff;
+static const char *spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t count);
+
+/* The gauge's last current reading, in mA (> 0: out of the battery); 0 if it does not answer */
+static int32_t
+current_now(void)
+{
+	uint8_t ia[2] = { 0, 0 };
+
+	if (gauge_subtype == 0xff && spmi_read(&qg, 0x05, &gauge_subtype, 1) != NULL) {
+		gauge_subtype = 0xff;
+	}
+	if (spmi_read(&qg, 0xc2, ia, 2) != NULL) {
+		return 0;
+	}
+	return (int32_t)((int64_t)(int16_t)((uint16_t)ia[0] | (uint16_t)ia[1] << 8) *
+	    (gauge_subtype == 3 ? 152588 : 305176) / 1000000);
+}
+
+static void
+current_sample(void)
+{
+	current_ring[current_next] = current_now();
+	current_next = (current_next + 1) % 30;
+	current_count += current_count < 30;
+}
+
+static int32_t
+current_average(void)
+{
+	int64_t sum = 0;
+
+	for (uint32_t i = 0; i < current_count; i++) {
+		sum += current_ring[i];
+	}
+	return current_count ? (int32_t)(sum / current_count) : 0;
+}
+""")
+sub1(BTN, """		if (battery_direct && tick % (5000 / POLL_MS) == 0) {
+			battery_look();
+		}
+""", """		if (battery_direct && tick % (1000 / POLL_MS) == 0) {
+			current_sample();
+		}
+		if (battery_direct && tick % (5000 / POLL_MS) == 0) {
+			battery_look();
+		}
+""")
+sub1(BTN, """		redwood_status(REDWOOD_STATUS_WIFI, "chg%s S%02x/%02x E%02x C%02x U%02x L%02x P%02x W%02x/%02x T%02x I%lldmA",
+		    pet_stopped ? "!" : pets != 0 ? "+" : "", st[0], st[1], en, cfg2, il, icl, pp, wd[0], wd[2], sub, ma);""",
+     """		(void)cfg2;
+		(void)icl;
+		(void)pp;
+		(void)ma;
+		redwood_status(REDWOOD_STATUS_WIFI, "chg%s S%02x/%02x E%02x U%02x W%02x/%02x I%d avg %dmA/%us",
+		    pet_stopped ? "!" : pets != 0 ? "+" : "", st[0], st[1], en, il, wd[0], wd[2], current_now(), current_average(),
+		    current_count);""")

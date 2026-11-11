@@ -1,28 +1,28 @@
-From b0b852baa5b83476a8cacf4c930e051647ec34e4 Mon Sep 17 00:00:00 2001
+From b6562c5e0d34abc4aef8fa045bab370fe87cc533 Mon Sep 17 00:00:00 2001
 From: andrecremo <andreljsantos@gmail.com>
-Date: Tue, 10 Nov 2026 21:01:08 -0300
+Date: Wed, 11 Nov 2026 14:29:09 -0300
 Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
 
 ---
  xnu/files/bsd/dev/redwood_a610.c              |  32 +-
  xnu/files/bsd/dev/redwood_adreno.c            |   5 +-
  xnu/files/bsd/dev/redwood_battery.c           |  24 +
- xnu/files/bsd/dev/redwood_buttons.c           | 139 +++
+ xnu/files/bsd/dev/redwood_buttons.c           | 256 +++++
  xnu/files/bsd/dev/redwood_focaltech.c         | 943 ++++++++++++++++++
- xnu/files/bsd/dev/redwood_input.c             |   1 +
- xnu/files/bsd/dev/redwood_osm.c               |  23 +-
+ xnu/files/bsd/dev/redwood_input.c             |   4 +
+ xnu/files/bsd/dev/redwood_osm.c               | 154 ++-
  xnu/files/bsd/dev/redwood_rpm.c               |  11 +-
  xnu/files/bsd/dev/redwood_ufs.c               |   5 +
  xnu/files/bsd/sys/redwood_input.h             |   1 +
- .../iokit/Kernel/MiniIOMobileFramebuffer.cpp  | 177 +++-
+ .../iokit/Kernel/MiniIOMobileFramebuffer.cpp  | 179 +++-
  xnu/files/iokit/Kernel/MiniIOSurface.cpp      |  31 +
  xnu/files/iokit/Kernel/MiniIOSurface.h        |   2 +
  xnu/files/iokit/Kernel/RedwoodGPU.cpp         |  41 +-
  xnu/files/osfmk/arm64/gic_v3_irq.c            |  12 +-
  xnu/redwood.patch                             |   9 +-
  xnuloader/build.sh                            |   3 +-
- xnuloader/loader.c                            | 290 +++++-
- 18 files changed, 1727 insertions(+), 22 deletions(-)
+ xnuloader/loader.c                            | 339 ++++++-
+ 18 files changed, 2029 insertions(+), 22 deletions(-)
  create mode 100644 xnu/files/bsd/dev/redwood_focaltech.c
 
 diff --git a/xnu/files/bsd/dev/redwood_a610.c b/xnu/files/bsd/dev/redwood_a610.c
@@ -164,10 +164,10 @@ index 6e80b4d..6bf0b72 100644
  	}
  	printf("battery: Qualcomm UEFI cache at pa %#llx; polling every 5 seconds\n", shared_pa);
 diff --git a/xnu/files/bsd/dev/redwood_buttons.c b/xnu/files/bsd/dev/redwood_buttons.c
-index 593ed6e..fa0bd5a 100644
+index 593ed6e..ddfdd91 100644
 --- a/xnu/files/bsd/dev/redwood_buttons.c
 +++ b/xnu/files/bsd/dev/redwood_buttons.c
-@@ -148,6 +148,13 @@ struct peripheral {
+@@ -148,6 +148,112 @@ struct peripheral {
  	bool            found;
  };
  static struct peripheral pon, pin;
@@ -177,11 +177,110 @@ index 593ed6e..fa0bd5a 100644
 + */
 +static struct peripheral qg, usbin, chgr, qgsdam;
 +static struct peripheral dcdc, misc;    /* the charger's DCDC (0x1100) and MISC (0x1600) blocks: read for the panel only */
++/*
++ * charge=1 (doha): the charger's watchdog petted (BARK_BITE_WDOG_PET, MISC 0x43 bit 0) while a cable is in, through
++ * the arbiter's write channel for the PMI632's MISC block ("chnls" at 0x1E00000 in doha's spmi@1c40000, 0x10000 a
++ * channel; command 0x00, status 0x08, write data 0x10; write opcode 0), if this system owns that channel
++ */
++#define DOHA_ARB_CHNLS          0x01E00000UL
++#define CHANNEL_WDATA0          0x10
++#define COMMAND_WRITE           (0u << 27)
++static vm_offset_t pet_channel;
++static uint16_t pet_channel_n;
++static bool pet_stopped;
++static uint32_t pets;
++static int32_t current_ring[30];        /* the battery's current, mA (> 0 out of the battery), one a second */
++static uint32_t current_count, current_next;
++static uint8_t gauge_subtype = 0xff;
++static const char *spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t count);
++
++/* The gauge's last current reading, in mA (> 0: out of the battery); 0 if it does not answer */
++static int32_t
++current_now(void)
++{
++	uint8_t ia[2] = { 0, 0 };
++
++	if (gauge_subtype == 0xff && spmi_read(&qg, 0x05, &gauge_subtype, 1) != NULL) {
++		gauge_subtype = 0xff;
++	}
++	if (spmi_read(&qg, 0xc2, ia, 2) != NULL) {
++		return 0;
++	}
++	return (int32_t)((int64_t)(int16_t)((uint16_t)ia[0] | (uint16_t)ia[1] << 8) *
++	    (gauge_subtype == 3 ? 152588 : 305176) / 1000000);
++}
++
++static void
++current_sample(void)
++{
++	current_ring[current_next] = current_now();
++	current_next = (current_next + 1) % 30;
++	current_count += current_count < 30;
++}
++
++static int32_t
++current_average(void)
++{
++	int64_t sum = 0;
++
++	for (uint32_t i = 0; i < current_count; i++) {
++		sum += current_ring[i];
++	}
++	return current_count ? (int32_t)(sum / current_count) : 0;
++}
++
++static void
++pet_setup(uint32_t channels)
++{
++	for (uint32_t n = 0; n < channels; n++) {
++		uint32_t map = rd(arb_core + ARB_CHANNEL(n));
++
++		if (map != 0 && ((map >> 8) & 0xfff) == 0x216 && (rd(arb_cnfg + ARB_OWNER(n)) & 7) == ARB_SYSTEM) {
++			pet_channel_n = (uint16_t)n;
++			pet_channel = ml_io_map(DOHA_ARB_CHNLS + 0x10000UL * n, 0x1000);
++			printf("battery: charge=1: the charger's watchdog will be petted (channel %u, MISC 0x43)\n", n);
++			return;
++		}
++	}
++	printf("battery: charge=1, but no channel of the charger's MISC block is ours to write through: nothing petted\n");
++}
++
++static void
++pet(void)
++{
++	uint64_t start, interval;
++	uint32_t status;
++
++	if (pet_channel == 0 || pet_stopped) {
++		return;
++	}
++	if (((rd(arb_core + ARB_CHANNEL(pet_channel_n)) >> 8) & 0xfff) != 0x216) {
++		pet_stopped = true;
++		printf("battery: the arbiter's channel %u is no longer the charger's MISC: not petted any more\n", pet_channel_n);
++		return;
++	}
++	nanoseconds_to_absolutetime(READ_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
++	redwood_spmi_lock();
++	wr(pet_channel + CHANNEL_WDATA0, 0x01);
++	wr(pet_channel + OBSERVER_COMMAND, COMMAND_WRITE | 0x43u << 4);
++	start = mach_absolute_time();
++	do {
++		status = rd(pet_channel + OBSERVER_STATUS);
++	} while (!(status & STATUS_DONE) && mach_absolute_time() - start < interval);
++	redwood_spmi_unlock();
++	if (!(status & STATUS_DONE) || (status & (STATUS_DENIED | STATUS_FAILURE))) {
++		pet_stopped = true;
++		printf("battery: the charger's watchdog not petted any more: %s (status %#x)\n",
++		    !(status & STATUS_DONE) ? "no answer from the arbiter" : "the write was refused", status);
++		return;
++	}
++	pets++;
++}
 +static bool battery_direct;
  
  /*
   * Where each phone has it all. The power-on block comes in two kinds: redwood's is split in two
-@@ -170,6 +177,9 @@ static const struct board {
+@@ -170,6 +276,9 @@ static const struct board {
  	/* qcom,spmi@1c40000 of willow's device tree; qcom,power-on@800 of the PM6125, gpio_keys' GPIO5 of it */
  	{ "willow", 0x01c40000, 0x01c0a000, 0x03e00000, "the PM6125's power-on block", 0x008, 0x01, 0x05, 0x01, 0x02,
  	  "GPIO5 of the PM6125", 0x0c4 },
@@ -191,7 +290,7 @@ index 593ed6e..fa0bd5a 100644
  };
  static const struct board *board = &boards[0];
  
-@@ -470,6 +480,107 @@ say_summary(void)
+@@ -470,6 +579,115 @@ say_summary(void)
  	    bus.reads ? bus.total_ns / bus.reads / 1000 : 0, bus.longest_ns / 1000, bus.failed);
  }
  
@@ -272,6 +371,9 @@ index 593ed6e..fa0bd5a 100644
 +		soc = last_soc;
 +	}
 +	last_soc = soc;
++	if ((usb & 0x10) != 0) {
++		pet();
++	}
 +	redwood_battery_direct(soc, mv, (usb & 0x10) != 0, state >= 1 && state <= 4, android);
 +	{
 +		uint8_t st[2] = { 0, 0 }, en = 0, cfg2 = 0, il = 0, icl = 0, pp = 0, wd[3] = { 0, 0, 0 }, sub = 0, ia[2] = { 0, 0 };
@@ -291,15 +393,20 @@ index 593ed6e..fa0bd5a 100644
 +		spmi_read(&qg, 0x05, &sub, 1);
 +		spmi_read(&qg, 0xc2, ia, 2);
 +		ma = (int64_t)(int16_t)((uint16_t)ia[0] | (uint16_t)ia[1] << 8) * 305176 / 1000000;
-+		redwood_status(REDWOOD_STATUS_WIFI, "chg S%02x/%02x E%02x C%02x U%02x L%02x P%02x W%02x/%02x T%02x I%lldmA",
-+		    st[0], st[1], en, cfg2, il, icl, pp, wd[0], wd[2], sub, ma);
++		(void)cfg2;
++		(void)icl;
++		(void)pp;
++		(void)ma;
++		redwood_status(REDWOOD_STATUS_WIFI, "chg%s S%02x/%02x E%02x U%02x W%02x/%02x I%d avg %dmA/%us",
++		    pet_stopped ? "!" : pets != 0 ? "+" : "", st[0], st[1], en, il, wd[0], wd[2], current_now(), current_average(),
++		    current_count);
 +	}
 +}
 +
  static void
  buttons_thread(void *parameter, __unused wait_result_t result)
  {
-@@ -498,6 +609,18 @@ buttons_thread(void *parameter, __unused wait_result_t result)
+@@ -498,6 +716,25 @@ buttons_thread(void *parameter, __unused wait_result_t result)
  	printf("buttons: step 2: look through the arbiter's table for the channels of the two peripherals\n");
  	find_channel(&pon, channels);
  	find_channel(&pin, channels);
@@ -310,6 +417,13 @@ index 593ed6e..fa0bd5a 100644
 +		find_channel(&qgsdam, channels);
 +		find_channel(&dcdc, channels);
 +		find_channel(&misc, channels);
++		{
++			uint32_t charge = 0;
++
++			if (PE_parse_boot_argn("charge", &charge, sizeof(charge)) && charge) {
++				pet_setup(channels);
++			}
++		}
 +		battery_direct = qg.found && usbin.found && chgr.found;
 +		if (battery_direct) {
 +			battery_look();
@@ -318,17 +432,20 @@ index 593ed6e..fa0bd5a 100644
  	if (steps < 3) {
  		goto out;
  	}
-@@ -540,6 +663,9 @@ buttons_thread(void *parameter, __unused wait_result_t result)
+@@ -540,6 +777,12 @@ buttons_thread(void *parameter, __unused wait_result_t result)
  	    volume_up.usable ? " volume-up" : "", volume_down.usable ? " volume-down" : "", POLL_MS);
  	for (unsigned tick = 1;; tick++) {
  		buttons_poll();
++		if (battery_direct && tick % (1000 / POLL_MS) == 0) {
++			current_sample();
++		}
 +		if (battery_direct && tick % (5000 / POLL_MS) == 0) {
 +			battery_look();
 +		}
  		/* once early on as well: a short run is to say what the reads cost too */
  		if (tick % MINUTE_TICKS == 0 || tick == 10 * 1000 / POLL_MS) {
  			say_summary();
-@@ -595,6 +721,19 @@ redwood_buttons_init(void)
+@@ -595,6 +838,19 @@ redwood_buttons_init(void)
  		}
  	}
  	pon = (struct peripheral){ .name = board->pon_name, .id = board->pon_id };
@@ -1298,10 +1415,23 @@ index 0000000..ef7a9ff
 +	}
 +}
 diff --git a/xnu/files/bsd/dev/redwood_input.c b/xnu/files/bsd/dev/redwood_input.c
-index 5f0ee3e..d0b6b0a 100644
+index 5f0ee3e..ca46795 100644
 --- a/xnu/files/bsd/dev/redwood_input.c
 +++ b/xnu/files/bsd/dev/redwood_input.c
-@@ -220,6 +220,7 @@ redwood_input_init(void)
+@@ -134,9 +134,12 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
+ 	wakeup(&touch_queue);
+ }
+ 
++extern volatile uint64_t redwood_activity;     /* bsd/dev/redwood_osm.c (cpu_gov): the last frame or touch */
++
+ void
+ redwood_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
+ {
++	redwood_activity = mach_absolute_time();
+ 	touch_post(type, finger, x, y, true);
+ }
+ 
+@@ -220,6 +223,7 @@ redwood_input_init(void)
  	redwood_virtio_input_init();
  	redwood_goodix_init();
  	redwood_novatek_init();
@@ -1310,7 +1440,7 @@ index 5f0ee3e..d0b6b0a 100644
  	redwood_battery_init();
  	redwood_ufs_init();
 diff --git a/xnu/files/bsd/dev/redwood_osm.c b/xnu/files/bsd/dev/redwood_osm.c
-index 1546703..968f572 100755
+index 1546703..f10ba91 100755
 --- a/xnu/files/bsd/dev/redwood_osm.c
 +++ b/xnu/files/bsd/dev/redwood_osm.c
 @@ -86,6 +86,19 @@ osm_thread(__unused void *parameter, __unused wait_result_t result)
@@ -1333,7 +1463,7 @@ index 1546703..968f572 100755
  	(void)lmh;
  	/*
  	 * The clusters' speed, by their own cycle counters (clk-cpu-osm.c, OSM_CYCLE_COUNTER_STATUS_REG 0x9c0:
-@@ -121,6 +134,13 @@ osm_thread(__unused void *parameter, __unused wait_result_t result)
+@@ -121,20 +134,159 @@ osm_thread(__unused void *parameter, __unused wait_result_t result)
  		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
  		printf("osm: cpu %d (on cpu %d): 100M loops in %llu us: %llu million a second\n", cpu, cpu_number(), ns / 1000,
  		    ns ? 100000000000ull / ns : 0);
@@ -1347,7 +1477,144 @@ index 1546703..968f572 100755
  	}
  	thread_bind(PROCESSOR_NULL);
  	thread_terminate(current_thread());
-@@ -134,7 +154,8 @@ redwood_osm_init(void)
+ }
+ 
++/* ---- cpu_gov=1 (doha): the rows of both clusters' OSM tables by the load ---- */
++#include <mach/processor_info.h>
++#include <mach/machine.h>
++extern kern_return_t processor_info(processor_t processor, processor_flavor_t flavor, host_t *host, processor_info_t info,
++    mach_msg_type_number_t *count);
++
++#define GOV_PERIOD_MS           50
++extern uint32_t redwood_osm_seen[8][6];         /* osfmk/arm/arm_init.c, osm_ask(): [core][5] set once a core came up */
++#define GOV_UP_PERCENT          70              /* a core this busy: the top row */
++#define GOV_HOLD_PERIODS        5               /* ... held so long at least */
++static const uint32_t gov_silver_mhz[8] = { 300, 614, 864, 1017, 1305, 1420, 1612, 1804 };      /* doha's firmware's table */
++#define GOV_TOP                 7
++#define GOV_GOLD_TOP            6               /* Gold's row 6, 1804 MHz (7 is 2016: nothing here watches the heat) */
++
++/*
++ * The governor, second form (2026-11-11). Measuring each processor's load (processor_info, PROCESSOR_CPU_LOAD_INFO)
++ * rebooted the phone at once, before anything was written (cpu_gov=2, the first step never said itself). So the load is
++ * not measured: what the phone is doing is. A frame handed to the panel (MiniIOMobileFramebuffer's present()) or a touch
++ * (redwood_touch_post()) stamps redwood_activity; within 400 ms of one, the top row; after that, a row down every 50 ms to
++ * the lowest (cpu_gov_min, row 1 by default, 614 MHz). Nothing moves between processors.
++ *
++ * cpu_gov=2: a test of the writes alone, each step said on the panel's CPU line before it is taken, 4 s apart: Silver's
++ * request written again as it is (row 7), Gold's again as it is (row 6, from whichever processor this runs on), then
++ * Silver at row 3 for 10 s, then Gold at row 3 for 10 s. The last line seen before a reboot names the step.
++ */
++volatile uint64_t redwood_activity;     /* mach_absolute_time of the last touch */
++volatile uint32_t redwood_frames;       /* frames handed to the panel (MiniIOMobileFramebuffer's present()), counted */
++
++static void
++gov_rows(vm_offset_t osm, int silver, int gold)
++{
++	bool gold_up = false;
++
++	for (int core = 4; core < 8; core++) {
++		gold_up = gold_up || redwood_osm_seen[core][5] != 0;
++	}
++	for (int core = 0; core < 4; core++) {
++		if (silver >= 0) {
++			*(volatile uint32_t *)(osm + OSM_SILVER + 0x920 + 4 * core) = (uint32_t)silver;
++		}
++		if (gold >= 0 && gold_up) {
++			*(volatile uint32_t *)(osm + OSM_GOLD + 0x920 + 4 * core) = (uint32_t)gold;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++gov_say(const char *step)
++{
++	redwood_status(REDWOOD_STATUS_CPU, "gov test %s (cpu %d, MPIDR %#llx)", step, cpu_number(),
++	    __builtin_arm_rsr64("MPIDR_EL1") & 0xffff);
++	printf("cpu_gov: test %s\n", step);
++	delay_for_interval(4, NSEC_PER_SEC);
++}
++
++static void
++gov_thread(void *parameter, __unused wait_result_t result)
++{
++	uint32_t mode = (uint32_t)(uintptr_t)parameter;        /* 1: the rows follow what the phone does; 2: the test */
++	vm_offset_t osm = ml_io_map(OSM_PHYS, OSM_SIZE);
++	uint32_t row = GOV_TOP, written = ~0u, min_row = 1, periods = 0, at_top = 0, frames[5] = { 0 }, slot = 0;
++	uint64_t since, quiet;
++
++	PE_parse_boot_argn("cpu_gov_min", &min_row, sizeof(min_row));
++	min_row = min_row > GOV_TOP ? GOV_TOP : min_row;
++	nanoseconds_to_absolutetime(400 * NSEC_PER_MSEC, &quiet);
++	/* not before the system is up and the Gold cores with it (~57 s) */
++	delay_for_interval(60, NSEC_PER_SEC);
++	if (mode == 2) {
++		gov_say("A: running, nothing written yet");
++		gov_say("B: Silver's request again, row 7");
++		gov_rows(osm, GOV_TOP, -1);
++		gov_say("B done; C: Gold's request again, row 6");
++		gov_rows(osm, -1, GOV_GOLD_TOP);
++		gov_say("C done; D: Silver at row 3 for 10 s");
++		gov_rows(osm, 3, -1);
++		delay_for_interval(10, NSEC_PER_SEC);
++		gov_rows(osm, GOV_TOP, -1);
++		gov_say("D done; E: Gold at row 3 for 10 s");
++		gov_rows(osm, -1, 3);
++		delay_for_interval(10, NSEC_PER_SEC);
++		gov_rows(osm, -1, GOV_GOLD_TOP);
++		gov_say("E done: all steps passed");
++		thread_terminate(current_thread());
++	}
++	printf("cpu_gov: the top row within 400 ms of a frame or a touch, down to row %u otherwise\n", min_row);
++	since = mach_absolute_time();
++	for (;;) {
++		uint64_t now, ns;
++
++		delay_for_interval(GOV_PERIOD_MS, NSEC_PER_MSEC);
++		now = mach_absolute_time();
++		/* frames in the last 250 ms: the count now against the one five periods ago */
++		uint32_t count = redwood_frames, moving = count - frames[slot];
++
++		frames[slot] = count;
++		slot = (slot + 1) % 5;
++		if (now - redwood_activity < quiet || moving >= 5) {
++			row = GOV_TOP;
++		} else if (row > min_row) {
++			row--;
++		}
++		/* written when it changes, and every second besides (a Gold core powered off and on again forgets its row) */
++		if (row != written || periods % (1000 / GOV_PERIOD_MS) == 0) {
++			gov_rows(osm, (int)row, (int)(row > GOV_GOLD_TOP ? GOV_GOLD_TOP : row));
++			written = row;
++		}
++		periods++;
++		at_top += row == GOV_TOP;
++		absolutetime_to_nanoseconds(now - since, &ns);
++		if (ns >= NSEC_PER_SEC) {
++			redwood_status(REDWOOD_STATUS_CPU, "gov %u MHz now; at the top %u%% of the last second", gov_silver_mhz[row],
++			    at_top * 100 / periods);
++			periods = at_top = 0;
++			since = now;
++		}
++	}
++}
++
+ void
+ redwood_osm_init(void)
+ {
++	{
++		uint32_t gov = 0;
++		char where[16] = "";
++		thread_t thread;
++
++		if (PE_parse_boot_argn("cpu_gov", &gov, sizeof(gov)) && gov != 0 &&
++		    PE_parse_boot_arg_str("device", where, sizeof(where)) && strcmp(where, "doha") == 0 &&
++		    kernel_thread_start(gov_thread, (void *)(uintptr_t)gov, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		}
++	}
+ 	uint32_t dump = 0;
+ 	char device[16] = "";
  	thread_t thread;
  
  	if (!PE_parse_boot_argn("osm_dump", &dump, sizeof(dump)) || !dump ||
@@ -1415,7 +1682,7 @@ index 3e701f0..deb3dd6 100644
  void redwood_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
  void redwood_ufs_report(const char *when); /* where reading the storage has spent its time so far */
 diff --git a/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
-index 65a99ee..9cf5c60 100644
+index 65a99ee..b54b075 100644
 --- a/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
 +++ b/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
 @@ -25,6 +25,7 @@
@@ -1426,7 +1693,7 @@ index 65a99ee..9cf5c60 100644
  #include <kern/thread.h>
  #include <kern/clock.h>
  #include <pexpert/pexpert.h>
-@@ -174,12 +175,30 @@ static TUNABLE(uint32_t, gHud, "fb_hud", 0);
+@@ -174,12 +175,31 @@ static TUNABLE(uint32_t, gHud, "fb_hud", 0);
   * (RedwoodGPUBlitToPanel), not row by row by the processors; anything else is copied as before.
   */
  static TUNABLE(uint32_t, gFBGPU, "fb_gpu", 0);
@@ -1444,6 +1711,7 @@ index 65a99ee..9cf5c60 100644
 +#define INTF1_FRAMES            ((0x6B800 + 0xac) / 4)  /* the DSI interface's INTF_FRAME_COUNT */
 +extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern "C" void flush_dcache(vm_offset_t addr, unsigned count, int phys);
++extern "C" volatile uint32_t redwood_frames;    /* bsd/dev/redwood_osm.c (cpu_gov): frames handed to the panel */
  extern "C" {
  extern unsigned char iso_font[256 * 16];
  enum { kStatusScreen = 0, kStatusParts = 10 };  /* REDWOOD_STATUS_SCREEN, REDWOOD_STATUS_PARTS (sys/redwood_input.h) */
@@ -1457,7 +1725,7 @@ index 65a99ee..9cf5c60 100644
  #define SWAP_QUEUE              2                       /* frames that may wait for the panel at most (fb_queue) */
  static TUNABLE(uint32_t, gQueue, "fb_queue", 2);
  static inline unsigned
-@@ -323,9 +342,17 @@ public:
+@@ -323,9 +343,17 @@ public:
  	void reportFrameTimes(void);
  	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
  	void drawHud(uint64_t began);
@@ -1475,7 +1743,7 @@ index 65a99ee..9cf5c60 100644
  	uint32_t *      fHudPixels;             /* ... the panel as last drawn, copied into every frame */
  	uint32_t        fGPUFrames;             /* fb_gpu=1: frames the GPU copied onto the panel (in the 5-second line) */
  	uint64_t        fHudDrawn;              /* ... when it was drawn: twice a second */
-@@ -758,17 +785,27 @@ IOMobileFramebuffer::drawHud(uint64_t began)
+@@ -758,17 +786,27 @@ IOMobileFramebuffer::drawHud(uint64_t began)
  	if (fHudLast != 0) {
  		absolutetime_to_nanoseconds(now - fHudLast, &ns);
  		fHudIntervalUs = (uint32_t) (ns / 1000);
@@ -1505,7 +1773,15 @@ index 65a99ee..9cf5c60 100644
  	if (left + width > fPanelWidth || top + height > fPanelHeight) {
  		return;
  	}
-@@ -1034,6 +1071,117 @@ IOMobileFramebuffer::presenter(void)
+@@ -968,6 +1006,7 @@ IOMobileFramebuffer::reportFrameTimes(void)
+ void
+ IOMobileFramebuffer::present(const uint8_t * swap)
+ {
++	redwood_frames++;                               /* (cpu_gov: frames handed over, counted) */
+ 	AbsoluteTime deadline;
+ 
+ 	uint64_t now = mach_absolute_time(), period, pause;
+@@ -1034,6 +1073,117 @@ IOMobileFramebuffer::presenter(void)
  	}
  }
  
@@ -1623,7 +1899,7 @@ index 65a99ee..9cf5c60 100644
  /* A swap's surfaces onto the panel, once the GPU is done with them. */
  void
  IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
-@@ -1101,6 +1249,26 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+@@ -1101,6 +1251,26 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
  		    swapWord(swap, SWAP_ID), fSwapsShown, swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)),
  		    swapWord(swap, SWAP_SURFACE(2)), swapWord(swap, SWAP_SURFACE(3)), set, swapWord(swap, SWAP_LAYERS_CLEARED));
  	}
@@ -1650,7 +1926,7 @@ index 65a99ee..9cf5c60 100644
  	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
  		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
  		int32_t src[4], dst[4];
-@@ -1146,12 +1314,17 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+@@ -1146,12 +1316,17 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
  			drawLayer(s, src, dst);
  			if (layer == 0) {
  				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
@@ -1916,7 +2192,7 @@ index 3073c14..b28c3d3 100755
  # is in the middle of the phone's largest block of RAM, which XNU needs in one piece. Another device
  # whose largest block holds 0xA1000000 sets LOADER_BASE (common/devices/<name>.conf) to free RAM outside it.
 diff --git a/xnuloader/loader.c b/xnuloader/loader.c
-index 256397e..2cd046d 100644
+index 256397e..22e3426 100644
 --- a/xnuloader/loader.c
 +++ b/xnuloader/loader.c
 @@ -15,7 +15,9 @@
@@ -2021,7 +2297,7 @@ index 256397e..2cd046d 100644
  				}
  				break;
  			}
-@@ -3321,16 +3370,227 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -3321,16 +3370,276 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  			break;
  		}
  	}
@@ -2158,6 +2434,55 @@ index 256397e..2cd046d 100644
 +				break;
 +			}
 +		}
++		for (const char *c = pi.cmdline; *c; c++) {
++			if (starts_with(c, "lastpanic=1") && (c == pi.cmdline || c[-1] == ' ')) {
++				const unsigned char *log = (const unsigned char *)(uintptr_t)PANIC_LOG_BASE;
++				char line[120];
++				uint64_t at = 0, shown = 0, lines = 0, nonzero = 0;
++
++				for (uint64_t i = 0; i < PANIC_LOG_SIZE; i++) {
++					nonzero += log[i] != 0;
++				}
++				print("lastpanic=1: the panic log region (%x, %x bytes): %d bytes not zero\n", (uint64_t)PANIC_LOG_BASE,
++				    (uint64_t)PANIC_LOG_SIZE, nonzero);
++				/* runs of printable text 8 or more long, broken into lines, 40 lines at most */
++				while (at < PANIC_LOG_SIZE && lines < 40) {
++					uint64_t run = 0;
++
++					while (at + run < PANIC_LOG_SIZE && ((log[at + run] >= 32 && log[at + run] < 127) || log[at + run] == 10)) {
++						run++;
++					}
++					if (run >= 8) {
++						uint64_t k = 0;
++
++						for (uint64_t j = 0; j < run && lines < 40; j++) {
++							char ch = (char)log[at + j];
++
++							if (ch == 10 || k == sizeof(line) - 2) {
++								line[k] = 0;
++								print("%s\n", line);
++								lines++;
++								k = 0;
++								if (ch == 10) {
++									continue;
++								}
++							}
++							line[k++] = ch;
++						}
++						if (k > 0 && lines < 40) {
++							line[k] = 0;
++							print("%s\n", line);
++							lines++;
++						}
++						shown += run;
++					}
++					at += run + 1;
++				}
++				print("lastpanic=1: %d characters shown; 30 s to read this\n", shown);
++				BS->stall(30000000);
++				break;
++			}
++		}
 +		/*
 +		 * doha, "fliptest=1": a picture of eight coloured bands in RAM of the loader's (below 4 GB: the pipe takes 32
 +		 * bits), shown for 5 s by pointing VIG0's picture address (0x5E05000 + 0x14, read by mdssdump=1 as 0x5c000000)
@@ -2252,7 +2577,7 @@ index 256397e..2cd046d 100644
  		for (const char *c = pi.cmdline; *c; c++) {
  			if (starts_with(c, "osm=") && (c == pi.cmdline || c[-1] == ' ') && (c[4] == '1' || c[4] == '2') &&
  			    (c[5] == 0 || c[5] == ' ')) {
-@@ -3341,6 +3601,20 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -3341,6 +3650,20 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  				for (int k = 0; k < 2; k++) {
  					volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)osm[k];
  
@@ -2273,7 +2598,7 @@ index 256397e..2cd046d 100644
  					for (int core = 0; core < 4; core++) {
  						r[0x920 / 4 + core] = row[k];
  					}
-@@ -4503,7 +4777,8 @@ efi_main(efi_handle image, efi_system_table *st)
+@@ -4503,7 +4826,8 @@ efi_main(efi_handle image, efi_system_table *st)
  		SCREEN.height = GOP->mode->info->height;
  		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
  		for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++)
@@ -2283,7 +2608,7 @@ index 256397e..2cd046d 100644
  				PLAT = platforms[i];
  		if (PLAT == &platform_qemu_virt)
  			ramfb_phone_screen();
-@@ -4524,6 +4799,11 @@ efi_main(efi_handle image, efi_system_table *st)
+@@ -4524,6 +4848,11 @@ efi_main(efi_handle image, efi_system_table *st)
  	if (have_payload) {
  		run_kernel(0, 0);
  	}

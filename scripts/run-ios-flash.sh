@@ -105,6 +105,9 @@ TOUCHARG=; [ "${TOUCH:-1}" = 1 ] && TOUCHARG=" touchscreen=1"
 # BATTERY=1 (default): battery=1, the battery's level for the status bar: the loader asks Qualcomm's ChargerEx in
 # doha's UEFI (read-only: present, charger plugged, voltage; the level estimated from the voltage); BATTERY=0: left out
 [ "${BATTERY:-1}" = 1 ] && TOUCHARG="$TOUCHARG battery=1"
+# CHARGE=1: charge=1, the charger's watchdog petted every 5 s while a cable is in (MISC 0x43), without which the
+# PMI632 stops charging a few minutes into the run; the panel's Wi-Fi line then starts "chg+" ("chg!": a write refused)
+[ "${CHARGE:-0}" = 1 ] && TOUCHARG="$TOUCHARG charge=1"
 # HUD=1: fb_hud=1, a line for each part of the phone (the drivers' redwood_status()) drawn over the picture
 # GPU=1: gpu=1, the Adreno 610 started and kept for the system (redwood_a610.c; the RPM's buses first, the zap shader,
 # 745 MHz); FBGPU=1 too: fb_gpu=1, frames onto the panel by the GPU's 2D engine (with a GL=1 small image)
@@ -129,11 +132,21 @@ GPUARG="$GPUARG rpm_bimc=${BIMC:-1804000}"
 # FLIPTEST=1: fliptest=1, the loader shows eight coloured bands for 5 s by pointing the display's pipe (VIG0) at them,
 # then puts it back: whether a picture anywhere in RAM can be shown without the GPU's copy
 [ "${FLIPTEST:-0}" = 1 ] && GPUARG="$GPUARG fliptest=1"
+# LASTPANIC=1: lastpanic=1, the loader shows the text left in the panic log region by the run before (30 s)
+[ "${LASTPANIC:-0}" = 1 ] && GPUARG="$GPUARG lastpanic=1"
 # FLIP=1 (default; FLIP=0 copies every frame as before): fb_flip=1, a frame of one layer shown where the GPU drew it
 # (the display's pipe pointed at it) instead of copied onto the panel's memory by the GPU. 2026-11-10: Settings'
 # scroll 29-59 fps against 21-30, the longest gap 17-57 ms against 150-470, and no SpringBoard restart (the black
 # screen with the spinner) in any run; the HUD's Screen line says "flip, N late" while it is
 [ "${FLIP:-1}" = 1 ] && GPUARG="$GPUARG fb_flip=1"
+# GOV=1: cpu_gov=1, the cores' clocks follow the load (bsd/dev/redwood_osm.c): the top row only while a core is busy,
+# down to 300 MHz at rest; the HUD's CPU line says the clock, the load and how much of the time was at the top.
+# GOVMIN=N: cpu_gov_min=N, the lowest row (0: 300 MHz, 1: 614, 2: 864 ...)
+# GOV=2: cpu_gov=2, the load measured and shown on the CPU line, no clock changed
+# GOV=1 is the default (2026-11-11: at rest on the home screen, unplugged, 442 mA against 527 without it; GOV=0 leaves
+# the cores at the top all the time)
+[ "${GOV:-1}" != 0 ] && GPUARG="$GPUARG cpu_gov=${GOV:-1}"
+[ -n "$GOVMIN" ] && GPUARG="$GPUARG cpu_gov_min=$GOVMIN"
 # WALLFREEZE=1: wallpaper_freeze=1, SpringBoard shows the wallpaper as one still picture read off the panel (20 s
 # in, at the home screen; the icons blink once) instead of drawing its layers every frame; 2: the wallpaper hidden
 [ -n "$WALLFREEZE" ] && GPUARG="$GPUARG wallpaper_freeze=$WALLFREEZE"
