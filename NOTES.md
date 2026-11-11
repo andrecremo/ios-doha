@@ -763,3 +763,65 @@ Pendências vistas com os Gold a 1804 MHz (2026-11-10):
   último minuto, só desce sem cabo e só sobe com ele; a barra acompanha o HUD, mas pulou de 55% para 38% numa rodada
   (provavelmente ao tirar o cabo: a tensão de carga infla a estimativa). A ver: a corrente do medidor (QG) para
   compensar a carga.
+
+GPU e tela, pelo kernel da Motorola (`MotorolaMobilityLLC/kernel-msm`, branch `android-10-release-qpis30.28-q3-28-26-4-1-7`,
+que tem `trinket-doha-*.dts*`), 2026-11-10:
+- Medido no HUD (rolando os Ajustes): GPU 84-92% ocupada a 745 e a 900 MHz; a tela passa ~400 ms/s esperando o
+  quadro e ~400 ms/s esperando a cópia para o painel. A 900 MHz (`GPUMHZ`, agora padrão) o maior engasgo caiu de ~470
+  para 75-141 ms.
+- `trinket-gpu.dtsi`: níveis 950, 900, 820, 745, 600, 465, 320 MHz; UBWC modo 1. O voto de memória ("grp3d", mestre 26
+  para EBI 512) é bimc a 1353 MHz com a GPU a 745 e 1804 MHz a 900-950. O `redwood_rpm.c` pedia bimc a 400 MHz:
+  `rpm_bimc=kHz` (`BIMC=` no `run-ios-flash.sh`) para testar.
+- `doha-panel.dtsi`: painel `dsi-panel-ft8719-tm-fhd-video` (modo vídeo). `trinket-sde.dtsi`: MDSS em 0x5e00000;
+  SSPP vig 0x5000, dma 0x25000 e 0x27000 (src-size 0x1f0); CTL 0x2000...; mixer 0x45000, 0x46000; INTF 0x6b000 (DP),
+  0x6b800 (DSI). Caminho para trocar o endereço da imagem lida pelo painel (sem a cópia da GPU).
+- `mdssdump=1` (2026-11-10), como a UEFI deixa o vídeo: hw rev 0x50040000 (DPU 5.4). O leitor ativo é o **VIG0**
+  (0x5E05000): tamanho 0x08e80438 (1080 × 2280) em +0x00 e +0x0c, endereço da imagem **0x5c000000** em +0x14, passo
+  0x10e0 (4320) em +0x24, formato 0x237fff em +0x30. DMA0 e DMA1 zerados. LM0 com saída 0x08e80438. INTF1 (DSI) ligado.
+  Trocar a imagem mostrada = escrever +0x14 do VIG0 e o flush do CTL0 (+0x18, bit 0 = VIG0).
+- Erro meu: as escapas `\n` de dois trechos novos do `doha_willow_edit.py` viraram quebras de linha reais. O `printf`
+  do `rpm_bimc` não compilava, então o teste `BIMC=1804000` rodou num kernel sem a opção e não vale. O `mdssdump`
+  saiu sem quebras de linha. Corrigido.
+- `fliptest=1` (2026-11-10) **funcionou**: o loader desenhou 8 faixas numa área própria (0x59013000), escreveu esse
+  endereço em VIG0 +0x14 e o bit 0 no flush do CTL0 (+0x18, que volta a ler 0 depois de aceito); o painel mostrou as
+  faixas por 5 s, cores e alinhamento certos, e voltou a 0x5c000000. O MDSS lê memória física direto (sem SMMU no
+  caminho, abaixo de 4 GB: o endereço tem 32 bits). Caminho para mostrar o quadro do iOS onde a GPU o desenhou.
+- `fb_flip=1` (`FLIP=1`), primeira rodada (2026-11-10): o flip funciona ("; flip" no HUD, copy 0.0 ms, blit 0, espera
+  da tela 60-89 ms/s), maior engasgo 53-116 ms; mas 15-17 fps, 249-317 envios/s, um pouco de rastro na rolagem e a
+  rodinha duas vezes. O rastro: o CoreAnimation desenhava na superfície que o painel mostrava. Segunda versão: a
+  superfície mostrada conta como em uso (useCount, o que IOSurfaceIsInUse lê) até a próxima ser tomada.
+
+Carga e nível da bateria, pelo kernel do LineageOS 23 do doha (`christiaan/android_kernel_motorola_msm-4.14`, `lts`),
+2026-11-10:
+- Bateria: KD40, 4000 mAh, de dois fabricantes (`qg-batterydata-kd40-atl/scud-4000mah.dtsi`, em
+  `trinket-moto-common-overlay.dtsi`); carga até 4,4 V, rápida até 3,6 A, entrada USB até 3 A. Curva OCV×carga a 25 °C
+  (ATL; SCUD quase igual): 100% 4382, 90% 4260, 80% 4144, 70% 4040, 60% 3958, 50% 3863, 40% 3825, 30% 3801, 20% 3770,
+  10% 3707, 5% 3668, 2% 3489, 0% 3000 mV. Plana entre 3800 e 3860 mV (30-50%): sem descontar a queda pela corrente, a
+  estimativa erra muito aí. Resistência interna ~0,12 Ω (`pc-temp-z-lut`).
+- Corrente no medidor (QG, periférico 0x48 da PMI632): `QG_LAST_ADC_I_DATA0` 0xC2 ou a média `LAST_BURST_AVG_I` 0xC6
+  (com `QG_DATA_CTL2` BURST_AVG_HOLD), com sinal, 305,176 uA por passo (152,588 no subtipo `QG_ADC_IBAT_5A`).
+- Carregador (SMB5 na PMI632; CHGR 0x1000, DCDC 0x1100, USBIN 0x1300, MISC 0x1600): `BATTERY_CHARGER_STATUS_1` 0x1006
+  bits 2:0 = 0 INHIBIT, 1 trickle, 2 pre, 3 fullon, 4 taper, 5 terminate, 6 pause, 7 disable (o nosso código lia 1-4
+  como carregando: o `chg 0` pode ser inibido, pausado ou desligado). `CHARGING_ENABLE_CMD` 0x1042 bit 0;
+  `CHGR_CFG2` 0x1051 (bit 0 inibir); `USBIN_CMD_IL` 0x1340 (bit 0 suspende a entrada); `POWER_PATH_STATUS` 0x110B;
+  `ICL_STATUS` 0x1107. Watchdog do carregador: `WD_CFG` 0x1651 (bit 1 liga ao conectar), `SNARL_BARK_BITE_WD_CFG` 0x1653
+  (bit 7: a mordida desliga a carga), `BARK_BITE_WDOG_PET` 0x1643 bit 0. O Linux limpa o bit 7 e alimenta o watchdog;
+  sem ninguém alimentando, a carga pode parar. Primeiro passo: mostrar esses registradores (só leitura).
+- `fb_flip=1` com a superfície mostrada marcada em uso (2026-11-10): 14 fps, 293 envios/s, GPU 59%, espera da tela
+  22 ms/s, copy/blit 0. Pior que sem flip (22-37 fps): o iOS parece redesenhar o quadro inteiro em outro buffer, e o
+  kernel espera o painel tomar cada troca. Mas **a rodinha não apareceu nenhuma vez** nessa rodada: pista de que a queda
+  do `backboardd` tem a ver com o caminho da cópia pela GPU. Flip fica como opção (`FLIP=1`), desligado.
+- `wallpaper_freeze=1` trazido do upstream (`oosexgang/hakios-xnu-kernel` 66b8e63ee e 348613f22): o SpringBoard troca o
+  papel de parede (camadas do PosterBoard redesenhadas a cada quadro) por uma imagem lida da superfície na tela
+  (`kern.redwood.fb_surface`), 20 s depois de chegar à tela inicial. `WALLFREEZE=1` no `run-ios-flash.sh`.
+- `WALLFREEZE=1`, primeira rodada (2026-11-10): o papel de parede virou imagem, mas os ícones da tela inicial ficaram
+  esbranquiçados (a "foto" pegou um estado de transição); na rolagem dos Ajustes nada mudou (21 fps, GPU 56%, copy
+  5.3 ms); a rodinha apareceu. Fica desligado.
+- Flip, terceira versão: as duas rodadas com flip deram 14-17 fps, como se cada quadro esperasse duas vezes o limite de
+  40 ms do `flipLatched` (o bit de flush do CTL0 parece não voltar a 0 a tempo no doha). Agora a espera é pelo contador
+  de quadros da interface DSI (INTF1 + 0xac) andar uma vez, e só depois da escrita. O HUD mostra "flip, N late" (esperas
+  que passaram de 25 ms).
+- **Flip, terceira versão: funcionou** (2026-11-10). Espera pelo contador de quadros da INTF1: "flip, 0 late" em
+  todas as fotos; Ajustes 29-59 fps (maior engasgo 17-57 ms; antes, com a cópia, 21-30 fps e 150-470 ms), tela
+  inicial 23 fps, Relógio 30; GPU 33-63%, copy/blit 0, espera da tela 6-156 ms/s. **Nenhuma rodinha.** Resta um pouco
+  de rastro e um atraso no desenho (o quadro aparece na varredura seguinte à troca).

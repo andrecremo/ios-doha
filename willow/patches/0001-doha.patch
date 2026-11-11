@@ -1,28 +1,32 @@
-From 320c3899259fb10a27c4e6b814907d9c833bc43b Mon Sep 17 00:00:00 2001
+From b0b852baa5b83476a8cacf4c930e051647ec34e4 Mon Sep 17 00:00:00 2001
 From: andrecremo <andreljsantos@gmail.com>
-Date: Tue, 10 Nov 2026 12:40:10 -0300
+Date: Tue, 10 Nov 2026 21:01:08 -0300
 Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
 
 ---
- xnu/files/bsd/dev/redwood_a610.c      |  20 +-
- xnu/files/bsd/dev/redwood_adreno.c    |   5 +-
- xnu/files/bsd/dev/redwood_battery.c   |  24 +
- xnu/files/bsd/dev/redwood_buttons.c   | 113 +++
- xnu/files/bsd/dev/redwood_focaltech.c | 943 ++++++++++++++++++++++++++
- xnu/files/bsd/dev/redwood_input.c     |   1 +
- xnu/files/bsd/dev/redwood_osm.c       |  23 +-
- xnu/files/bsd/dev/redwood_rpm.c       |   3 +-
- xnu/files/bsd/dev/redwood_ufs.c       |   5 +
- xnu/files/bsd/sys/redwood_input.h     |   1 +
- xnu/files/osfmk/arm64/gic_v3_irq.c    |  12 +-
- xnu/redwood.patch                     |   9 +-
- xnuloader/build.sh                    |   3 +-
- xnuloader/loader.c                    | 207 +++++-
- 14 files changed, 1351 insertions(+), 18 deletions(-)
+ xnu/files/bsd/dev/redwood_a610.c              |  32 +-
+ xnu/files/bsd/dev/redwood_adreno.c            |   5 +-
+ xnu/files/bsd/dev/redwood_battery.c           |  24 +
+ xnu/files/bsd/dev/redwood_buttons.c           | 139 +++
+ xnu/files/bsd/dev/redwood_focaltech.c         | 943 ++++++++++++++++++
+ xnu/files/bsd/dev/redwood_input.c             |   1 +
+ xnu/files/bsd/dev/redwood_osm.c               |  23 +-
+ xnu/files/bsd/dev/redwood_rpm.c               |  11 +-
+ xnu/files/bsd/dev/redwood_ufs.c               |   5 +
+ xnu/files/bsd/sys/redwood_input.h             |   1 +
+ .../iokit/Kernel/MiniIOMobileFramebuffer.cpp  | 177 +++-
+ xnu/files/iokit/Kernel/MiniIOSurface.cpp      |  31 +
+ xnu/files/iokit/Kernel/MiniIOSurface.h        |   2 +
+ xnu/files/iokit/Kernel/RedwoodGPU.cpp         |  41 +-
+ xnu/files/osfmk/arm64/gic_v3_irq.c            |  12 +-
+ xnu/redwood.patch                             |   9 +-
+ xnuloader/build.sh                            |   3 +-
+ xnuloader/loader.c                            | 290 +++++-
+ 18 files changed, 1727 insertions(+), 22 deletions(-)
  create mode 100644 xnu/files/bsd/dev/redwood_focaltech.c
 
 diff --git a/xnu/files/bsd/dev/redwood_a610.c b/xnu/files/bsd/dev/redwood_a610.c
-index 6ce395a..292e9e0 100644
+index 6ce395a..8188306 100644
 --- a/xnu/files/bsd/dev/redwood_a610.c
 +++ b/xnu/files/bsd/dev/redwood_a610.c
 @@ -917,7 +917,9 @@ scm3(const char *what, uint64_t function, uint64_t arguments, uint64_t first, ui
@@ -36,7 +40,26 @@ index 6ce395a..292e9e0 100644
  #define ZAP_REGION_SIZE         0x2000UL
  #define MDT_RELOCATABLE         (1u << 27)
  #define MDT_TYPE(flags)         (((flags) >> 24) & 7)
-@@ -2227,6 +2229,11 @@ redwood_osm_report(void)
+@@ -1169,6 +1171,18 @@ kept_time(uint32_t fence, uint32_t end)
+ 	ring((uint32_t)(at >> 32));
+ }
+ 
++/* How long the core worked on submission `fence`, in microseconds, if its times are still kept; 0 otherwise. */
++uint64_t a610_fence_us(uint32_t fence);
++uint64_t
++a610_fence_us(uint32_t fence)
++{
++	volatile uint64_t *times = (volatile uint64_t *)(kept_scratch() + KEPT_TIMES_AT);
++	uint32_t slot = fence % KEPT_TIMES;
++
++	to_memory(kept_scratch(), 4096);
++	return times[2 * slot + 1] > times[2 * slot] ? (times[2 * slot + 1] - times[2 * slot]) * 10 / 192 : 0;
++}
++
+ /* Add up the times of the submissions the core has finished since this was last done (redwood_adreno.c's gpu_times). */
+ static void
+ kept_times(void)
+@@ -2227,6 +2241,11 @@ redwood_osm_report(void)
  			said |= (uint8_t)(1u << core);
  			printf("osm: core %d: enable %x then %x, desired %x, cycles %x then %x; %u MHz if one add a cycle\n", core,
  			    seen[0], seen[1], seen[2], seen[3], seen[4], redwood_cpu_mhz[core]);
@@ -48,7 +71,7 @@ index 6ce395a..292e9e0 100644
  		}
  	}
  }
-@@ -2238,9 +2245,18 @@ redwood_a610_init(void)
+@@ -2238,9 +2257,18 @@ redwood_a610_init(void)
  	char device[16] = "";
  	thread_t thread;
  
@@ -141,10 +164,10 @@ index 6e80b4d..6bf0b72 100644
  	}
  	printf("battery: Qualcomm UEFI cache at pa %#llx; polling every 5 seconds\n", shared_pa);
 diff --git a/xnu/files/bsd/dev/redwood_buttons.c b/xnu/files/bsd/dev/redwood_buttons.c
-index 593ed6e..fde275e 100644
+index 593ed6e..fa0bd5a 100644
 --- a/xnu/files/bsd/dev/redwood_buttons.c
 +++ b/xnu/files/bsd/dev/redwood_buttons.c
-@@ -148,6 +148,12 @@ struct peripheral {
+@@ -148,6 +148,13 @@ struct peripheral {
  	bool            found;
  };
  static struct peripheral pon, pin;
@@ -153,11 +176,12 @@ index 593ed6e..fde275e 100644
 + * and its charger (qcom,qpnp-smb5: usb@1300, chgr@1000) and the gauge's SDAM (qg-sdam@b100) -- read and never written
 + */
 +static struct peripheral qg, usbin, chgr, qgsdam;
++static struct peripheral dcdc, misc;    /* the charger's DCDC (0x1100) and MISC (0x1600) blocks: read for the panel only */
 +static bool battery_direct;
  
  /*
   * Where each phone has it all. The power-on block comes in two kinds: redwood's is split in two
-@@ -170,6 +176,9 @@ static const struct board {
+@@ -170,6 +177,9 @@ static const struct board {
  	/* qcom,spmi@1c40000 of willow's device tree; qcom,power-on@800 of the PM6125, gpio_keys' GPIO5 of it */
  	{ "willow", 0x01c40000, 0x01c0a000, 0x03e00000, "the PM6125's power-on block", 0x008, 0x01, 0x05, 0x01, 0x02,
  	  "GPIO5 of the PM6125", 0x0c4 },
@@ -167,7 +191,7 @@ index 593ed6e..fde275e 100644
  };
  static const struct board *board = &boards[0];
  
-@@ -470,6 +479,86 @@ say_summary(void)
+@@ -470,6 +480,107 @@ say_summary(void)
  	    bus.reads ? bus.total_ns / bus.reads / 1000 : 0, bus.longest_ns / 1000, bus.failed);
  }
  
@@ -249,12 +273,33 @@ index 593ed6e..fde275e 100644
 +	}
 +	last_soc = soc;
 +	redwood_battery_direct(soc, mv, (usb & 0x10) != 0, state >= 1 && state <= 4, android);
++	{
++		uint8_t st[2] = { 0, 0 }, en = 0, cfg2 = 0, il = 0, icl = 0, pp = 0, wd[3] = { 0, 0, 0 }, sub = 0, ia[2] = { 0, 0 };
++		int64_t ma;
++
++		spmi_read(&chgr, 0x06, st, 2);
++		spmi_read(&chgr, 0x42, &en, 1);
++		spmi_read(&chgr, 0x51, &cfg2, 1);
++		spmi_read(&usbin, 0x40, &il, 1);
++		if (dcdc.found) {
++			spmi_read(&dcdc, 0x07, &icl, 1);
++			spmi_read(&dcdc, 0x0b, &pp, 1);
++		}
++		if (misc.found) {
++			spmi_read(&misc, 0x51, wd, 3);
++		}
++		spmi_read(&qg, 0x05, &sub, 1);
++		spmi_read(&qg, 0xc2, ia, 2);
++		ma = (int64_t)(int16_t)((uint16_t)ia[0] | (uint16_t)ia[1] << 8) * 305176 / 1000000;
++		redwood_status(REDWOOD_STATUS_WIFI, "chg S%02x/%02x E%02x C%02x U%02x L%02x P%02x W%02x/%02x T%02x I%lldmA",
++		    st[0], st[1], en, cfg2, il, icl, pp, wd[0], wd[2], sub, ma);
++	}
 +}
 +
  static void
  buttons_thread(void *parameter, __unused wait_result_t result)
  {
-@@ -498,6 +587,16 @@ buttons_thread(void *parameter, __unused wait_result_t result)
+@@ -498,6 +609,18 @@ buttons_thread(void *parameter, __unused wait_result_t result)
  	printf("buttons: step 2: look through the arbiter's table for the channels of the two peripherals\n");
  	find_channel(&pon, channels);
  	find_channel(&pin, channels);
@@ -263,6 +308,8 @@ index 593ed6e..fde275e 100644
 +		find_channel(&usbin, channels);
 +		find_channel(&chgr, channels);
 +		find_channel(&qgsdam, channels);
++		find_channel(&dcdc, channels);
++		find_channel(&misc, channels);
 +		battery_direct = qg.found && usbin.found && chgr.found;
 +		if (battery_direct) {
 +			battery_look();
@@ -271,7 +318,7 @@ index 593ed6e..fde275e 100644
  	if (steps < 3) {
  		goto out;
  	}
-@@ -540,6 +639,9 @@ buttons_thread(void *parameter, __unused wait_result_t result)
+@@ -540,6 +663,9 @@ buttons_thread(void *parameter, __unused wait_result_t result)
  	    volume_up.usable ? " volume-up" : "", volume_down.usable ? " volume-down" : "", POLL_MS);
  	for (unsigned tick = 1;; tick++) {
  		buttons_poll();
@@ -281,7 +328,7 @@ index 593ed6e..fde275e 100644
  		/* once early on as well: a short run is to say what the reads cost too */
  		if (tick % MINUTE_TICKS == 0 || tick == 10 * 1000 / POLL_MS) {
  			say_summary();
-@@ -595,6 +697,17 @@ redwood_buttons_init(void)
+@@ -595,6 +721,19 @@ redwood_buttons_init(void)
  		}
  	}
  	pon = (struct peripheral){ .name = board->pon_name, .id = board->pon_id };
@@ -294,6 +341,8 @@ index 593ed6e..fde275e 100644
 +			usbin = (struct peripheral){ .name = "the PMI632's USB input", .id = 0x213 };
 +			chgr = (struct peripheral){ .name = "the PMI632's charger", .id = 0x210 };
 +			qgsdam = (struct peripheral){ .name = "the PMI632's gauge SDAM", .id = 0x2b1 };
++			dcdc = (struct peripheral){ .name = "the PMI632's charger DCDC", .id = 0x211 };
++			misc = (struct peripheral){ .name = "the PMI632's charger MISC", .id = 0x216 };
 +		}
 +	}
  	pin = (struct peripheral){ .name = board->pin_name, .id = board->pin_id };
@@ -1309,10 +1358,25 @@ index 1546703..968f572 100755
  	}
  	if (kernel_thread_start(osm_thread, NULL, &thread) == KERN_SUCCESS) {
 diff --git a/xnu/files/bsd/dev/redwood_rpm.c b/xnu/files/bsd/dev/redwood_rpm.c
-index 7d3bb87..3efe4b6 100644
+index 7d3bb87..cd09139 100644
 --- a/xnu/files/bsd/dev/redwood_rpm.c
 +++ b/xnu/files/bsd/dev/redwood_rpm.c
-@@ -429,7 +429,8 @@ redwood_rpm_init(void)
+@@ -405,7 +405,13 @@ rpm_thread(void *parameter, __unused wait_result_t result)
+ 
+ 	printf("rpm: step 2: the memory bus\n");
+ 	ipc = ml_io_map(IPC_PHYS, 0x1000);
+-	if (!rpm_ask("the memory bus (bimc)", TYPE_MEM_CLK, 0, 400000)) {
++	uint32_t bimc_khz = 400000;
++
++	if (PE_parse_boot_argn("rpm_bimc", &bimc_khz, sizeof(bimc_khz)) && (bimc_khz < 100000 || bimc_khz > 1804000)) {
++		printf("rpm: rpm_bimc=%u kHz is outside 100000-1804000: 400000\n", bimc_khz);
++		bimc_khz = 400000;
++	}
++	if (!rpm_ask("the memory bus (bimc)", TYPE_MEM_CLK, 0, bimc_khz)) {
+ 		goto out;
+ 	}
+ 	fifo_say(&tx);
+@@ -429,7 +435,8 @@ redwood_rpm_init(void)
  	char device[16] = "";
  	thread_t thread;
  
@@ -1350,6 +1414,415 @@ index 3e701f0..deb3dd6 100644
  void redwood_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
  void redwood_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
  void redwood_ufs_report(const char *when); /* where reading the storage has spent its time so far */
+diff --git a/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index 65a99ee..9cf5c60 100644
+--- a/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -25,6 +25,7 @@
+ #include <libkern/c++/OSSymbol.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <kern/thread_call.h>
++#include <sys/sysctl.h>
+ #include <kern/thread.h>
+ #include <kern/clock.h>
+ #include <pexpert/pexpert.h>
+@@ -174,12 +175,30 @@ static TUNABLE(uint32_t, gHud, "fb_hud", 0);
+  * (RedwoodGPUBlitToPanel), not row by row by the processors; anything else is copied as before.
+  */
+ static TUNABLE(uint32_t, gFBGPU, "fb_gpu", 0);
++/*
++ * Boot-arg fb_flip=1 (doha): a frame of one layer, the panel's size and unscaled, shown where the GPU drew it, by
++ * pointing the display controller's pipe at the surface (VIG0's picture address and stride, flushed through CTL0;
++ * taken at the next refresh), not copied; the HUD is drawn into the surface first. Anything else as before.
++ */
++static TUNABLE(uint32_t, gFlip, "fb_flip", 0);
++#define MDSS_PHYS               0x05E00000ull   /* doha's trinket-sde.dtsi, mdp_phys */
++#define MDSS_SIZE               0x80000
++#define VIG0_ADDR               ((0x5000 + 0x14) / 4)   /* SSPP_SRC0_ADDR */
++#define VIG0_STRIDE             ((0x5000 + 0x24) / 4)   /* SSPP_SRC_YSTRIDE0 */
++#define CTL0_FLUSH              ((0x2000 + 0x18) / 4)   /* bit 0: VIG0 */
++#define INTF1_FRAMES            ((0x6B800 + 0xac) / 4)  /* the DSI interface's INTF_FRAME_COUNT */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" void flush_dcache(vm_offset_t addr, unsigned count, int phys);
+ extern "C" {
+ extern unsigned char iso_font[256 * 16];
+ enum { kStatusScreen = 0, kStatusParts = 10 };  /* REDWOOD_STATUS_SCREEN, REDWOOD_STATUS_PARTS (sys/redwood_input.h) */
+ void redwood_status(unsigned part, const char *format, ...) __printflike(2, 3);
+ bool redwood_status_line(unsigned part, char *line, size_t size);
+ }
++/* kern.redwood.fb_surface: the IOSurface on the panel, for a picture of what is there (SpringBoard's wallpaper_freeze=1) */
++SYSCTL_DECL(_kern_redwood);
++static uint32_t gShownSurface;
++SYSCTL_UINT(_kern_redwood, OID_AUTO, fb_surface, CTLFLAG_RD | CTLFLAG_LOCKED, &gShownSurface, 0, "the IOSurface last put on the panel");
+ #define SWAP_QUEUE              2                       /* frames that may wait for the panel at most (fb_queue) */
+ static TUNABLE(uint32_t, gQueue, "fb_queue", 2);
+ static inline unsigned
+@@ -323,9 +342,17 @@ public:
+ 	void reportFrameTimes(void);
+ 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
+ 	void drawHud(uint64_t began);
++	bool flipTo(MiniIOSurface * s, const int32_t * src, const int32_t * dst, uint64_t began);
++	void flipBack(void);
++	bool flipLatched(void);
++	MiniIOSurface * fFlipped;               /* fb_flip=1: the surface the pipe shows, held until the next is taken */
++	volatile uint32_t * fMdss;
++	uint32_t        fFlipHomeAddr, fFlipHomeStride, fFlipFrames, fFlipMisses;
++	bool            fFlipTried;
+ 	uint64_t        fHudLast;               /* drawHud(): when the frame before was shown */
+ 	uint64_t        fHudSecond;             /* ... the second being counted, and its frames */
+ 	uint32_t        fHudFrames, fHudFps, fHudIntervalUs, fHudDriverUs;
++	uint32_t        fHudWorstUs, fHudWorstShownUs;  /* the longest gap of the second being counted, and of the last */
+ 	uint32_t *      fHudPixels;             /* ... the panel as last drawn, copied into every frame */
+ 	uint32_t        fGPUFrames;             /* fb_gpu=1: frames the GPU copied onto the panel (in the 5-second line) */
+ 	uint64_t        fHudDrawn;              /* ... when it was drawn: twice a second */
+@@ -758,17 +785,27 @@ IOMobileFramebuffer::drawHud(uint64_t began)
+ 	if (fHudLast != 0) {
+ 		absolutetime_to_nanoseconds(now - fHudLast, &ns);
+ 		fHudIntervalUs = (uint32_t) (ns / 1000);
++		if (fHudIntervalUs < 500000 && fHudIntervalUs > fHudWorstUs) {
++			fHudWorstUs = fHudIntervalUs;
++		}
+ 	}
+ 	fHudLast = now;
+ 	fHudFrames++;
+ 	absolutetime_to_nanoseconds(now - fHudSecond, &ns);
+ 	if (fHudSecond == 0 || ns >= NSEC_PER_SEC) {
+ 		fHudFps = fHudSecond == 0 ? 0 : (uint32_t) ((uint64_t) fHudFrames * NSEC_PER_SEC / ns);
++		fHudWorstShownUs = fHudWorstUs;
++		fHudWorstUs = 0;
+ 		fHudFrames = 0;
+ 		fHudSecond = now;
+ 	}
+-	redwood_status(kStatusScreen, "%u fps; %u ms a frame, %u ms of it showing it", fHudFps, fHudIntervalUs / 1000,
+-	    fHudDriverUs / 1000);
++	if (fFlipped != NULL) {
++		redwood_status(kStatusScreen, "%u fps; longest gap %u ms; flip, %u late", fHudFps, fHudWorstShownUs / 1000,
++		    fFlipMisses);
++	} else {
++		redwood_status(kStatusScreen, "%u fps; longest gap %u ms; %u ms showing it", fHudFps, fHudWorstShownUs / 1000,
++		    fHudDriverUs / 1000);
++	}
+ 	if (left + width > fPanelWidth || top + height > fPanelHeight) {
+ 		return;
+ 	}
+@@ -1034,6 +1071,117 @@ IOMobileFramebuffer::presenter(void)
+ 	}
+ }
+ 
++/*
++ * fb_flip=1: wait (25 ms at most) until the scan after the flush has begun: the DSI interface's frame counter has moved
++ * on from what it was when the flush was written. Registers flushed are taken at the start of a scan.
++ */
++bool
++IOMobileFramebuffer::flipLatched(void)
++{
++	uint64_t t0 = mach_absolute_time(), limit;
++	uint32_t frames = fMdss[INTF1_FRAMES];
++
++	nanoseconds_to_absolutetime(25 * NSEC_PER_MSEC, &limit);
++	while (fMdss[INTF1_FRAMES] == frames) {
++		if (mach_absolute_time() - t0 > limit) {
++			fFlipMisses++;
++			return false;
++		}
++		delay(200);
++	}
++	return true;
++}
++
++/*
++ * fb_flip=1: the pipe pointed at surface s, if s can be shown as it is; held until the next one is taken, the one
++ * before let go once the controller has taken this. False: the frame is to be copied.
++ */
++bool
++IOMobileFramebuffer::flipTo(MiniIOSurface * s, const int32_t * src, const int32_t * dst, uint64_t began)
++{
++	IOByteCount length = 0;
++	uint64_t phys, bytes;
++	MiniIOSurface * held;
++
++	if (fMdss == NULL) {
++		char device[16] = "";
++
++		if (fFlipTried) {
++			return false;
++		}
++		fFlipTried = true;
++		if (!PE_parse_boot_arg_str("device", device, sizeof(device)) || strcmp(device, "doha") != 0 ||
++		    (fMdss = (volatile uint32_t *) ml_io_map(MDSS_PHYS, MDSS_SIZE)) == NULL) {
++			return false;
++		}
++		fFlipHomeAddr = fMdss[VIG0_ADDR];
++		fFlipHomeStride = fMdss[VIG0_STRIDE];
++		IOLog("MiniIOMobileFramebuffer: fb_flip=1: VIG0 shows %#x (stride %u); frames will be shown where drawn\n",
++		    fFlipHomeAddr, fFlipHomeStride);
++	}
++	if (s == NULL || s->client != NULL || s->memory == NULL || s->info.bytesPerElement != 4 || s->info.planeCount != 0 ||
++	    s->info.width != fPanelWidth || s->info.height != fPanelHeight || fWidth != fPanelWidth || fHeight != fPanelHeight ||
++	    !(src[2] <= 0 || src[3] <= 0 || (src[0] == 0 && src[1] == 0 && src[2] == (int32_t) fPanelWidth &&
++	    src[3] == (int32_t) fPanelHeight)) ||
++	    !(dst[2] <= 0 || dst[3] <= 0 || (dst[0] == 0 && dst[1] == 0 && dst[2] == (int32_t) fWidth && dst[3] == (int32_t) fHeight)) ||
++	    (s->info.bytesPerRow & 63) != 0 || s->info.bytesPerRow > 0xffff) {
++		return false;
++	}
++	bytes = (uint64_t) s->info.bytesPerRow * s->info.height;
++	phys = s->memory->getPhysicalSegment((IOByteCount) (s->pixels() - s->kbase), &length, kIOMemoryMapperNone);
++	if (phys == 0 || length < bytes || phys + bytes > 0x100000000ull) {
++		fFlipMisses++;
++		return false;
++	}
++	if (gHud) {
++		uint8_t * base = fBase;
++		uint32_t rowBytes = fRowBytes;
++
++		fBase = s->pixels();
++		fRowBytes = s->info.bytesPerRow;
++		drawHud(began);
++		fBase = base;
++		fRowBytes = rowBytes;
++		flush_dcache((vm_offset_t) s->pixels(), (unsigned) (s->info.bytesPerRow * 512), 0);
++	}
++	if ((held = MiniIOSurfaceCopy(s->sid)) == NULL) {
++		return false;
++	}
++	MiniIOSurfaceDisplayUse(held, 1);
++	fMdss[VIG0_STRIDE] = s->info.bytesPerRow;
++	fMdss[VIG0_ADDR] = (uint32_t) phys;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	fMdss[CTL0_FLUSH] = 1;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	flipLatched();
++	if (fFlipped != NULL) {
++		MiniIOSurfaceDisplayUse(fFlipped, -1);
++		MiniIOSurfaceDrop(fFlipped);
++	}
++	fFlipped = held;
++	fFlipFrames++;
++	gShownSurface = s->sid;
++	return true;
++}
++
++/* fb_flip=1: the pipe back on the panel's memory (a frame has just been copied there) */
++void
++IOMobileFramebuffer::flipBack(void)
++{
++	if (fFlipped == NULL || fMdss == NULL) {
++		return;
++	}
++	fMdss[VIG0_STRIDE] = fFlipHomeStride;
++	fMdss[VIG0_ADDR] = fFlipHomeAddr;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	fMdss[CTL0_FLUSH] = 1;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	flipLatched();
++	MiniIOSurfaceDisplayUse(fFlipped, -1);
++	MiniIOSurfaceDrop(fFlipped);
++	fFlipped = NULL;
++}
++
+ /* A swap's surfaces onto the panel, once the GPU is done with them. */
+ void
+ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+@@ -1101,6 +1249,26 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 		    swapWord(swap, SWAP_ID), fSwapsShown, swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)),
+ 		    swapWord(swap, SWAP_SURFACE(2)), swapWord(swap, SWAP_SURFACE(3)), set, swapWord(swap, SWAP_LAYERS_CLEARED));
+ 	}
++	bool unflip = false;
++
++	if (gFlip && fGraphics) {
++		bool alone = surfaces[0] != NULL;
++
++		for (unsigned layer = 1; layer < SWAP_LAYERS; layer++) {
++			alone = alone && swapWord(swap, SWAP_SURFACE(layer)) == 0;
++		}
++		if (alone) {
++			int32_t src[4], dst[4];
++
++			memcpy(src, swap + SWAP_SOURCE(0), sizeof(src));
++			memcpy(dst, swap + SWAP_DEST(0), sizeof(dst));
++			if (flipTo(surfaces[0], src, dst, began)) {
++				layers = 1;
++				goto flipped;
++			}
++		}
++		unflip = fFlipped != NULL;
++	}
+ 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+ 		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
+ 		int32_t src[4], dst[4];
+@@ -1146,12 +1314,17 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 			drawLayer(s, src, dst);
+ 			if (layer == 0) {
+ 				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
++				gShownSurface = sid;
+ 			}
+ 		}
+ 	}
+ 	if (gHud && fGraphics) {
+ 		drawHud(began);
+ 	}
++	if (unflip) {
++		flipBack();
++	}
++flipped:
+ 	drawn = mach_absolute_time();
+ 	if (recorded != NULL) {
+ 		record(recorded);
+diff --git a/xnu/files/iokit/Kernel/MiniIOSurface.cpp b/xnu/files/iokit/Kernel/MiniIOSurface.cpp
+index 579ea6c..944219c 100644
+--- a/xnu/files/iokit/Kernel/MiniIOSurface.cpp
++++ b/xnu/files/iokit/Kernel/MiniIOSurface.cpp
+@@ -208,6 +208,22 @@ surfaceMemory(vm_size_t bytes)
+ 			bzero(memory->getBytesNoCopy(), gSurfaceClear ? bytes : PAGE_SIZE);
+ 		}
+ 	}
++	{
++		/*
++		 * fb_flip=1 (MiniIOMobileFramebuffer.cpp): a frame-sized surface in memory of one piece below 4 GB, which the
++		 * display controller can be pointed at; as before if there is no such piece
++		 */
++		static int flip = -1;
++		uint32_t value = 0;
++
++		if (flip < 0) {
++			flip = PE_parse_boot_argn("fb_flip", &value, sizeof(value)) && value != 0;
++		}
++		if (memory == NULL && flip && bytes >= (8u << 20)) {
++			memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut |
++			    kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, bytes, 0xfffff000ull);
++		}
++	}
+ 	if (memory == NULL) {
+ 		memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, bytes,
+ 		    PAGE_SIZE);
+@@ -764,6 +780,21 @@ MiniIOSurfaceDrop(MiniIOSurface * s)
+ 	IOLockUnlock(gSurfaceLock);
+ }
+ 
++/* The display shows the surface (delta 1) or has stopped (-1): its use count, which IOSurfaceIsInUse reads, says so */
++void
++MiniIOSurfaceDisplayUse(MiniIOSurface * s, int delta)
++{
++	if (s == NULL || gSurfaceLock == NULL) {
++		return;
++	}
++	IOLockLock(gSurfaceLock);
++	if (delta > 0 || s->useCount[0] != 0) {
++		s->useCount[0] += delta;
++		s->shared()->useCount = (uint64_t) s->useCount[1] << 32 | s->useCount[0];
++	}
++	IOLockUnlock(gSurfaceLock);
++}
++
+ MiniIOSurface *
+ MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint32_t pixelFormat)
+ {
+diff --git a/xnu/files/iokit/Kernel/MiniIOSurface.h b/xnu/files/iokit/Kernel/MiniIOSurface.h
+index 79216b3..f2aa6df 100644
+--- a/xnu/files/iokit/Kernel/MiniIOSurface.h
++++ b/xnu/files/iokit/Kernel/MiniIOSurface.h
+@@ -178,6 +178,8 @@ bool            RedwoodGPUBlitToPanel(MiniIOSurface * surface, uint32_t sx, uint
+     uint32_t dx, uint32_t dy, uint64_t panelPhys, uint32_t rowBytes, uint32_t panelHeight);
+ MiniIOSurface * MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint32_t pixelFormat);
+ void            MiniIOSurfaceDrop(MiniIOSurface * surface);
++/* The display shows a surface where it is (delta 1), or has stopped (-1): counted as a use (IOSurfaceIsInUse) */
++void            MiniIOSurfaceDisplayUse(MiniIOSurface * surface, int delta);
+ /* A Mach send right for the surface in the task (what IOSurfaceCreateMachPort gives); 0 on failure. */
+ mach_port_name_t MiniIOSurfaceMakeSendRight(task_t task, MiniIOSurface * surface);
+ 
+diff --git a/xnu/files/iokit/Kernel/RedwoodGPU.cpp b/xnu/files/iokit/Kernel/RedwoodGPU.cpp
+index 851cf43..bf3783f 100644
+--- a/xnu/files/iokit/Kernel/RedwoodGPU.cpp
++++ b/xnu/files/iokit/Kernel/RedwoodGPU.cpp
+@@ -65,6 +65,8 @@ extern uint32_t gpu_log;
+ bool redwood_gpu_done(uint32_t fence);
+ uint32_t redwood_gpu_last(void);
+ void redwood_osm_report(void);
++void redwood_status(unsigned part, const char *format, ...) __printflike(2, 3);
++uint64_t a610_fence_us(uint32_t fence);
+ void redwood_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
+ void redwood_gpu_report(const char * why);
+ bool redwood_gpu_recover(void);
+@@ -229,6 +231,9 @@ static struct {
+ 	uint64_t prepWaiting;                   /* ... and the time those waited */
+ 	uint64_t making;                        /* ... and the time it took to make the others */
+ } gGPUStat;
++static uint64_t gWaitShow, gWaitBlit, gWaitApp;         /* the panel's GPU line: waits by who waited (processor clock) */
++static uint64_t gBlitGpuUs;                             /* ... and the GPU's own time for the frames it copied onto the panel */
++static uint32_t gBlitCount;
+ 
+ /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
+ static bool
+@@ -295,12 +300,16 @@ MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
+ 		gAnnounced.waited++;
+ 		gAnnounced.late += surface->delivered != surface->announced;
+ 		gAnnounced.waiting += mach_absolute_time() - began;
++		gWaitShow += mach_absolute_time() - began;
+ 	}
+ 	fence = surface->drawn;
+ 
+ 	if (fence != 0 && gGPULock != NULL) {
+ 		IOLockLock(gGPULock);
++		uint64_t showBegan = mach_absolute_time();
++
+ 		done = !redwood_gpu_ready() || gpuWait(fence, milliseconds);
++		gWaitShow += mach_absolute_time() - showBegan;
+ 		IOLockUnlock(gGPULock);
+ 	}
+ 	return done;
+@@ -534,7 +543,16 @@ RedwoodGPUBlitToPanel(MiniIOSurface * s, uint32_t sx, uint32_t sy, uint32_t w, u
+ 	blitEvent(words, &n, 0x1d);                                                     /* the colour cache out to memory */
+ 	redwood_gpu_to_memory(words, n * 4);
+ 	fence = redwood_gpu_submit(&gBlitCommandsAt, &n, 1);
+-	done = fence != 0 && gpuWait(fence, 200);
++	{
++		uint64_t blitBegan = mach_absolute_time();
++
++		done = fence != 0 && gpuWait(fence, 200);
++		gWaitBlit += mach_absolute_time() - blitBegan;
++		if (done) {
++			gBlitGpuUs += a610_fence_us(fence);
++			gBlitCount++;
++		}
++	}
+ 	IOLockUnlock(gGPULock);
+ 	if (!done && gBlitSaid++ < 4) {
+ 		IOLog("RedwoodGPU: a frame onto the panel by the GPU did not finish (submission %u)\n", fence);
+@@ -1381,6 +1399,26 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 			bzero(&gAnnounced, sizeof(gAnnounced));
+ 		}
+ 		absolutetime_to_nanoseconds(gGPUStat.prepWaiting, &prepWaiting);
++		{
++			uint64_t s = nanos / 1000000;   /* the window, in ms */
++
++			if (s != 0) {
++				uint64_t show, blit, app;
++
++				absolutetime_to_nanoseconds(gWaitShow, &show);
++				absolutetime_to_nanoseconds(gWaitBlit, &blit);
++				absolutetime_to_nanoseconds(gWaitApp, &app);
++				uint64_t copy = gBlitCount ? gBlitGpuUs / gBlitCount : 0;      /* us, one copy onto the panel */
++
++				(void)app;
++				redwood_status(3 /* REDWOOD_STATUS_GPU */, "busy %llu%% %llu/s; copy %llu.%llums; wait show %llu blit %llu",
++				    worked / 10 / s, (uint64_t)gGPUStat.submissions * 1000 / s, copy / 1000, copy / 100 % 10,
++				    show / 1000 / s, blit / 1000 / s);
++				gWaitShow = gWaitBlit = gWaitApp = 0;
++				gBlitGpuUs = 0;
++				gBlitCount = 0;
++			}
++		}
+ 		IOLog("RedwoodGPU: cpu-prep: %u asked, %u waited for the GPU, %llu us each\n", gGPUStat.preps, gGPUStat.prepsWaited,
+ 		    gGPUStat.prepsWaited ? prepWaiting / NSEC_PER_USEC / gGPUStat.prepsWaited : 0);
+ 		IOLog("RedwoodGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
+@@ -1560,6 +1598,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 			}
+ 		}
+ 		IOLockUnlock(gGPULock);
++		gWaitApp += mach_absolute_time() - waitBegan;
+ 		slowWait("fence", waitBegan);
+ 		break;
+ 	case kMsmGemMadvise:
 diff --git a/xnu/files/osfmk/arm64/gic_v3_irq.c b/xnu/files/osfmk/arm64/gic_v3_irq.c
 index ce5452a..00b41f0 100644
 --- a/xnu/files/osfmk/arm64/gic_v3_irq.c
@@ -1443,7 +1916,7 @@ index 3073c14..b28c3d3 100755
  # is in the middle of the phone's largest block of RAM, which XNU needs in one piece. Another device
  # whose largest block holds 0xA1000000 sets LOADER_BASE (common/devices/<name>.conf) to free RAM outside it.
 diff --git a/xnuloader/loader.c b/xnuloader/loader.c
-index 256397e..461a4fc 100644
+index 256397e..2cd046d 100644
 --- a/xnuloader/loader.c
 +++ b/xnuloader/loader.c
 @@ -15,7 +15,9 @@
@@ -1548,7 +2021,7 @@ index 256397e..461a4fc 100644
  				}
  				break;
  			}
-@@ -3321,16 +3370,144 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -3321,16 +3370,227 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  			break;
  		}
  	}
@@ -1653,6 +2126,89 @@ index 256397e..461a4fc 100644
 +			}
 +		}
 +		/*
++		 * doha, "mdssdump=1": the display controller (MDSS at 0x5E00000; its blocks where doha's own trinket-sde.dtsi
++		 * has them) as the UEFI left it scanning out, read only: the three source pipes (VIG0 +0x5000, DMA0 +0x25000,
++		 * DMA1 +0x27000: size 0x00, source xy 0x08, out size 0x0c, the picture's address 0x14, its stride 0x24, the
++		 * format 0x30), CTL0 (+0x2000), the mixer LM0 (+0x45000) and the DSI interface (+0x6B800); 30 s to read
++		 */
++		for (const char *c = pi.cmdline; *c; c++) {
++			if (starts_with(c, "mdssdump=1") && (c == pi.cmdline || c[-1] == ' ')) {
++				static const struct {
++					const char *name;
++					uint64_t at;
++					uint32_t words;
++				} blocks[] = {
++					{ "VIG0", 0x05E05000ULL, 16 }, { "DMA0", 0x05E25000ULL, 16 }, { "DMA1", 0x05E27000ULL, 16 },
++					{ "CTL0", 0x05E02000ULL, 16 }, { "LM0", 0x05E45000ULL, 16 }, { "INTF1", 0x05E6B800ULL, 28 },
++				};
++
++				print("mdssdump=1: the display controller, read only; 0x5E00000: %x\n",
++				    (uint64_t)*(volatile uint32_t *)(uintptr_t)0x05E00000ULL);
++				for (int b = 0; b < 6; b++) {
++					volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)blocks[b].at;
++
++					print("%s at %x:\n", blocks[b].name, blocks[b].at);
++					for (uint32_t i = 0; i < blocks[b].words; i += 4) {
++						print("  +%x: %x %x %x %x\n", (uint64_t)(4 * i), (uint64_t)r[i], (uint64_t)r[i + 1],
++						    (uint64_t)r[i + 2], (uint64_t)r[i + 3]);
++					}
++				}
++				print("mdssdump=1: 30 s to read this\n");
++				BS->stall(30000000);
++				break;
++			}
++		}
++		/*
++		 * doha, "fliptest=1": a picture of eight coloured bands in RAM of the loader's (below 4 GB: the pipe takes 32
++		 * bits), shown for 5 s by pointing VIG0's picture address (0x5E05000 + 0x14, read by mdssdump=1 as 0x5c000000)
++		 * at it and flushing VIG0 through CTL0 (+0x18, bit 0; the pipe takes it at the next frame), then put back. Same
++		 * size, stride (4320) and format as the UEFI's picture. If the bands show, the controller reads physical memory
++		 * wherever it is, and a frame of iOS's can be shown where it was drawn.
++		 */
++		for (const char *c = pi.cmdline; *c; c++) {
++			if (starts_with(c, "fliptest=1") && (c == pi.cmdline || c[-1] == ' ')) {
++				const uint64_t bytes = 4320ULL * 2280, pages = (bytes + 0xFFF) >> 12;
++				static const uint32_t colours[8] = { 0xffff0000, 0xff00ff00, 0xff0000ff, 0xffffffff, 0xffffff00, 0xff00ffff,
++				    0xffff00ff, 0xff808080 };
++				volatile uint32_t *vig = (volatile uint32_t *)(uintptr_t)0x05E05000ULL;
++				volatile uint32_t *ctl = (volatile uint32_t *)(uintptr_t)0x05E02000ULL;
++				uint64_t buf = 0xFFFFFFFFULL;
++				uint32_t old;
++
++				if (EFI_ERROR(BS->allocate_pages(AllocateMaxAddress, EfiLoaderData, pages, &buf))) {
++					print("fliptest=1: no %d pages below 4 GB\n", pages);
++					BS->stall(10000000);
++					break;
++				}
++				for (uint64_t y = 0; y < 2280; y++) {
++					uint32_t *row = (uint32_t *)(uintptr_t)(buf + y * 4320);
++
++					for (uint64_t x = 0; x < 1080; x++) {
++						row[x] = colours[y * 8 / 2280];
++					}
++				}
++				flush_dcache(buf, buf + bytes);
++				old = vig[0x14 / 4];
++				print("fliptest=1: VIG0's picture from %x to %x for 5 s\n", (uint64_t)old, buf);
++				BS->stall(2000000);
++				vig[0x14 / 4] = (uint32_t)buf;
++				__asm__ volatile ("dsb sy" ::: "memory");
++				ctl[0x18 / 4] = 1;
++				__asm__ volatile ("dsb sy" ::: "memory");
++				BS->stall(5000000);
++				vig[0x14 / 4] = old;
++				__asm__ volatile ("dsb sy" ::: "memory");
++				ctl[0x18 / 4] = 1;
++				__asm__ volatile ("dsb sy" ::: "memory");
++				BS->stall(100000);
++				print("fliptest=1: back; VIG0 +14 reads %x, CTL0 flush %x; 15 s to read this\n", (uint64_t)vig[0x14 / 4],
++				    (uint64_t)ctl[0x18 / 4]);
++				BS->free_pages(buf, pages);
++				BS->stall(15000000);
++				break;
++			}
++		}
++		/*
 +		 * doha, "uefilog=1": the lines of the UEFI's own log (dohaPkg's "Log Buffer", 32 KB at 0x5FFF7000, where
 +		 * DEBUG () goes) that say "harg" or "attery" -- why Qualcomm's charger drivers did not come up -- for 25 s
 +		 */
@@ -1696,7 +2252,7 @@ index 256397e..461a4fc 100644
  		for (const char *c = pi.cmdline; *c; c++) {
  			if (starts_with(c, "osm=") && (c == pi.cmdline || c[-1] == ' ') && (c[4] == '1' || c[4] == '2') &&
  			    (c[5] == 0 || c[5] == ' ')) {
-@@ -3341,6 +3518,20 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -3341,6 +3601,20 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  				for (int k = 0; k < 2; k++) {
  					volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)osm[k];
  
@@ -1717,7 +2273,7 @@ index 256397e..461a4fc 100644
  					for (int core = 0; core < 4; core++) {
  						r[0x920 / 4 + core] = row[k];
  					}
-@@ -4503,7 +4694,8 @@ efi_main(efi_handle image, efi_system_table *st)
+@@ -4503,7 +4777,8 @@ efi_main(efi_handle image, efi_system_table *st)
  		SCREEN.height = GOP->mode->info->height;
  		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
  		for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++)
@@ -1727,7 +2283,7 @@ index 256397e..461a4fc 100644
  				PLAT = platforms[i];
  		if (PLAT == &platform_qemu_virt)
  			ramfb_phone_screen();
-@@ -4524,6 +4716,11 @@ efi_main(efi_handle image, efi_system_table *st)
+@@ -4524,6 +4799,11 @@ efi_main(efi_handle image, efi_system_table *st)
  	if (have_payload) {
  		run_kernel(0, 0);
  	}

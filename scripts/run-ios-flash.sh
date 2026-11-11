@@ -115,6 +115,28 @@ GPUARG=; [ "${GPU:-0}" = 1 ] && GPUARG=" gpu=1"; [ "${FBGPU:-0}" = 1 ] && GPUARG
 # from up to 1231 ms a frame to 37 ms with it (willow's SIGBUS with it was with /var on the disk; here /var is in RAM)
 [ "${GL:-0}" = 1 ] && GPUARG=" gpu=1 fb_gpu=1 fbwidth=1080 fbheight=2280 sb_statusbar=1"
 [ "${GL:-0}" = 1 ] && [ "${GLASYNC:-1}" = 1 ] && GPUARG="$GPUARG glasync=1"
+# GPUMHZ=N (default 900): a610_mhz=N, the 3D core at a speed of gpucc-trinket.c's table (320 465 600 745 820 900 950;
+# the CX rail at that speed's level through the RPM). 900 over the driver's 745 (2026-11-10): scrolling Settings, the
+# longest gap between frames from 465 ms to 75-141 ms, the GPU still 80-92% busy
+GPUARG="$GPUARG a610_mhz=${GPUMHZ:-900}"
+# BIMC=kHz (default 1804000): rpm_bimc=kHz, the memory bus asked of the RPM (the kernel's own 400000 without it).
+# doha's kernel votes 1353000 with the GPU at 745 MHz and 1804000 at 900 (trinket-gpu.dtsi); at 1804000 a frame's
+# copy onto the panel took the GPU 5.0 ms against 6.7 (2026-11-10)
+GPUARG="$GPUARG rpm_bimc=${BIMC:-1804000}"
+# MDSSDUMP=1: mdssdump=1, the loader shows the display controller's source pipes, CTL0, LM0 and the DSI interface as
+# the UEFI keeps them (read only) for 30 s before the kernel
+[ "${MDSSDUMP:-0}" = 1 ] && GPUARG="$GPUARG mdssdump=1"
+# FLIPTEST=1: fliptest=1, the loader shows eight coloured bands for 5 s by pointing the display's pipe (VIG0) at them,
+# then puts it back: whether a picture anywhere in RAM can be shown without the GPU's copy
+[ "${FLIPTEST:-0}" = 1 ] && GPUARG="$GPUARG fliptest=1"
+# FLIP=1 (default; FLIP=0 copies every frame as before): fb_flip=1, a frame of one layer shown where the GPU drew it
+# (the display's pipe pointed at it) instead of copied onto the panel's memory by the GPU. 2026-11-10: Settings'
+# scroll 29-59 fps against 21-30, the longest gap 17-57 ms against 150-470, and no SpringBoard restart (the black
+# screen with the spinner) in any run; the HUD's Screen line says "flip, N late" while it is
+[ "${FLIP:-1}" = 1 ] && GPUARG="$GPUARG fb_flip=1"
+# WALLFREEZE=1: wallpaper_freeze=1, SpringBoard shows the wallpaper as one still picture read off the panel (20 s
+# in, at the home screen; the icons blink once) instead of drawing its layers every frame; 2: the wallpaper hidden
+[ -n "$WALLFREEZE" ] && GPUARG="$GPUARG wallpaper_freeze=$WALLFREEZE"
 # CPUMASK=M: the cores by mask instead of cpus=. The bits are positions in the loader's list, the boot core first
 # (bit 0, which must be set: the kernel panics without it), then by distance from it: 3, 4, 2, 5, 1, 6, 7 (core 0 is
 # the loader's). 0x15: the Silver cores 3, 2, 1 alone, without the Gold ones the firmware leaves at 300 MHz.
