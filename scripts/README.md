@@ -14,7 +14,7 @@ from the phone or from willow-hackios is in this repository: the scripts fetch o
 | `doha_userland_edit.py` | Puts the FT8719's firmware into the small image and gives `var_store` doha's store (`../willow/patches/userland/`) |
 
 `run-ios-flash.sh` options: `GL=1` (the GPU: `gpu=1 fb_gpu=1 glasync=1`, Mesa), `HUD=1` (the status panel), `VERBOSE=1`
-(the kernel's console), `CPUMASK=` / `CPUS=` (default `cpus=8`), `OSMGOLD=` (default 6: the Gold cores at 1804 MHz; 0 leaves them at 300), `GPUMHZ=` (default 900), `BIMC=` (default 1804000: the memory bus), `FLIP=0` (on by default: frames shown where the GPU drew them, not copied), `GOV=0` (on by default: the cores' clocks follow touches and moving frames), `CHARGE=1` (the charger's watchdog petted), `WALLFREEZE=1`, `MDSSDUMP=1`, `FLIPTEST=1`, `OSM=0`, `TOUCH=0`, `MEMMAP=1`, `PERSIST=0` (on by default: keep `/private/var`, `ufs_write=1 var_store=1
+(the kernel's console), `CPUMASK=` / `CPUS=` (default `cpus=8`), `OSMGOLD=` (default 6: the Gold cores at 1804 MHz; 0 leaves them at 300), `GPUMHZ=` (default 900), `BIMC=` (default 1804000: the memory bus), `FLIP=0` (on by default: frames shown where the GPU drew them, not copied), `GOV=0` (on by default: the cores' clocks follow touches and moving frames), `CHARGE=1` (the charger's watchdog petted), `BACKLIGHT=0` (on by default: iOS's brightness slider sets the panel's, by DCS over DSI), `WALLFREEZE=1`, `MDSSDUMP=1`, `FLIPTEST=1`, `OSM=0`, `TOUCH=0`, `MEMMAP=1`, `PERSIST=0` (on by default: keep `/private/var`, `ufs_write=1 var_store=1
 var_save_every=120`, `SAVE_EVERY=` seconds).
 
 The phone's files the build takes from `DOHA_FILES`: `vendor-firmware/` (`/vendor/firmware` of `vendor_a`, EROFS) and

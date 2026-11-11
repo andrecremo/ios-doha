@@ -844,3 +844,16 @@ Governador dos núcleos (`cpu_gov`, 2026-11-10/11):
 - Medido (2026-11-11), tela inicial parada, sem cabo, média de 30 s da corrente do QG (escala do subtipo 3, 152,588
   uA/passo; as leituras anteriores estavam em dobro): sem governador 527 mA; `cpu_gov=1` 442 mA (CPU em 614 MHz, 0% no
   topo); `cpu_gov=1` com GPU a 600 MHz e bimc a 400 MHz 394 mA. A tela parada ainda entrega ~9 quadros por segundo.
+
+Brilho (2026-11-11): o controle do iOS não faz nada (na Central de Controle nem se move). O painel do doha recebe o
+brilho por comando DCS (`dsi-panel-ft8719-tm-fhd-video.dtsi`: `bl_ctrl_dcs`, níveis 1-4095, `bklt-dcs-2bytes-0xff0f`:
+bytes `nível >> 4` e `nível & 0xf`), não por WLED. A UEFI não tem o `EFI_DISPLAYPWRCTRL_PROTOCOL` (`bltest=1`:
+EFI_NOT_FOUND). `dcstest=1`: o loader manda `0x51` pelo DSI (0x5E94000; registradores 6G a partir de +4: CTRL 0x04,
+STATUS0 0x08, CMD_DMA_CTRL 0x3c, DMA_BASE 0x48, DMA_LEN 0x4c, TRIG_DMA 0x90, INTR_CTRL 0x110) no formato do MSM
+(`03 00 39 c0 51 hi lo ff`), com CMD_MODE_EN no CTRL durante o envio. Em low power (como a UEFI deixa), "sent" e nada
+muda; em alta velocidade (LOW_POWER do CMD_DMA_CTRL desligado durante o envio, como o driver da Motorola), o painel
+muda de brilho. Falta: o kernel mandar o comando, e o SpringBoard passar o brilho do iOS ao kernel.
+- `backlight=1` (2026-11-11): o serviço `AppleARMBacklight` (como no port do Mi 9, `not-exyy/ios-cepheus`) faz o
+  controle de brilho do iOS (Central de Controle e Ajustes) mudar o painel. Primeira rodada: funciona, mas com
+  travadinhas e às vezes a rodinha ao arrastar: cada comando segurava a thread do backboardd (até ~13 ms). Agora o envio
+  vai para uma thread call, a última pedida substituindo a anterior.

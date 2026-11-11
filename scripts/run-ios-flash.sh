@@ -134,6 +134,14 @@ GPUARG="$GPUARG rpm_bimc=${BIMC:-1804000}"
 [ "${FLIPTEST:-0}" = 1 ] && GPUARG="$GPUARG fliptest=1"
 # LASTPANIC=1: lastpanic=1, the loader shows the text left in the panic log region by the run before (30 s)
 [ "${LASTPANIC:-0}" = 1 ] && GPUARG="$GPUARG lastpanic=1"
+# BLTEST=1: bltest=1, the loader tries the UEFI's display power control protocol: the backlight at 20% and 60%, 3 s each
+[ "${BLTEST:-0}" = 1 ] && GPUARG="$GPUARG bltest=1"
+# DCSTEST=1: dcstest=1, the loader sends the panel the DCS brightness command (0x51) over DSI: levels 400, 1600, 4095
+[ "${DCSTEST:-0}" = 1 ] && GPUARG="$GPUARG dcstest=1"
+# BACKLIGHT=1: backlight=1, iOS's brightness (Control Center, Settings) sets the panel's: AppleARMBacklight and the DCS
+# brightness command over DSI (iokit/Kernel/MiniIOMobileFramebuffer.cpp); the panel starts at 2400 of 4095
+# (on by default since 2026-11-11; BACKLIGHT=0 leaves the panel at the UEFI's brightness, iOS's slider doing nothing)
+[ "${BACKLIGHT:-1}" = 1 ] && GPUARG="$GPUARG backlight=1"
 # FLIP=1 (default; FLIP=0 copies every frame as before): fb_flip=1, a frame of one layer shown where the GPU drew it
 # (the display's pipe pointed at it) instead of copied onto the panel's memory by the GPU. 2026-11-10: Settings'
 # scroll 29-59 fps against 21-30, the longest gap 17-57 ms against 150-470, and no SpringBoard restart (the black

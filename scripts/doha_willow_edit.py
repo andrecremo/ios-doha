@@ -2018,3 +2018,425 @@ sub1(BTN, """		redwood_status(REDWOOD_STATUS_WIFI, "chg%s S%02x/%02x E%02x C%02x
 		redwood_status(REDWOOD_STATUS_WIFI, "chg%s S%02x/%02x E%02x U%02x W%02x/%02x I%d avg %dmA/%us",
 		    pet_stopped ? "!" : pets != 0 ? "+" : "", st[0], st[1], en, il, wd[0], wd[2], current_now(), current_average(),
 		    current_count);""")
+
+# doha, "bltest=1" (2026-11-11): iOS's brightness does nothing on doha, whose panel takes its brightness as a DCS command
+# (doha's dsi-panel-ft8719-tm-fhd-video.dtsi: bl_ctrl_dcs, levels 1 to 4095, two bytes), not from a PMIC's WLED as
+# miatoll's. Qualcomm's DisplayDxe has a protocol for it (QcomPkg EFIDisplayPwrCtrl.h, EFI_DISPLAYPWRCTRL_PROTOCOL_GUID):
+# the backlight's level in percent, set and read. The test: whether the UEFI has it, the level it reads, then 20% for
+# 3 s, 60% for 3 s, and the level read at first again; 15 s to read the screen
+sub1(L, """				print("lastpanic=1: %d characters shown; 30 s to read this\\n", shown);
+				BS->stall(30000000);
+				break;
+			}
+		}
+""", """				print("lastpanic=1: %d characters shown; 30 s to read this\\n", shown);
+				BS->stall(30000000);
+				break;
+			}
+		}
+		for (const char *c = pi.cmdline; *c; c++) {
+			if (starts_with(c, "bltest=1") && (c == pi.cmdline || c[-1] == ' ')) {
+				static const efi_guid pwr_guid = { 0x7bfa4293, 0x7aa4, 0x4375, { 0xb6, 0x3c, 0xb6, 0xaa, 0xb7, 0x86, 0xc4, 0x3c } };
+				struct {
+					uint64_t revision;
+					efi_status (EFIAPI *panel_power)(uint32_t display, uint32_t state);
+					efi_status (EFIAPI *panel_power_status)(uint32_t display, uint32_t *state);
+					efi_status (EFIAPI *set_level)(uint32_t display, uint32_t percent);
+					efi_status (EFIAPI *get_level)(uint32_t display, uint32_t *percent);
+				} *pwr = NULL;
+				uint32_t level = 0, now = 0;
+				efi_status s;
+
+				s = BS->locate_protocol(&pwr_guid, NULL, (void **)&pwr);
+				if (EFI_ERROR(s) || pwr == NULL) {
+					print("bltest=1: no display power control protocol (%x)\\n", (uint64_t)s);
+					BS->stall(15000000);
+					break;
+				}
+				s = pwr->get_level(0, &level);
+				print("bltest=1: display power control, revision %x; the backlight at %d%% (%x)\\n", pwr->revision,
+				    (uint64_t)level, (uint64_t)s);
+				BS->stall(2000000);
+				s = pwr->set_level(0, 20);
+				pwr->get_level(0, &now);
+				print("bltest=1: 20%%: %x, reads %d%%; 3 s\\n", (uint64_t)s, (uint64_t)now);
+				BS->stall(3000000);
+				s = pwr->set_level(0, 60);
+				pwr->get_level(0, &now);
+				print("bltest=1: 60%%: %x, reads %d%%; 3 s\\n", (uint64_t)s, (uint64_t)now);
+				BS->stall(3000000);
+				s = pwr->set_level(0, level ? level : 100);
+				pwr->get_level(0, &now);
+				print("bltest=1: back to %d%%: %x, reads %d%%; 15 s to read this\\n", (uint64_t)(level ? level : 100),
+				    (uint64_t)s, (uint64_t)now);
+				BS->stall(15000000);
+				break;
+			}
+		}
+""")
+
+# doha, "dcstest=1" (2026-11-11): the UEFI has no display power control protocol (bltest=1: EFI_NOT_FOUND), so the
+# brightness command is sent as Linux's msm DSI driver sends a command while the panel runs in video mode (mainline
+# dsi_host.c: msm_dsi_host_xfer_prepare(), dsi_cmd_dma_add(), msm_dsi_host_cmd_xfer_commit()): the DCS command
+# "write display brightness" (0x51) with doha's two bytes (dsi-panel-ft8719-tm-fhd-video.dtsi: bl_ctrl_dcs, levels 1 to
+# 4095, qcom,bklt-dcs-2bytes-0xff0f: the level's high 8 bits, then its low 4) in MSM's format in a page of the loader's,
+# the controller's command engine on for it, DMA_BASE, DMA_LEN, TRIG_DMA, and CMD_DMA_DONE awaited. The DSI controller:
+# 0x5E94000 (doha's trinket-sde.dtsi, dsi_ctrl), its 6G registers 4 bytes on from the version register. The test: level
+# 400 for 3 s, 1600 for 3 s, then 4095
+sub1(L, """				print("bltest=1: back to %d%%: %x, reads %d%%; 15 s to read this\\n", (uint64_t)(level ? level : 100),
+				    (uint64_t)s, (uint64_t)now);
+				BS->stall(15000000);
+				break;
+			}
+		}
+""", """				print("bltest=1: back to %d%%: %x, reads %d%%; 15 s to read this\\n", (uint64_t)(level ? level : 100),
+				    (uint64_t)s, (uint64_t)now);
+				BS->stall(15000000);
+				break;
+			}
+		}
+		for (const char *c = pi.cmdline; *c; c++) {
+			if (starts_with(c, "dcstest=1") && (c == pi.cmdline || c[-1] == ' ')) {
+				volatile uint32_t *dsi = (volatile uint32_t *)(uintptr_t)0x05E94000ULL;
+				uint64_t page = 0xFFFFFFFFULL;
+				static const uint32_t levels[3] = { 400, 1600, 4095 };
+
+				print("dcstest=1: DSI version %x, CTRL %x, STATUS0 %x, CMD_DMA_CTRL %x, INTR_CTRL %x\\n", (uint64_t)dsi[0],
+				    (uint64_t)dsi[0x04 / 4], (uint64_t)dsi[0x08 / 4], (uint64_t)dsi[0x3c / 4], (uint64_t)dsi[0x110 / 4]);
+				if (EFI_ERROR(BS->allocate_pages(AllocateMaxAddress, EfiLoaderData, 1, &page))) {
+					print("dcstest=1: no page below 4 GB\\n");
+					BS->stall(15000000);
+					break;
+				}
+				BS->stall(3000000);
+				for (int k = 0; k < 3; k++) {
+					volatile uint8_t *b = (volatile uint8_t *)(uintptr_t)page;
+					uint32_t ctrl = dsi[0x04 / 4], intr, waited = 0;
+
+					/* MSM's format: word count (3, two bytes), data type (0x39, DCS long write), last | long; then 51 hi lo, 0xff */
+					b[0] = 3;
+					b[1] = 0;
+					b[2] = 0x39;
+					b[3] = 0x80 | 0x40;
+					b[4] = 0x51;
+					b[5] = (uint8_t)(levels[k] >> 4);
+					b[6] = (uint8_t)(levels[k] & 0x0f);
+					b[7] = 0xff;
+					flush_dcache(page, page + 64);
+					dsi[0x04 / 4] = ctrl | 0x4 | 0x1;                    /* CMD_MODE_EN, ENABLE */
+					dsi[0x110 / 4] = dsi[0x110 / 4] | 0x1;               /* CMD_DMA_DONE cleared (written 1) */
+					__asm__ volatile ("dsb sy" ::: "memory");
+					dsi[0x48 / 4] = (uint32_t)page;                      /* DMA_BASE */
+					dsi[0x4c / 4] = 8;                                   /* DMA_LEN */
+					__asm__ volatile ("dsb sy" ::: "memory");
+					dsi[0x90 / 4] = 1;                                   /* TRIG_DMA */
+					__asm__ volatile ("dsb sy" ::: "memory");
+					while (!((intr = dsi[0x110 / 4]) & 0x1) && waited < 100) {
+						BS->stall(1000);
+						waited++;
+					}
+					dsi[0x110 / 4] = intr | 0x1;
+					dsi[0x04 / 4] = ctrl;
+					__asm__ volatile ("dsb sy" ::: "memory");
+					print("dcstest=1: level %d: %s after %d ms (INTR_CTRL %x, STATUS0 %x); 3 s\\n", (uint64_t)levels[k],
+					    (intr & 0x1) ? "sent" : "NOT done", (uint64_t)waited, (uint64_t)intr, (uint64_t)dsi[0x08 / 4]);
+					BS->stall(3000000);
+				}
+				BS->free_pages(page, 1);
+				print("dcstest=1: 15 s to read this\\n");
+				BS->stall(15000000);
+				break;
+			}
+		}
+""")
+
+# dcstest=1, second run (2026-11-11): the three commands were "sent" (CMD_DMA_DONE in 6-13 ms) and the panel did not
+# change. They went in low power (CMD_DMA_CTRL 0x14000000: LOW_POWER on, as the UEFI left it); Motorola's driver sends
+# the brightness without MIPI_DSI_MSG_USE_LPM, so msm_dsi_host_xfer_prepare() clears LOW_POWER and it goes at high speed,
+# which a panel in video mode takes between lines. The bytes were right (dsi_panel.c: with 0xff0f the level becomes
+# (low 4 bits << 8) | (level >> 4), and mipi_dsi_dcs_set_display_brightness() sends its low byte first). Now at high speed
+sub1(L, """					dsi[0x04 / 4] = ctrl | 0x4 | 0x1;                    /* CMD_MODE_EN, ENABLE */""",
+     """					uint32_t dma_ctrl = dsi[0x3c / 4];
+
+					dsi[0x3c / 4] = dma_ctrl & ~(1u << 26);              /* high speed (CMD_DMA_CTRL's LOW_POWER off) */
+					dsi[0x04 / 4] = ctrl | 0x4 | 0x1;                    /* CMD_MODE_EN, ENABLE */""")
+sub1(L, """					dsi[0x110 / 4] = intr | 0x1;
+					dsi[0x04 / 4] = ctrl;""", """					dsi[0x110 / 4] = intr | 0x1;
+					dsi[0x04 / 4] = ctrl;
+					dsi[0x3c / 4] = dma_ctrl;""")
+
+# backlight=1, doha (2026-11-11): iOS's brightness slider sets the panel's -- the service CoreBrightness looks for
+# (AppleARMBacklight, as the Mi 9's HakiOS port has it) and the DCS brightness command over DSI at high speed (the loader's
+# dcstest=1 found it changes the panel), in iokit/Kernel/MiniIOMobileFramebuffer.cpp, started with the framebuffer
+sub1(FBF, """/*
+ * fb_flip=1: wait (25 ms at most) until the scan after the flush has begun: the DSI interface's frame counter has moved
+""", """/*
+ * The brightness of doha's screen, and the slider of iOS that sets it (backlight=1, device=doha).
+ *
+ * The panel (doha's dsi-panel-ft8719-tm-fhd-video.dtsi) takes its brightness as a DCS command, bl_ctrl_dcs, levels 1 to
+ * 4095 in two bytes (qcom,bklt-dcs-2bytes-0xff0f: Motorola's dsi_panel.c sends level >> 4, then level & 0xf): the DSI
+ * packet "DCS long write" (0x39) of 0x51 and those two bytes. It is sent as Linux's msm DSI driver sends a command
+ * while a video-mode panel runs (mainline dsi_host.c): the packet in MSM's layout in memory of ours below 4 GB, the
+ * controller's command engine on for it (CTRL's CMD_MODE_EN), high speed (CMD_DMA_CTRL's LOW_POWER off: in low power
+ * the panel ignored it, the loader's dcstest=1 found), DMA_BASE, DMA_LEN, TRIG_DMA, CMD_DMA_DONE awaited (50 ms at
+ * most) and cleared, CTRL and CMD_DMA_CTRL put back. The DSI controller: 0x5E94000 (doha's trinket-sde.dtsi), version
+ * 2.3.0, its registers 4 bytes on from the version's. A command not done in time ends the writes for the run.
+ *
+ * iOS: CoreBrightness (backboardd) looks for the service with "backlight-control" = true that is an AppleARMBacklight,
+ * reads its range from "IODisplayParameters" = { brightness = { min, max, value } } and sets a brightness with
+ * IORegistryEntrySetCFProperties(service, { brightness = n, FadePeriod = t, ... }) -- the way the Mi 9's HakiOS port
+ * (not-exyy/ios-cepheus, drivers/gpu/hakios.backlight.cpp) found it, whose service this one follows. Here n is the
+ * panel's level itself, BACKLIGHT_MIN..4095; a fade is done in steps of 16 ms.
+ */
+#include <IOKit/IOPlatformExpert.h>
+
+#define DSI_PHYS                0x05E94000ull
+#define DSI_CTRL                (0x04 / 4)
+#define DSI_CMD_DMA_CTRL        (0x3c / 4)
+#define DSI_DMA_BASE            (0x48 / 4)
+#define DSI_DMA_LEN             (0x4c / 4)
+#define DSI_TRIG_DMA            (0x90 / 4)
+#define DSI_INTR_CTRL           (0x110 / 4)
+#define BACKLIGHT_MIN           24              /* the least iOS may set: dim, never dark */
+#define BACKLIGHT_MAX           4095
+
+static TUNABLE(uint32_t, gBacklight, "backlight", 0);
+static TUNABLE(uint32_t, gBacklightStart, "backlight_default", 2400);   /* the level iOS is told the panel is at */
+
+static volatile uint32_t * gDsi;
+static IOBufferMemoryDescriptor * gDcsBuffer;
+static uint64_t gDcsPhys;
+static IOLock * gDcsLock;
+static bool gDcsGaveUp;
+static uint32_t gDcsSent, gDcsLevel = BACKLIGHT_MAX;
+
+/* The panel to `level` (1..4095); false once a command has not been done (and none is sent again in this run). */
+static bool
+dcsBrightness(uint32_t level)
+{
+	volatile uint8_t * b;
+	uint32_t ctrl, dmaCtrl, intr = 0;
+	uint64_t t0, limit;
+
+	if (gDsi == NULL || gDcsBuffer == NULL || gDcsGaveUp) {
+		return false;
+	}
+	IOLockLock(gDcsLock);
+	b = (volatile uint8_t *) gDcsBuffer->getBytesNoCopy();
+	b[0] = 3;                               /* word count, two bytes */
+	b[1] = 0;
+	b[2] = 0x39;                            /* DCS long write */
+	b[3] = 0x80 | 0x40;                     /* last, long */
+	b[4] = 0x51;                            /* write display brightness */
+	b[5] = (uint8_t) (level >> 4);
+	b[6] = (uint8_t) (level & 0x0f);
+	b[7] = 0xff;
+	flush_dcache((vm_offset_t) b, 64, 0);
+	ctrl = gDsi[DSI_CTRL];
+	dmaCtrl = gDsi[DSI_CMD_DMA_CTRL];
+	gDsi[DSI_CMD_DMA_CTRL] = dmaCtrl & ~(1u << 26);
+	gDsi[DSI_CTRL] = ctrl | 0x4 | 0x1;
+	gDsi[DSI_INTR_CTRL] = gDsi[DSI_INTR_CTRL] | 0x1;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	gDsi[DSI_DMA_BASE] = (uint32_t) gDcsPhys;
+	gDsi[DSI_DMA_LEN] = 8;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	gDsi[DSI_TRIG_DMA] = 1;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &limit);
+	t0 = mach_absolute_time();
+	while (!((intr = gDsi[DSI_INTR_CTRL]) & 0x1) && mach_absolute_time() - t0 < limit) {
+		delay(100);
+	}
+	gDsi[DSI_INTR_CTRL] = intr | 0x1;
+	gDsi[DSI_CTRL] = ctrl;
+	gDsi[DSI_CMD_DMA_CTRL] = dmaCtrl;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (!(intr & 0x1)) {
+		gDcsGaveUp = true;
+		IOLog("MiniIOMobileFramebuffer: backlight: the command for level %u was not done in 50 ms (INTR_CTRL %#x): "
+		    "no more brightness commands in this run\\n", level, intr);
+	} else {
+		gDcsSent++;
+		gDcsLevel = level;
+	}
+	IOLockUnlock(gDcsLock);
+	return (intr & 0x1) != 0;
+}
+
+/* A fade towards a level, one step every 16 ms, on a thread call (setProperties() must not wait for it) */
+static thread_call_t gFadeCall;
+static uint32_t gFadeFrom, gFadeTo, gFadeSteps, gFadeStep;
+
+static void
+fadeStep(thread_call_param_t, thread_call_param_t)
+{
+	uint32_t level;
+	uint64_t deadline;
+
+	if (gFadeStep >= gFadeSteps) {
+		return;
+	}
+	gFadeStep++;
+	level = gFadeFrom + (uint32_t) (((int64_t) gFadeTo - (int64_t) gFadeFrom) * (int64_t) gFadeStep / (int64_t) gFadeSteps);
+	if (dcsBrightness(level) && gFadeStep < gFadeSteps) {
+		clock_interval_to_deadline(16, kMillisecondScale, &deadline);
+		thread_call_enter_delayed(gFadeCall, deadline);
+	}
+}
+
+static void
+backlightRequest(uint32_t value, uint32_t fadeMs)
+{
+	uint32_t level = value < BACKLIGHT_MIN ? BACKLIGHT_MIN : value > BACKLIGHT_MAX ? BACKLIGHT_MAX : value;
+
+	/*
+	 * Never sent from here: setProperties() is backboardd's own thread, and a command takes the controller up to a
+	 * frame (13 ms seen); while the slider was dragged those waits held backboardd up, and the screen stuttered and
+	 * now and then went black with the spinner (2026-11-11). The thread call sends, the newest request replacing any
+	 * fade under way.
+	 */
+	if (gFadeCall == NULL) {
+		return;
+	}
+	thread_call_cancel(gFadeCall);
+	gFadeFrom = gDcsLevel;
+	gFadeTo = level;
+	gFadeSteps = fadeMs < 32 ? 1 : (fadeMs / 16 > 60 ? 60 : fadeMs / 16);
+	gFadeStep = 0;
+	thread_call_enter(gFadeCall);
+}
+
+class AppleARMBacklight : public IOService
+{
+	OSDeclareDefaultStructors(AppleARMBacklight);
+
+public:
+	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
+	void parameters(uint32_t value);
+	unsigned told;
+};
+
+OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+
+/* IODisplayParameters = { brightness = { min, max, value } } */
+void
+AppleARMBacklight::parameters(uint32_t value)
+{
+	OSDictionary * outer = OSDictionary::withCapacity(1), * brightness = OSDictionary::withCapacity(3);
+	OSNumber * lo = OSNumber::withNumber(BACKLIGHT_MIN, 32), * hi = OSNumber::withNumber(BACKLIGHT_MAX, 32);
+	OSNumber * now = OSNumber::withNumber(value, 32);
+
+	if (outer != NULL && brightness != NULL && lo != NULL && hi != NULL && now != NULL) {
+		brightness->setObject("min", lo);
+		brightness->setObject("max", hi);
+		brightness->setObject("value", now);
+		outer->setObject("brightness", brightness);
+		setProperty("IODisplayParameters", outer);
+	}
+	OSSafeReleaseNULL(now);
+	OSSafeReleaseNULL(hi);
+	OSSafeReleaseNULL(lo);
+	OSSafeReleaseNULL(brightness);
+	OSSafeReleaseNULL(outer);
+}
+
+/* a number from what user space gave: an integer, or a dictionary { value = n } */
+static bool
+backlightNumber(OSObject * object, uint32_t * out)
+{
+	OSNumber * n = OSDynamicCast(OSNumber, object);
+	OSDictionary * d = OSDynamicCast(OSDictionary, object);
+
+	if (n == NULL && d != NULL) {
+		n = OSDynamicCast(OSNumber, d->getObject("value"));
+	}
+	if (n == NULL) {
+		return false;
+	}
+	*out = n->unsigned32BitValue();
+	return true;
+}
+
+IOReturn
+AppleARMBacklight::setProperties(OSObject * properties)
+{
+	OSDictionary * dict = OSDynamicCast(OSDictionary, properties);
+	uint32_t value = 0, fade = 0;
+
+	if (dict == NULL) {
+		return kIOReturnBadArgument;
+	}
+	if (!backlightNumber(dict->getObject("brightness"), &value)) {
+		return kIOReturnSuccess;
+	}
+	backlightNumber(dict->getObject("FadePeriod"), &fade);
+	if (told < 8) {
+		told++;
+		IOLog("MiniIOMobileFramebuffer: backlight: iOS asks for %u (fade %u)\\n", value, fade);
+	}
+	value = value > BACKLIGHT_MAX ? BACKLIGHT_MAX : value;
+	parameters(value);
+	backlightRequest(value, fade);
+	return kIOReturnSuccess;
+}
+
+/* backlight=1 on doha: the DSI controller mapped, a page for the command, and the service iOS looks for */
+static void
+redwoodBacklightStart(void)
+{
+	char device[16] = "";
+	AppleARMBacklight * made;
+	IOService * platform;
+
+	if (gBacklight == 0 || !PE_parse_boot_arg_str("device", device, sizeof(device)) || strcmp(device, "doha") != 0) {
+		return;
+	}
+	gDcsLock = IOLockAlloc();
+	gDsi = (volatile uint32_t *) ml_io_map(DSI_PHYS, 0x1000);
+	gDcsBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 4096, 0xfffff000ull);
+	gFadeCall = thread_call_allocate(fadeStep, NULL);
+	if (gDcsLock == NULL || gDsi == NULL || gDcsBuffer == NULL) {
+		IOLog("MiniIOMobileFramebuffer: backlight: no DSI registers or no page for the command\\n");
+		gDsi = NULL;
+		return;
+	}
+	gDcsPhys = gDcsBuffer->getPhysicalAddress();
+	IOLog("MiniIOMobileFramebuffer: backlight: DSI version %#x, CTRL %#x, CMD_DMA_CTRL %#x; the command's page at %#llx\\n",
+	    gDsi[0], gDsi[DSI_CTRL], gDsi[DSI_CMD_DMA_CTRL], gDcsPhys);
+	if (gBacklightStart >= BACKLIGHT_MIN && gBacklightStart <= BACKLIGHT_MAX) {
+		dcsBrightness(gBacklightStart);
+	}
+	made = OSTypeAlloc(AppleARMBacklight);
+	if ((platform = IOService::getPlatform()) == NULL || made == NULL || !made->init()) {
+		OSSafeReleaseNULL(made);
+		return;
+	}
+	made->setProperty("backlight-control", kOSBooleanTrue);
+	made->parameters(gDcsLevel);
+	if (!made->attach(platform)) {
+		made->release();
+		return;
+	}
+	made->setName("AppleARMBacklight");
+	if (!made->start(platform)) {
+		made->detach(platform);
+		made->release();
+		return;
+	}
+	made->registerService();
+	IOLog("MiniIOMobileFramebuffer: backlight: AppleARMBacklight registered, the panel at %u\\n", gDcsLevel);
+}
+
+/*
+ * fb_flip=1: wait (25 ms at most) until the scan after the flush has begun: the DSI interface's frame counter has moved
+""")
+sub1(FBF, """extern "C" volatile uint32_t redwood_frames;    /* bsd/dev/redwood_osm.c (cpu_gov): frames handed to the panel */
+""", """extern "C" volatile uint32_t redwood_frames;    /* bsd/dev/redwood_osm.c (cpu_gov): frames handed to the panel */
+static void redwoodBacklightStart(void);        /* backlight=1 (doha): below */
+""")
+sub1(FBF, """	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+""", """	redwoodBacklightStart();
+	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+""")
