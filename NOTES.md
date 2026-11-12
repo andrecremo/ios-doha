@@ -943,3 +943,41 @@ Com a troca (`ITEM_SMP2P_OURS` 428, `ITEM_SMP2P_THEIRS` 435), o HUD mostra:
 - **Storage:** `wlfw: THE WI-FI FIRMWARE IS READY`. A troca WLFW (MSA, BDF) vai até o fim.
 
 Próximos passos: o driver do rádio (copy engines em 0xC800000, modo mission, WMI, como o ath10k/snoc do miatoll) e a camada Apple80211 para o `wifid`.
+
+## Nível da bateria contado (passo 4, 2026-11-12, kernel 15:57)
+
+Problema: no teste charge=2, o nível foi de 60 % a 65 % em 5 minutos com ~100 mA entrando, o que daria só ~0,2 %. O nível vinha da tensão, e a tensão sobe com o cabo conectado.
+
+Agora (em `level_look`/`level_count`, no redwood_buttons.c):
+- **Nível inicial:** média das 6 primeiras leituras (30 s), pela curva OCV do KD40 a 25 °C. A tensão é corrigida pela corrente: OCV = V + I·R, com R = 150 mΩ (boot-arg `batt_rint=<mΩ>` para ajustar).
+- **Depois:** contagem de carga. A corrente do medidor, amostrada a cada segundo, é descontada de 4000 mAh (1 mA por 1 ms = 1/144 de milionésimo de %).
+- **Correção lenta:** só sem cabo e com carga leve (−50 a 300 mA), o nível é puxado para o da curva em 1/120 por leitura (constante de ~10 min).
+- O estado "done" do carregador (5) vale 100 %.
+
+Linha Wi-Fi do HUD: `chg+e S03 E01 T<subtipo> I<agora> avg<média>mA ocv<mV corrigido>=<nível da curva>% cc<nível contado>%`.
+- O `T` resolve a dúvida da escala da corrente: 03 dá 152,588 µA por passo; outro valor, 305,176.
+- Se a contagem andar no dobro ou na metade do esperado, a escala está errada.
+- Antes de existir o nível contado, a barra de status usa o cálculo antigo, nos primeiros 30 s.
+
+A testar:
+1. Ver se o `cc` sobe devagar com o cabo conectado (~0,04 %/min a 100 mA).
+2. Sem cabo, ver se o `ocv` fica estável quando a carga muda (com o R certo, rolar a tela não deve mexer muito no `ocv`).
+
+### Primeira leitura do nível contado (2026-11-12 16:01, kernel 15:58, cabo conectado)
+
+- Wi-Fi: `chg+e S03 E01 T03 I-161 avg-141mA ocv4003=65% cc63.0%`; Battery: `63%~ 4027 mV, cable 1, chg 1`. O iOS mostra 63 com o raio.
+- `T03`: o medidor é do tipo QG_ADC_IBAT_5A, com 152,588 µA por passo. A escala usada desde 2026-11-11 está certa, e as leituras de corrente anteriores a isso eram o dobro do real (os 1156–1810 mA com a tela parada eram ~580–900 mA).
+- O cálculo confere: 4027 − 161·0,150 = 4003 mV, que na curva dá 65 %. O nível contado partiu de 63 %, a média dos primeiros 30 s, quando o boot puxava mais corrente.
+- A corrente que entra na bateria continua baixa, ~140–160 mA. A essa taxa, o nível deve subir ~0,06 %/min, ou ~0,3 % em 5 min.
+
+### Nível contado com o cabo: 11 minutos (2026-11-12, kernel 16:15, fotos 189/190)
+
+| hora | Wi-Fi | Battery | iOS |
+|---|---|---|---|
+| 16:55 | `chg+e S03 E01 T03 I-166 avg168mA ocv3991=64% cc62.2%` | `62%~ 4015 mV, cable 1, chg 1` | 62 ⚡ |
+| 17:06 | `chg+e S03 E01 T03 I-189 avg-173mA ocv4032=69% cc63.0%` | `63%~ 4060 mV, cable 1, chg 1` | 62 ⚡ |
+
+- **O nível contado está certo.** Subiu 0,8 % em 11 min. Com ~170 mA entrando, a conta dá 170 × 11/60 = 31 mAh, ou 0,78 % de 4000 mAh. No mesmo intervalo, o nível pela curva (`ocv`) foi de 64 % para 69 %, e a tensão de 4015 para 4060 mV. É a tensão subindo com a carga, e era isso que inflava o nível antigo. Com a contagem, esse efeito sumiu.
+- **avg +168 mA às 16:55** (a foto 189 confirma que não há sinal de menos), com a corrente do momento em −166. A média é dos 30 s anteriores, quando a bateria estava cedendo corrente. A explicação mais provável é que o Wi-Fi estava subindo nessa hora (o HUD mostra "wlfw: MISSION MODE; the radio is read in 2 s"): o rádio e o modem consumiram mais do que os ~500 mA que o cabo fornece. Às 17:06 a média já era −173. O valor quase simétrico (168 contra −166) parece coincidência. Se voltar a aparecer, vale olhar o anel de amostras.
+- O ícone do iOS mostrava 62 com o `cc` em 63,0. A diferença é de arredondamento ou do intervalo de atualização do iOS.
+- Resta a corrente de carga baixa, ~170 mA. O próximo passo é ler o ICL efetivo (DCDC 0x07) e o resultado do APSD (tipo de carregador detectado).

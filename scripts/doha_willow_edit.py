@@ -3683,3 +3683,121 @@ sub1(MSS, """#define ITEM_SMP2P_OURS         435             /* dt: qcom,smp2p-m
 #define ITEM_SMP2P_THEIRS       435""")
 # (the two items' dump of the run before, off by default now that the WLFW exchange's line matters: mss_items=1 shows it)
 sub1(MSS, """				uint32_t items = 1, size = 0, at;""", """				uint32_t items = 0, size = 0, at;""")
+
+# doha, battery step 4 (2026-11-12): the level counted, not guessed from the voltage. The charge=2 run went 60 -> 65 %
+# in 5 minutes on ~100 mA (that is 0.2 %): a cable lifts the cell's voltage, and the level came from the voltage. Now:
+# a first level from the KD40's own OCV curve (Motorola's trinket-moto-common-overlay.dtsi, 25 C) with the voltage
+# corrected for the current (OCV = V + I * R, R = 150 mOhm or boot-arg batt_rint=<mOhm>), the mean of the first six
+# looks (30 s); from then the charge counted -- the gauge's current, sampled every second, against 4000 mAh -- and,
+# only without a cable and at a light load (-50..300 mA), nudged toward the curve's level (1/120 a look: some 10
+# minutes). The charger's "done" (state 5) is 100 %. The panel's Wi-Fi line: S, E, the gauge's subtype (T), the
+# current now and its mean, the corrected voltage and the curve's level, and the counted level
+sub1(BTN, """static void
+current_sample(void)
+{
+	current_ring[current_next] = current_now();
+""", """/*
+ * doha: the battery's level, counted. KD40 (4000 mAh): its OCV curve at 25 C, mV for 0..100 %
+ */
+static const struct { int16_t mv, pct; } kd40_ocv[] = {
+	{ 3000, 0 }, { 3489, 2 }, { 3668, 5 }, { 3707, 10 }, { 3770, 20 }, { 3801, 30 }, { 3825, 40 },
+	{ 3863, 50 }, { 3958, 60 }, { 4040, 70 }, { 4144, 80 }, { 4260, 90 }, { 4382, 100 },
+};
+#define LEVEL_FULL      100000000LL     /* the level in millionths of a percent: 100 % */
+static int64_t level_u = -1;            /* the counted level; -1: not yet */
+static int64_t level_first;             /* the curve's levels summed over the first looks */
+static uint32_t level_firsts;
+static int32_t level_rint = -1;         /* mOhm */
+static int level_ocv, level_est;        /* for the panel: the corrected voltage, the curve's level (%) */
+static uint64_t level_last_ns;
+
+/* The curve's level for a resting voltage, in millionths of a percent */
+static int64_t
+level_from_ocv(int mv)
+{
+	uint32_t n = sizeof(kd40_ocv) / sizeof(kd40_ocv[0]);
+
+	if (mv <= kd40_ocv[0].mv) {
+		return 0;
+	}
+	for (uint32_t i = 1; i < n; i++) {
+		if (mv < kd40_ocv[i].mv) {
+			return (int64_t)kd40_ocv[i - 1].pct * 1000000LL + (int64_t)(mv - kd40_ocv[i - 1].mv) *
+			    (kd40_ocv[i].pct - kd40_ocv[i - 1].pct) * 1000000LL / (kd40_ocv[i].mv - kd40_ocv[i - 1].mv);
+		}
+	}
+	return LEVEL_FULL;
+}
+
+/* A second's current (mA, > 0 out of the battery) counted against the level: 1 mA for 1 ms is 1/144 of a millionth */
+static void
+level_count(int32_t ma)
+{
+	uint64_t now, ms;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+	ms = level_last_ns ? (now - level_last_ns) / 1000000ULL : 0;
+	level_last_ns = now;
+	if (level_u < 0 || ms == 0 || ms > 10000) {
+		return;         /* not started, or a gap (the loop stalled): nothing counted */
+	}
+	level_u -= (int64_t)ma * (int64_t)ms / 144;
+	level_u = level_u < 0 ? 0 : level_u > LEVEL_FULL ? LEVEL_FULL : level_u;
+}
+
+/* One look (every 5 s): the voltage just read, the cable, the charger's state; the level to show, or -1 not yet */
+static int
+level_look(int mv, int plugged, int state)
+{
+	int32_t ma = current_now();
+	int64_t est;
+
+	if (level_rint < 0) {
+		uint32_t r = 150;
+
+		if (PE_parse_boot_argn("batt_rint", &r, sizeof(r)) && r > 1000) {
+			r = 150;
+		}
+		level_rint = (int32_t)r;
+	}
+	level_ocv = mv + ma * level_rint / 1000;
+	est = level_from_ocv(level_ocv);
+	level_est = (int)(est / 1000000);
+	if (level_u < 0) {
+		level_first += est;
+		if (++level_firsts < 6) {
+			return -1;
+		}
+		level_u = level_first / level_firsts;
+		printf("battery: the level counted from %lld.%lld %% (the KD40's curve, %d mOhm)\\n",
+		    level_u / 1000000, level_u / 100000 % 10, level_rint);
+	} else if ((state & 7) == 5) {
+		level_u = LEVEL_FULL;
+	} else if (!plugged && ma > -50 && ma < 300) {
+		level_u += (est - level_u) / 120;
+	}
+	return (int)((level_u + 500000) / 1000000);
+}
+
+static void
+current_sample(void)
+{
+	current_ring[current_next] = current_now();
+	level_count(current_ring[current_next]);
+""")
+sub1(BTN, """	last_soc = soc;
+""", """	last_soc = soc;
+	{
+		int counted = level_look((int)(((uint32_t)v[0] | (uint32_t)v[1] << 8) * 194637ULL / 1000000ULL), plugged_now, state);
+
+		if (counted >= 0) {
+			soc = counted;
+		}
+	}
+""")
+sub1(BTN, """		redwood_status(REDWOOD_STATUS_WIFI, "chg%s%s S%02x/%02x E%02x U%02x W%02x/%02x I%d avg %dmA/%us",
+		    pet_stopped ? "!" : pets != 0 ? "+" : "", enable_stopped ? "x" : enables != 0 ? "e" : "", st[0], st[1], en, il,
+		    wd[0], wd[2], current_now(), current_average(), current_count);""", """		redwood_status(REDWOOD_STATUS_WIFI, "chg%s%s S%02x E%02x T%02x I%d avg%dmA ocv%d=%d%% cc%lld.%lld%%",
+		    pet_stopped ? "!" : pets != 0 ? "+" : "", enable_stopped ? "x" : enables != 0 ? "e" : "", st[0], en,
+		    gauge_subtype, current_now(), current_average(), level_ocv, level_est,
+		    level_u < 0 ? 0 : level_u / 1000000, level_u < 0 ? 0 : level_u / 100000 % 10);""")
