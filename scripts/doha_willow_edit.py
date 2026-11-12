@@ -2839,3 +2839,796 @@ sub1(MSS, """		if ((at = strnstr(line, "HAS FAILED: ", sizeof(line))) != NULL ||
 sub1(MSS, """			redwood_status(REDWOOD_STATUS_SOUND, "modem: loc %u, tftp %u, wifi %s; %.24s", mss_located, mss_files, mss_wifi,
 			    mss_failed[0] ? mss_failed : "no failure");""", """			redwood_status(REDWOOD_STATUS_SOUND, "loc %u tftp %u wifi %s %.34s", mss_located, mss_files, mss_wifi,
 			    mss_failed[0] ? mss_failed : "no failure");""")
+
+# The modem on doha, fifth run (2026-11-12): the same assert. The panel had only counts; which files the modem asked for
+# over TFTP, and which it was refused, is what tells whether the Wi-Fi firmware wanted a board file under a name doha's
+# modem_a has not (the assert comes right after its domain is up, as a missing file would make it). At the end of the
+# run, three more lines of the panel (Keys, Touch, Storage; their drivers write them again later) list them: a name with
+# "+" read, with "-" refused, "w:" written; and the summary counts RMTFS's sectors read
+sub1(MSS, """static uint32_t mss_located, mss_files;         /* the locator asked, files read over TFTP */
+""", """static uint32_t mss_located, mss_files;         /* the locator asked, files read over TFTP */
+static char mss_tftp[200];                      /* the files asked for over TFTP: name+ read, name- refused, w:name */
+static uint32_t mss_sectors;                    /* RMTFS's sectors read */
+""")
+sub1(MSS, """		if (strnstr(line, "TFTP: READ", sizeof(line)) != NULL) {
+			mss_files++;
+		}""", """		if (strnstr(line, "TFTP: READ", sizeof(line)) != NULL) {
+			mss_files++;
+		}
+		if ((at = strnstr(line, "TFTP: ", sizeof(line))) != NULL) {
+			const char *q = strnstr(at, "\\"", sizeof(line)), *end, *base;
+			char one[48];
+			size_t k;
+
+			if (q != NULL && (end = strnstr(q + 1, "\\"", sizeof(line))) != NULL) {
+				for (base = end; base > q + 1 && base[-1] != '/'; base--) {
+				}
+				k = (size_t)(end - base) < 30 ? (size_t)(end - base) : 30;
+				snprintf(one, sizeof(one), "%s%.*s%s ", strncmp(at + 6, "write", 5) == 0 ? "w:" : "", (int)k, base,
+				    strncmp(at + 6, "READ", 4) == 0 ? "+" : strncmp(at + 6, "read", 4) == 0 ? "-" : "");
+				strlcat(mss_tftp, one, sizeof(mss_tftp));
+			}
+		}
+		if ((at = strnstr(line, "RMTFS: read ", sizeof(line))) != NULL) {
+			mss_sectors += (uint32_t)strtoul(at + 12, NULL, 10);
+		}""")
+sub1(MSS, """			redwood_status(REDWOOD_STATUS_SOUND, "loc %u tftp %u wifi %s %.34s", mss_located, mss_files, mss_wifi,
+			    mss_failed[0] ? mss_failed : "no failure");""", """			size_t n = strlen(mss_tftp);
+
+			redwood_status(REDWOOD_STATUS_SOUND, "loc %u tftp %u rmtfs %u wifi %s %.26s", mss_located, mss_files, mss_sectors,
+			    mss_wifi, mss_failed[0] ? mss_failed : "no failure");
+			redwood_status(REDWOOD_STATUS_KEYS, "%.56s", mss_tftp);
+			redwood_status(REDWOOD_STATUS_TOUCH, "%.56s", n > 56 ? mss_tftp + 56 : "");
+			redwood_status(REDWOOD_STATUS_STORAGE, "%.56s", n > 112 ? mss_tftp + 112 : "");""")
+
+# The modem on doha, sixth run (2026-11-12): RMTFS now read (4096 sectors), the same assert. Asked over TFTP: shob.bin,
+# hob_report.txt, dhob.bin, dhob_report.txt (refused: files the modem keeps in /readwrite, written as it goes) and
+# server_check.txt written. And doha's own modemr.jsn (modem_a/image) lists one service of the root domain more than
+# willow's table here: "tms/pdr_enabled" -- whether protection-domain restart is on, which the modem asks the locator for;
+# this locator answered "in no domain". One of willow's open leads (README). In the table now, as doha's file has it.
+sub1(MSS, """	{ "msm/modem/root_pd", 180, { "tms/servreg", "gps/gps_service", NULL } },""",
+     """	{ "msm/modem/root_pd", 180, { "tms/servreg", "tms/pdr_enabled", "gps/gps_service" } },""")
+
+# The modem on doha, seventh run (2026-11-12): with tms/pdr_enabled answered, the same assert. 11 files were read over
+# TFTP, yet the panel's 168 characters held only the refused ones and the writes, which came first. Now the files read
+# have lines of their own (Keys, Touch), once each, and the rest goes to Storage
+sub1(MSS, """static char mss_tftp[200];                      /* the files asked for over TFTP: name+ read, name- refused, w:name */
+""", """static char mss_tftp[200];                      /* the files asked for over TFTP: name+ read, name- refused, w:name */
+static char mss_reads[200];                     /* ... those read, once each */
+""")
+sub1(MSS, """				strlcat(mss_tftp, one, sizeof(mss_tftp));""", """				if (strncmp(at + 6, "READ", 4) == 0) {
+					one[strlen(one) - 2] = ' ';     /* (no "+": this list is of reads) */
+					one[strlen(one) - 1] = 0;
+					if (strnstr(mss_reads, one, sizeof(mss_reads)) == NULL) {
+						strlcat(mss_reads, one, sizeof(mss_reads));
+					}
+				} else if (strnstr(mss_tftp, one, sizeof(mss_tftp)) == NULL) {
+					strlcat(mss_tftp, one, sizeof(mss_tftp));
+				}""")
+sub1(MSS, """			redwood_status(REDWOOD_STATUS_KEYS, "%.56s", mss_tftp);
+			redwood_status(REDWOOD_STATUS_TOUCH, "%.56s", n > 56 ? mss_tftp + 56 : "");
+			redwood_status(REDWOOD_STATUS_STORAGE, "%.56s", n > 112 ? mss_tftp + 112 : "");""", """			n = strlen(mss_reads);
+			redwood_status(REDWOOD_STATUS_KEYS, "read: %.50s", mss_reads);
+			redwood_status(REDWOOD_STATUS_TOUCH, "%.56s", n > 50 ? mss_reads + 50 : "");
+			redwood_status(REDWOOD_STATUS_STORAGE, "%.56s", mss_tftp);""")
+
+# The Wi-Fi firmware's WLFW exchange on doha (2026-11-12): the modem read only wlanmdsp.mbn over TFTP, no board file --
+# the board's data is the host's to send, over WLFW, and nothing here did. Ported from miatoll's HakiOS port (ath10k's
+# qmi.c by hand), with doha's MSA (0x53300000, 1 MB) and, as doha's dt has no qcom,hyp_disabled, the firmware's memory
+# given to it through TrustZone as icnss does; started at step 11, before the services are offered. The panel's Storage
+# line at the end: the last thing the exchange said
+sub1(MSS, """static bool
+step_serve(void)
+{""", """/*
+ * The Wi-Fi firmware's service (WLFW, QMI service 69), doha (2026-11-12): what Linux's ath10k says to a WCN3990 whose
+ * firmware runs in the modem (its qmi.c), made by hand as miatoll's HakiOS port made it (qdizax-w/hakios-xnu-kernel,
+ * drivers/modem/hakios.mpss.c, 30 October 2026), from the layout of Linux's qmi_wlfw_v01.c (message ids, TLV numbers,
+ * field sizes). On doha the modem reads only wlanmdsp.mbn over TFTP and no board file: the board's data is the host's
+ * to send, and without any of this exchange the Wi-Fi domain asserted right after it came up (platform_main.c:230).
+ *
+ * As soon as the service is there: the indications "firmware ready" and "MSA ready" registered for, the host's
+ * capabilities, the firmware's memory (the MSA: doha's dt qcom,wlan-msa-fixed-region, wlan_msa_region@53300000, of
+ * which qcom,wlan-msa-memory says 1 MB) told, the regions the firmware answers with given to it through TrustZone as
+ * Android's icnss does (doha's dt has no qcom,hyp_disabled: MP_ASSIGN, HLOS -> MSS_MSA and WLAN, read and write;
+ * wlfw_assign=0: not), the MSA said ready, the chip's capabilities asked, the board's data file sent (modem_a's
+ * image/bdwlan.b<board id>, else bdwlan.bin) in pieces of 6144 bytes, no calibrations reported, then "ready" awaited.
+ * On a thread of its own from step 11 on; wlfw=0: not.
+ */
+#define WLFW_IND_REGISTER       0x0020
+#define WLFW_FW_READY_IND       0x0021
+#define WLFW_CAP                0x0024
+#define WLFW_BDF_DOWNLOAD       0x0025
+#define WLFW_CAL_REPORT         0x0026
+#define WLFW_MSA_READY_IND      0x002b
+#define WLFW_MSA_INFO           0x002d
+#define WLFW_MSA_READY          0x002e
+#define WLFW_HOST_CAP           0x0034
+#define WLFW_CLIENT_ID          0x4b4e454cu     /* ath10k's ATH10K_QMI_CLIENT_ID */
+#define WLFW_MSA_PA             0x53300000ull   /* doha: wlan_msa_region@53300000 */
+#define WLFW_MSA_SIZE           0x00100000u     /* doha: qcom,wlan-msa-memory */
+#define WLFW_BDF_PIECE          6144
+#define VMID_WLAN               0x18
+#define VMID_WLAN_CE            0x19
+
+static struct redwood_qrtr_port *wlfw2_port;
+static volatile uint32_t wlfw2_node, wlfw2_at;
+static volatile bool wlfw2_there, wlfw2_fw_ready, wlfw2_msa_ready;
+static uint16_t wlfw2_txn;
+static uint8_t wlfw2_answer[1024];
+static volatile uint32_t wlfw2_answer_length;
+static volatile uint16_t wlfw2_waiting;
+
+static void
+wlfw2_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data;
+	uint16_t message;
+
+	if (length < 7 || node != wlfw2_node || port != wlfw2_at) {
+		return;
+	}
+	message = (uint16_t)(m[3] | m[4] << 8);
+	if (m[0] == 4) {                        /* an indication */
+		if (message == WLFW_FW_READY_IND) {
+			wlfw2_fw_ready = true;
+			printf("mss: wlfw: THE WI-FI FIRMWARE SAYS IT IS READY\\n");
+		} else if (message == WLFW_MSA_READY_IND) {
+			wlfw2_msa_ready = true;
+			printf("mss: wlfw: the firmware says its memory is ready\\n");
+		} else {
+			printf("mss: wlfw: indication %#x, %u bytes\\n", message, (unsigned)length);
+		}
+		return;
+	}
+	if (m[0] == 2 && wlfw2_waiting != 0 && (uint16_t)(m[1] | m[2] << 8) == wlfw2_waiting) {
+		uint32_t n = length < sizeof(wlfw2_answer) ? (uint32_t)length : (uint32_t)sizeof(wlfw2_answer);
+
+		memcpy(wlfw2_answer, m, n);
+		wlfw2_answer_length = n;
+		__asm__ volatile ("dmb ish" ::: "memory");
+		wlfw2_waiting = 0;
+	}
+}
+
+static void
+wlfw2_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, __unused uint32_t instance,
+    uint32_t node, uint32_t port)
+{
+	if (service != SERVICE_WLFW) {
+		return;
+	}
+	if (arrived) {
+		wlfw2_node = node;
+		wlfw2_at = port;
+	}
+	wlfw2_there = arrived;
+}
+
+/* One request and its answer (5 s); true if the answer's result is 0. The answer stays in wlfw2_answer. */
+static bool
+wlfw2_ask(const char *what, uint16_t message, const uint8_t *tlvs, uint32_t length)
+{
+	uint8_t *packet = kalloc_data(7 + length, Z_WAITOK | Z_ZERO);
+	uint32_t size = 0;
+	uint16_t result = 1, error = 0;
+	const uint8_t *value;
+	bool ok = false;
+
+	if (packet == NULL) {
+		return false;
+	}
+	wlfw2_txn = (uint16_t)(wlfw2_txn + 1 == 0 ? 1 : wlfw2_txn + 1);
+	packet[0] = 0;                          /* a request */
+	packet[1] = (uint8_t)wlfw2_txn;
+	packet[2] = (uint8_t)(wlfw2_txn >> 8);
+	packet[3] = (uint8_t)message;
+	packet[4] = (uint8_t)(message >> 8);
+	packet[5] = (uint8_t)length;
+	packet[6] = (uint8_t)(length >> 8);
+	if (length != 0) {
+		memcpy(packet + 7, tlvs, length);
+	}
+	wlfw2_answer_length = 0;
+	wlfw2_waiting = wlfw2_txn;
+	if (qrtr_send(wlfw2_port, wlfw2_node, wlfw2_at, packet, 7 + length) != 0) {
+		wlfw2_waiting = 0;
+		kfree_data(packet, 7 + length);
+		printf("mss: wlfw: %s: NOT SENT\\n", what);
+		return false;
+	}
+	kfree_data(packet, 7 + length);
+	for (unsigned ms = 0; ms < 5000 && wlfw2_waiting != 0; ms++) {
+		IOSleep(1);
+	}
+	if (wlfw2_waiting != 0) {
+		wlfw2_waiting = 0;
+		printf("mss: wlfw: %s: NO ANSWER in 5 s\\n", what);
+		return false;
+	}
+	if ((value = qmi_tlv(wlfw2_answer, wlfw2_answer_length, 2, &size)) != NULL && size == 4) {
+		result = (uint16_t)(value[0] | value[1] << 8);
+		error = (uint16_t)(value[2] | value[3] << 8);
+		ok = result == 0;
+	}
+	printf("mss: wlfw: %s: %s (result %u, error %u)\\n", what, ok ? "done" : "REFUSED", result, error);
+	return ok;
+}
+
+static unsigned
+wlfw2_u8(uint8_t *at, uint8_t type, uint8_t value)
+{
+	at[0] = type;
+	at[1] = 1;
+	at[2] = 0;
+	at[3] = value;
+	return 4;
+}
+
+static unsigned
+wlfw2_u32(uint8_t *at, uint8_t type, uint32_t value)
+{
+	at[0] = type;
+	at[1] = 4;
+	at[2] = 0;
+	at[3] = (uint8_t)value;
+	at[4] = (uint8_t)(value >> 8);
+	at[5] = (uint8_t)(value >> 16);
+	at[6] = (uint8_t)(value >> 24);
+	return 7;
+}
+
+static uint32_t
+wlfw2_le32(const uint8_t *p)
+{
+	return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+/* A region of the firmware's memory given to the modem's MSA and the WLAN's VM through TrustZone (MP_ASSIGN) */
+static bool
+wlfw2_assign(uint64_t address, uint32_t bytes)
+{
+	vm_offset_t page = 0;
+	uint64_t *ext, answer = 0, base;
+	int32_t result;
+
+	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		return false;
+	}
+	base = kvtophys(page);
+	{
+		uint64_t *region = (uint64_t *)page;                    /* at 0: { address, size } */
+		uint32_t *source = (uint32_t *)(page + 64);             /* at 64: the owners now */
+		uint32_t *destination = (uint32_t *)(page + 128);       /* at 128: { vmid, perm, ctx (8), ctx size, 0 } each */
+
+		region[0] = address;
+		region[1] = bytes;
+		source[0] = VMID_HLOS;
+		destination[0] = VMID_MSS_MSA;
+		destination[1] = SCM_PERM_RW;
+		destination[6] = VMID_WLAN;
+		destination[7] = SCM_PERM_RW;
+		ext = (uint64_t *)(page + 256);
+		ext[0] = 4;
+		ext[1] = base + 128;
+		ext[2] = 2 * 24;
+		ext[3] = 0;
+	}
+	to_memory_range(page, PAGE_SIZE);
+	result = scm_ext("the Wi-Fi firmware's memory to the modem and the WLAN (MP_ASSIGN: HLOS -> MSS_MSA + WLAN)", SCM_MP_ASSIGN,
+	    SCM_ASSIGN_ARGUMENTS, base, 16, base + 64, base + 256, &answer);
+	kmem_free(kernel_map, page, PAGE_SIZE);
+	printf("mss: wlfw: %#x bytes at %#llx given to the firmware: %s (%d)\\n", bytes, address, result == 0 ? "done" : "REFUSED",
+	    result);
+	return result == 0;
+}
+
+static void
+wlfw2_thread(__unused void *parameter, __unused wait_result_t wait)
+{
+	static uint8_t tlvs[64 + WLFW_BDF_PIECE];
+	unsigned at;
+	uint32_t chip_id = 0xff, chip_family = 0, board_id = 0xff, soc_id = 0, size = 0, assign = 1;
+	const uint8_t *value;
+	char name[40];
+	uint32_t board_size = 0, board_first = 0;
+
+	PE_parse_boot_argn("wlfw_assign", &assign, sizeof(assign));
+	for (unsigned ms = 0; ms < 120000 && !wlfw2_there; ms += 5) {
+		IOSleep(5);
+	}
+	if (!wlfw2_there) {
+		printf("mss: wlfw: the Wi-Fi firmware's service did not come in 2 minutes\\n");
+		goto out;
+	}
+	printf("mss: wlfw: the service at node %u port %u: the exchange begins\\n", wlfw2_node, wlfw2_at);
+
+	at = 0;
+	at += wlfw2_u8(tlvs + at, 0x10, 1);                             /* fw_ready_enable */
+	at += wlfw2_u8(tlvs + at, 0x13, 1);                             /* msa_ready_enable */
+	at += wlfw2_u32(tlvs + at, 0x15, WLFW_CLIENT_ID);               /* client_id */
+	if (!wlfw2_ask("indications", WLFW_IND_REGISTER, tlvs, at)) {
+		goto out;
+	}
+	if ((value = qmi_tlv(wlfw2_answer, wlfw2_answer_length, 0x10, &size)) != NULL && size == 8 && (value[0] & 2)) {
+		wlfw2_fw_ready = true;
+	}
+	at = wlfw2_u32(tlvs, 0x10, 0);                                  /* no daemon */
+	(void)wlfw2_ask("host capabilities", WLFW_HOST_CAP, tlvs, at);
+
+	at = 0;
+	tlvs[at++] = 0x01;
+	tlvs[at++] = 8;
+	tlvs[at++] = 0;
+	for (unsigned b = 0; b < 8; b++) {
+		tlvs[at++] = (uint8_t)(WLFW_MSA_PA >> (8 * b));
+	}
+	at += wlfw2_u32(tlvs + at, 0x02, WLFW_MSA_SIZE);
+	if (!wlfw2_ask("MSA info", WLFW_MSA_INFO, tlvs, at)) {
+		goto out;
+	}
+	if ((value = qmi_tlv(wlfw2_answer, wlfw2_answer_length, 0x03, &size)) != NULL && size >= 1) {
+		uint8_t copy[1 + 13 * 8];
+		unsigned regions = value[0] < 8 ? value[0] : 8;
+
+		memcpy(copy, value, size < sizeof(copy) ? size : sizeof(copy));
+		for (unsigned r = 0; r < regions && 1 + 13 * (r + 1) <= size; r++) {
+			const uint8_t *e = copy + 1 + 13 * r;
+			uint64_t address = wlfw2_le32(e) | (uint64_t)wlfw2_le32(e + 4) << 32;
+
+			printf("mss: wlfw: region %u: %#x bytes at %#llx%s\\n", r, wlfw2_le32(e + 8), address, e[12] ? ", secure" : "");
+			if (assign) {
+				wlfw2_assign(address, wlfw2_le32(e + 8));
+			}
+		}
+	}
+	if (!wlfw2_ask("MSA ready", WLFW_MSA_READY, NULL, 0)) {
+		goto out;
+	}
+	if (wlfw2_ask("chip capabilities", WLFW_CAP, NULL, 0)) {
+		if ((value = qmi_tlv(wlfw2_answer, wlfw2_answer_length, 0x10, &size)) != NULL && size >= 8) {
+			chip_id = wlfw2_le32(value);
+			chip_family = wlfw2_le32(value + 4);
+		}
+		if ((value = qmi_tlv(wlfw2_answer, wlfw2_answer_length, 0x11, &size)) != NULL && size >= 4) {
+			board_id = wlfw2_le32(value);
+		}
+		if ((value = qmi_tlv(wlfw2_answer, wlfw2_answer_length, 0x12, &size)) != NULL && size >= 4) {
+			soc_id = wlfw2_le32(value);
+		}
+		printf("mss: wlfw: chip %#x family %#x board %#x SoC %#x\\n", chip_id, chip_family, board_id, soc_id);
+	}
+	if (board_id <= 0xff) {
+		snprintf(name, sizeof(name), "bdwlan.b%02x", board_id);
+	} else {
+		snprintf(name, sizeof(name), "bdwlan.%03x", board_id);
+	}
+	if (!image_file(name, &board_size, &board_first)) {
+		strlcpy(name, "bdwlan.bin", sizeof(name));
+		if (!image_file(name, &board_size, &board_first)) {
+			board_size = 0;
+		}
+	}
+	if (board_size == 0) {
+		printf("mss: wlfw: no board file in modem_a's image\\n");
+	} else {
+		uint32_t sent = 0, segment = 0;
+		bool ok = true;
+
+		printf("mss: wlfw: the board's data: %s, %u bytes\\n", name, board_size);
+		while (ok && sent < board_size) {
+			uint32_t piece = board_size - sent > WLFW_BDF_PIECE ? WLFW_BDF_PIECE : board_size - sent;
+			bool end = sent + piece == board_size;
+
+			at = wlfw2_u8(tlvs, 0x01, 1);                           /* valid */
+			at += wlfw2_u32(tlvs + at, 0x10, 0);                    /* file_id */
+			at += wlfw2_u32(tlvs + at, 0x11, board_size);           /* total_size */
+			at += wlfw2_u32(tlvs + at, 0x12, segment);              /* seg_id */
+			tlvs[at++] = 0x13;                                      /* data: a 2-byte count, then the bytes */
+			tlvs[at++] = (uint8_t)(piece + 2);
+			tlvs[at++] = (uint8_t)((piece + 2) >> 8);
+			tlvs[at++] = (uint8_t)piece;
+			tlvs[at++] = (uint8_t)(piece >> 8);
+			if (file_read(board_first, sent, tlvs + at, piece) != 0) {
+				printf("mss: wlfw: the board file cannot be read\\n");
+				goto out;
+			}
+			at += piece;
+			at += wlfw2_u8(tlvs + at, 0x14, end ? 1 : 0);           /* end */
+			ok = wlfw2_ask(end ? "board data, the last piece" : "board data", WLFW_BDF_DOWNLOAD, tlvs, at);
+			if (!ok && end && (value = qmi_tlv(wlfw2_answer, wlfw2_answer_length, 2, &size)) != NULL && size == 4 &&
+			    (value[2] | value[3] << 8) == 1) {
+				ok = true;              /* (its CRC check fails on valid files: ath10k uses it all the same) */
+			}
+			sent += piece;
+			segment++;
+		}
+		if (!ok) {
+			goto out;
+		}
+	}
+	tlvs[0] = 0x01;
+	tlvs[1] = 1;
+	tlvs[2] = 0;
+	tlvs[3] = 0;
+	(void)wlfw2_ask("calibrations (none)", WLFW_CAL_REPORT, tlvs, 4);
+	for (unsigned ms = 0; ms < 15000 && !wlfw2_fw_ready; ms += 10) {
+		IOSleep(10);
+	}
+	printf("mss: wlfw: %s\\n", wlfw2_fw_ready ? "THE WI-FI FIRMWARE IS READY" : "not ready in 15 s");
+out:
+	thread_terminate(current_thread());
+}
+
+static void
+wlfw2_start(void)
+{
+	uint32_t want = 1;
+	thread_t thread;
+
+	PE_parse_boot_argn("wlfw", &want, sizeof(want));
+	if (want == 0) {
+		return;
+	}
+	wlfw2_port = qrtr_open(wlfw2_receive, wlfw2_server, NULL);
+	if (wlfw2_port == NULL || qrtr_lookup(wlfw2_port, SERVICE_WLFW, 1, 0) != 0) {
+		printf("mss: wlfw: no port for the Wi-Fi firmware's service\\n");
+		return;
+	}
+	if (kernel_thread_start(wlfw2_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}
+
+static bool
+step_serve(void)
+{""")
+sub1(MSS, """	if (rmtfs_memory == 0 && !rmtfs_memory_setup()) {
+		return false;
+	}
+""", """	if (rmtfs_memory == 0 && !rmtfs_memory_setup()) {
+		return false;
+	}
+	wlfw2_start();
+""")
+sub1(MSS, """static char mss_reads[200];                     /* ... those read, once each */
+""", """static char mss_reads[200];                     /* ... those read, once each */
+static char mss_wlfw[80] = "no WLFW exchange";  /* the last thing the WLFW exchange said */
+""")
+sub1(MSS, """		if ((at = strnstr(line, "RMTFS: read ", sizeof(line))) != NULL) {""", """		if (strncmp(line, "mss: wlfw: ", 11) == 0) {
+			strlcpy(mss_wlfw, line + 11, sizeof(mss_wlfw));
+		}
+		if ((at = strnstr(line, "RMTFS: read ", sizeof(line))) != NULL) {""")
+sub1(MSS, """			redwood_status(REDWOOD_STATUS_STORAGE, "%.56s", mss_tftp);""",
+     """			redwood_status(REDWOOD_STATUS_STORAGE, "wlfw: %.50s", mss_wlfw);""")
+
+# The modem on doha, eighth run (2026-11-12): "wlfw: no WLFW exchange" -- the Wi-Fi firmware's service never came: the
+# firmware asserts while it starts, before it offers anything (so not for want of the host's exchange). willow found the
+# same assert with the radio chip unpowered, and this driver asks the RPM for its five supplies first; whether that was
+# done on doha is said on a line nobody saw. Now the Touch line keeps it at the end
+sub1(MSS, """static char mss_wlfw[80] = "no WLFW exchange";  /* the last thing the WLFW exchange said */
+""", """static char mss_wlfw[80] = "no WLFW exchange";  /* the last thing the WLFW exchange said */
+static char mss_power[80] = "supplies: not asked";      /* what the radio chip's supplies came to */
+""")
+sub1(MSS, """		if (strncmp(line, "mss: wlfw: ", 11) == 0) {""", """		if ((at = strnstr(line, "supplies: ", sizeof(line))) != NULL) {
+			strlcpy(mss_power, at, sizeof(mss_power));
+		}
+		if (strncmp(line, "mss: wlfw: ", 11) == 0) {""")
+sub1(MSS, """			redwood_status(REDWOOD_STATUS_TOUCH, "%.56s", n > 50 ? mss_reads + 50 : "");""",
+     """			redwood_status(REDWOOD_STATUS_TOUCH, "%.56s", mss_power);""")
+
+# The modem on doha, the IPA's SMP2P entry (2026-11-12): with the radio's five supplies on (the panel: "ALL FIVE ON") the
+# Wi-Fi domain still asserted (platform_main.c:platform_main_task:230), as on willow. doha's dt (trinket.dtsi,
+# qcom,smp2p-modem) has a second outbound entry, "ipa" (qcom,smp2p-ipa-1-out), which Android's IPA driver makes at its probe,
+# long before the modem starts, and answers through when the modem's own "ipa" entry asks whether the IPA's clock is on
+# (ipa3_smp2p_notify(): bit 0 "the answer is there", bit 1 "the clock is on", once per modem start). Here: the entry made
+# (mss_ipa_entry=0: not), the answer given once the modem asks (mss_ipa=1, the clock off, by default; 3 on; 0 none). The
+# panel's Touch line at the end: the modem's SMP2P entries and their values, the last time they changed
+sub1(MSS, """static char mss_power[80] = "supplies: not asked";      /* what the radio chip's supplies came to */
+""", """static char mss_power[80] = "supplies: not asked";      /* what the radio chip's supplies came to */
+static char mss_smp2p[80] = "no modem SMP2P";   /* the modem's SMP2P entries, the last time they changed */
+static uint32_t mss_ipa_asked;                  /* the modem's "ipa" entry when our answer went out; 0: not yet */
+""")
+sub1(MSS, """	smem_poke(our_smp2p + SMP2P_AT_COUNTS, 16 | 1u << 16);
+""", """	{
+		uint32_t entry = 1;
+
+		PE_parse_boot_argn("mss_ipa_entry", &entry, sizeof(entry));
+		if (entry) {
+			bzero(name, sizeof(name));
+			strlcpy((char *)name, "ipa", sizeof(name));
+			for (uint32_t word = 0; word < 4; word++) {
+				smem_poke(our_smp2p + SMP2P_AT_NAME(1) + 4 * word, name[word]);
+			}
+			smem_poke(our_smp2p + SMP2P_AT_NAME(1) + 16, 0);
+		}
+		smem_poke(our_smp2p + SMP2P_AT_COUNTS, 16 | (entry ? 2u : 1u) << 16);
+		mss_ipa_asked = 0;
+	}
+""")
+sub1(MSS, """	show_smp2p("the link: the modem's item changes", words);
+""", """	show_smp2p("the link: the modem's item changes", words);
+	{
+		size_t n = 0;
+
+		mss_smp2p[0] = 0;
+		for (unsigned i = 0; i < words->valid && i < 16 && n < sizeof(mss_smp2p) - 1; i++) {
+			const char *what = words->entry[i].name;
+			uint32_t value = words->entry[i].value, answer = 1;
+
+			snprintf(mss_smp2p + n, sizeof(mss_smp2p) - n, "%.12s=%x ",
+			    strncmp(what, "slave-kernel", 16) == 0 ? "sk" : what, value);
+			n = strlen(mss_smp2p);
+			if (strncmp(what, "ipa", 16) == 0 && value != 0 && mss_ipa_asked == 0 && our_smp2p != 0) {
+				PE_parse_boot_argn("mss_ipa", &answer, sizeof(answer));
+				mss_ipa_asked = value;
+				if (answer != 0) {
+					smem_poke(our_smp2p + SMP2P_AT_NAME(1) + 16, answer);
+					ring(IPC_MODEM_SMP2P, "the modem's SMP2P doorbell (the IPA's answer)");
+				}
+				mss_say("mss: the modem asks of the IPA (%#x); answered %#x", value, answer);
+			}
+		}
+	}
+""")
+sub1(MSS, """			redwood_status(REDWOOD_STATUS_TOUCH, "%.56s", mss_power);""",
+     """			redwood_status(REDWOOD_STATUS_TOUCH, "%.56s", mss_smp2p);""")
+
+# The modem on doha, the IPA's SMP2P entry, second run (2026-11-12): the panel said "no modem SMP2P" -- modem_listen()
+# runs only on a change after the link's thread has its first copy, and the modem had written its entries before. The
+# first copy goes through it too now, so the entries are seen (and an "ipa" question already there answered)
+sub1(MSS, """	bzero(&last, sizeof(last));
+	modem_words(&last);
+	while (link_wanted) {""", """	bzero(&last, sizeof(last));
+	if (modem_words(&last)) {
+		modem_listen(&last);
+	}
+	while (link_wanted) {""")
+
+# The modem on doha, its SMP2P item (2026-11-12): the panel still said "no modem SMP2P" with the first copy listened to:
+# modem_words() took the modem's item only at the full 340 bytes of 16 entries, and the modem's own is smaller -- so the
+# link's thread never saw an entry of the modem's at all (nor a "fatal", nor an "ipa" question). Any item with its
+# header now, read up to its size, the rest zeroes; and the panel says the item's size
+sub1(MSS, """modem_words(struct smp2p *words)
+{
+	static uint32_t at;
+	uint32_t size = 0;
+
+	if (at == 0) {
+		at = smem_item(ITEM_SMP2P_THEIRS, &size);
+		if (at == 0 || size < sizeof(*words)) {
+			at = 0;
+			return false;
+		}
+	}
+	return smem_peek(at, words, sizeof(*words)) && words->magic == SMP2P_MAGIC;
+}""", """modem_words(struct smp2p *words)
+{
+	static uint32_t at, have;
+	uint32_t size = 0;
+
+	if (at == 0) {
+		at = smem_item(ITEM_SMP2P_THEIRS, &size);
+		if (at == 0 || size < 20) {
+			at = 0;
+			snprintf(mss_smp2p, sizeof(mss_smp2p), "modem SMP2P item: %s (%u bytes)", size == 0 ? "none" : "small", size);
+			return false;
+		}
+		have = size < sizeof(*words) ? size : (uint32_t)sizeof(*words);
+		snprintf(mss_smp2p, sizeof(mss_smp2p), "modem SMP2P item %u bytes, no entries read", size);
+	}
+	bzero(words, sizeof(*words));
+	if (!smem_peek(at, words, have) || words->magic != SMP2P_MAGIC) {
+		return false;
+	}
+	if (words->valid > (have - 20) / 20) {
+		words->valid = (uint16_t)((have - 20) / 20);
+	}
+	return true;
+}""")
+
+# doha, battery step 3 (2026-11-12): charge=2, the charging enable command written. The charge=1 run (kernel 14:07,
+# cable in, 60 %) petted the watchdog (chg+, W62/8c) but the charger stayed off: status 1 = 0x47 (bits 2:0 = 7,
+# DISABLE_CHARGE), CHARGING_ENABLE_CMD (CHGR 0x42) = 0x00 -- the command Android's smblib_chg_disable_vote_callback writes
+# (bit 0, CHARGING_ENABLE_CMD_BIT) and nobody wrote here; the battery's current fell to 0 (the cable feeding the system,
+# the battery left alone). With charge=2, besides the petting: while the cable is in and bit 0 reads 0, bit 0 written 1
+# through the arbiter's write channel for CHGR (0x210) if it is ours; the only other write. Voltage, current and
+# temperature limits stay the PMIC's (as Android last left them); stops for good on a refused write
+sub1(BTN, """	pets++;
+}
+""", """	pets++;
+}
+
+/*
+ * charge=2 (doha): the charging enable command (CHGR 0x42 bit 0) written 1 while a cable is in and it reads 0, through
+ * the arbiter's write channel for the PMI632's CHGR block (0x210), if this system owns it
+ */
+static vm_offset_t enable_channel;
+static uint16_t enable_channel_n;
+static bool enable_stopped;
+static uint32_t enables;
+
+static void
+enable_setup(uint32_t channels)
+{
+	for (uint32_t n = 0; n < channels; n++) {
+		uint32_t map = rd(arb_core + ARB_CHANNEL(n));
+
+		if (map != 0 && ((map >> 8) & 0xfff) == 0x210 && (rd(arb_cnfg + ARB_OWNER(n)) & 7) == ARB_SYSTEM) {
+			enable_channel_n = (uint16_t)n;
+			enable_channel = ml_io_map(DOHA_ARB_CHNLS + 0x10000UL * n, 0x1000);
+			printf("battery: charge=2: the charging enable command will be written (channel %u, CHGR 0x42)\\n", n);
+			return;
+		}
+	}
+	printf("battery: charge=2, but no channel of the charger's CHGR block is ours to write through: not enabled\\n");
+}
+
+static void
+charge_enable(void)
+{
+	uint64_t start, interval;
+	uint32_t status;
+	uint8_t en = 0;
+
+	if (enable_channel == 0 || enable_stopped) {
+		return;
+	}
+	if (spmi_read(&chgr, 0x42, &en, 1) != NULL || (en & 1) != 0) {
+		return;
+	}
+	if (((rd(arb_core + ARB_CHANNEL(enable_channel_n)) >> 8) & 0xfff) != 0x210) {
+		enable_stopped = true;
+		printf("battery: the arbiter's channel %u is no longer the charger's CHGR: not enabled any more\\n", enable_channel_n);
+		return;
+	}
+	nanoseconds_to_absolutetime(READ_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
+	redwood_spmi_lock();
+	wr(enable_channel + CHANNEL_WDATA0, (uint32_t)(en | 1));
+	wr(enable_channel + OBSERVER_COMMAND, COMMAND_WRITE | 0x42u << 4);
+	start = mach_absolute_time();
+	do {
+		status = rd(enable_channel + OBSERVER_STATUS);
+	} while (!(status & STATUS_DONE) && mach_absolute_time() - start < interval);
+	redwood_spmi_unlock();
+	if (!(status & STATUS_DONE) || (status & (STATUS_DENIED | STATUS_FAILURE))) {
+		enable_stopped = true;
+		printf("battery: the charging enable command not written any more: %s (status %#x)\\n",
+		    !(status & STATUS_DONE) ? "no answer from the arbiter" : "the write was refused", status);
+		return;
+	}
+	if (enables++ == 0) {
+		printf("battery: charging enabled (CHGR 0x42 was %#x)\\n", en);
+	}
+}
+""")
+sub1(BTN, """			if (PE_parse_boot_argn("charge", &charge, sizeof(charge)) && charge) {
+				pet_setup(channels);
+			}
+""", """			if (PE_parse_boot_argn("charge", &charge, sizeof(charge)) && charge) {
+				pet_setup(channels);
+				if (charge >= 2) {
+					enable_setup(channels);
+				}
+			}
+""")
+sub1(BTN, """	if ((usb & 0x10) != 0) {
+		pet();
+	}
+""", """	if ((usb & 0x10) != 0) {
+		pet();
+		charge_enable();
+	}
+""")
+sub1(BTN, """		redwood_status(REDWOOD_STATUS_WIFI, "chg%s S%02x/%02x E%02x U%02x W%02x/%02x I%d avg %dmA/%us",
+		    pet_stopped ? "!" : pets != 0 ? "+" : "", st[0], st[1], en, il, wd[0], wd[2], current_now(), current_average(),
+		    current_count);""", """		redwood_status(REDWOOD_STATUS_WIFI, "chg%s%s S%02x/%02x E%02x U%02x W%02x/%02x I%d avg %dmA/%us",
+		    pet_stopped ? "!" : pets != 0 ? "+" : "", enable_stopped ? "x" : enables != 0 ? "e" : "", st[0], st[1], en, il,
+		    wd[0], wd[2], current_now(), current_average(), current_count);""")
+
+# The modem on doha, no SMP2P item of its own (2026-11-12): the panel said "modem SMP2P item: none (0 bytes)" at the end
+# of the run -- the modem made GLINK's items but never its SMP2P item (428), the one its Wi-Fi domain puts its entry
+# "wlan" in (dt: qcom,smp2p-wlan-1-in); a domain that cannot make that entry plausibly asserts at its start
+# (platform_main_task). Our doorbell for SMP2P was rung once, before the modem ran. While the modem's item is not there,
+# the link's thread rings it once a second (up to 60 times; mss_smp2p_rings=N), and the panel's Touch line says how many
+# times it was rung before the item came, or that it never did
+sub1(MSS, """			snprintf(mss_smp2p, sizeof(mss_smp2p), "modem SMP2P item: %s (%u bytes)", size == 0 ? "none" : "small", size);
+""", "")
+sub1(MSS, """	struct glink_packet *packet;
+	bool gave_up = false;
+""", """	struct glink_packet *packet;
+	bool gave_up = false;
+	uint32_t smp2p_rings = 0, smp2p_rings_max = 60, smp2p_wait = 0;
+
+	PE_parse_boot_argn("mss_smp2p_rings", &smp2p_rings_max, sizeof(smp2p_rings_max));
+""")
+sub1(MSS, """		if (modem_words(&words) && memcmp(&words, &last, sizeof(words)) != 0) {""",
+     """		if (smp2p_rings < smp2p_rings_max && !modem_words(&words) && ++smp2p_wait >= 1000) {
+			smp2p_wait = 0;
+			smp2p_rings++;
+			ring(IPC_MODEM_SMP2P, "the modem's SMP2P doorbell (its item is not there)");
+			snprintf(mss_smp2p, sizeof(mss_smp2p), "modem SMP2P item: none; rung %u times", smp2p_rings);
+		}
+		if (modem_words(&words) && memcmp(&words, &last, sizeof(words)) != 0) {
+			if (smp2p_rings != 0 && last.magic == 0) {
+				mss_say("mss: link: the modem's SMP2P item came after %u rings", smp2p_rings);
+			}""")
+
+# The modem on doha, which items it makes (2026-11-12): rung 45 times, the modem's SMP2P item (428) never came. The
+# panel's Touch line now lists, each time the doorbell is rung, the items in the partition of us and the modem -- what
+# the modem made there, and so whether its SMP2P item is under another number
+sub1(MSS, """			snprintf(mss_smp2p, sizeof(mss_smp2p), "modem SMP2P item: none; rung %u times", smp2p_rings);
+""", """			{
+				static struct smem_item listed[40];
+				uint32_t cacheline = 0, psize = 0, part = smem_partition(SMEM_US, SMEM_MODEM, &cacheline, &psize);
+				unsigned count = smem_items(part, cacheline, listed, 40);
+
+				snprintf(mss_smp2p, sizeof(mss_smp2p), "r%u n%u:", smp2p_rings, count);
+				for (unsigned i = 0; i < count && i < 40; i++) {
+					size_t n = strlen(mss_smp2p);
+
+					snprintf(mss_smp2p + n, sizeof(mss_smp2p) - n, " %u", (unsigned)listed[i].item);
+				}
+			}
+""")
+
+# The modem on doha, its SMP2P item by its magic (2026-11-12): the partition of us and the modem had 435 (ours), 478 479
+# 480 (GLINK), 605, 611 and 497 (the IPA's filter tables, made by the modem itself) -- no 428. Should this modem keep its
+# SMP2P item under another number, it is found by what it begins with ("$SMP", from the modem to us); the panel's Touch
+# line begins with the item's number ("i611 ..."), or, with none, lists the items and their first words
+sub1(MSS, """modem_words(struct smp2p *words)
+{
+	static uint32_t at, have;
+	uint32_t size = 0;
+
+	if (at == 0) {
+		at = smem_item(ITEM_SMP2P_THEIRS, &size);
+""", """static uint32_t mss_smp2p_item;                 /* the number of the modem's SMP2P item, once found */
+
+static uint32_t
+smp2p_by_magic(uint32_t *size)
+{
+	static struct smem_item listed[40];
+	uint32_t cacheline = 0, psize = 0, part = smem_partition(SMEM_US, SMEM_MODEM, &cacheline, &psize);
+	unsigned count = smem_items(part, cacheline, listed, 40);
+
+	for (unsigned i = 0; i < count && i < 40; i++) {
+		struct smp2p head;
+
+		if (listed[i].item == ITEM_SMP2P_OURS || listed[i].size < 20) {
+			continue;
+		}
+		bzero(&head, sizeof(head));
+		if (smem_peek(listed[i].offset, &head, 20) && head.magic == SMP2P_MAGIC && head.local == SMEM_MODEM) {
+			*size = listed[i].size;
+			mss_smp2p_item = listed[i].item;
+			return listed[i].offset;
+		}
+	}
+	return 0;
+}
+
+static bool
+modem_words(struct smp2p *words)
+{
+	static uint32_t at, have;
+	uint32_t size = 0;
+
+	if (at == 0) {
+		at = smem_item(ITEM_SMP2P_THEIRS, &size);
+		if (at != 0) {
+			mss_smp2p_item = ITEM_SMP2P_THEIRS;
+		} else {
+			at = smp2p_by_magic(&size);
+		}
+""")
+sub1(MSS, """static bool
+static uint32_t mss_smp2p_item;""", """static uint32_t mss_smp2p_item;""")
+sub1(MSS, """		mss_smp2p[0] = 0;
+		for (unsigned i = 0; i < words->valid""", """		snprintf(mss_smp2p, sizeof(mss_smp2p), "i%u ", mss_smp2p_item);
+		n = strlen(mss_smp2p);
+		for (unsigned i = 0; i < words->valid""")
+sub1(MSS, """					snprintf(mss_smp2p + n, sizeof(mss_smp2p) - n, " %u", (unsigned)listed[i].item);""",
+     """					uint32_t first = 0;
+
+					smem_peek(listed[i].offset, &first, 4);
+					snprintf(mss_smp2p + n, sizeof(mss_smp2p) - n, " %u:%x", (unsigned)listed[i].item, first & 0xffff);""")

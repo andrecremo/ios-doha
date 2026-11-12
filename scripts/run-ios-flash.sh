@@ -107,7 +107,9 @@ TOUCHARG=; [ "${TOUCH:-1}" = 1 ] && TOUCHARG=" touchscreen=1"
 [ "${BATTERY:-1}" = 1 ] && TOUCHARG="$TOUCHARG battery=1"
 # CHARGE=1: charge=1, the charger's watchdog petted every 5 s while a cable is in (MISC 0x43), without which the
 # PMI632 stops charging a few minutes into the run; the panel's Wi-Fi line then starts "chg+" ("chg!": a write refused)
-[ "${CHARGE:-0}" = 1 ] && TOUCHARG="$TOUCHARG charge=1"
+# CHARGE=2: charge=2, also the charging enable command (CHGR 0x42 bit 0) written 1 while it reads 0 ("chg+e"; "x": refused)
+# default CHARGE=2 since 2026-11-12 (the charge=2 run charged: E01, full-on, the bolt in the status bar); CHARGE=0: no write
+case "${CHARGE:-2}" in 1|2) TOUCHARG="$TOUCHARG charge=${CHARGE:-2}" ;; esac
 # HUD=1: fb_hud=1, a line for each part of the phone (the drivers' redwood_status()) drawn over the picture
 # GPU=1: gpu=1, the Adreno 610 started and kept for the system (redwood_a610.c; the RPM's buses first, the zap shader,
 # 745 MHz); FBGPU=1 too: fb_gpu=1, frames onto the panel by the GPU's 2D engine (with a GL=1 small image)

@@ -885,3 +885,46 @@ Wi-Fi, levantamento (2026-11-11, só leitura):
   Asserted in platform_main.c:platform_main_task:230", logo depois do domínio do Wi-Fi ficar UP. O miatoll não esbarrou
   nisso; o que o `hakios.mpss.c` dele faz antes do domínio subir (modem em baixo consumo, sem handshake do IPA, item 497
   deixado ao modem, fila GLINK do host, localizador do ADSP) é o próximo lugar a olhar.
+- Quinta/sexta rodada (2026-11-12): com o buffer abaixo de 4 GB o modem lê o próprio sistema de arquivos (RMTFS: 4096
+  setores); pelo TFTP pede `shob.bin`, `hob_report.txt`, `dhob.bin`, `dhob_report.txt` (recusados: arquivos que ele
+  mesmo grava em /readwrite) e grava `server_check.txt`; o assert continua. O `modemr.jsn` do doha lista no domínio
+  raiz um serviço a mais que a tabela do willow, `tms/pdr_enabled`, que o localizador respondia "em nenhum domínio" (uma
+  das pistas abertas do README do willow). Acrescentado à tabela.
+- Sétima rodada (2026-11-12): por TFTP o modem lê só o `wlanmdsp.mbn` (em pedaços) e nenhum arquivo de calibração: os
+  dados da placa são do host, pela troca WLFW, que o nosso driver não fazia. Portada do miatoll (o `qmi.c` do ath10k à
+  mão): indicações, capacidades do host, MSA (0x53300000, 1 MB) com as regiões dadas ao firmware pelo TrustZone
+  (MP_ASSIGN HLOS -> MSS_MSA + WLAN, como o icnss; o dt do doha não tem `qcom,hyp_disabled`; `wlfw_assign=0` desliga),
+  MSA pronto, capacidades do chip, `bdwlan.b<placa>` ou `bdwlan.bin` em pedaços de 6144 bytes, calibrações (nenhuma),
+  e a espera do "ready". Começa no passo 11, antes de os serviços serem oferecidos (`wlfw=0` desliga).
+
+## Carga, teste charge=1 (2026-11-12, kernel 14:07)
+
+Cabo conectado, bateria em 60 %.
+
+| hora | HUD Wi-Fi | HUD Battery |
+|---|---|---|
+| 14:27 (boot, CPU a 1804) | `chg+ S47/08 E00 U00 W62/8c I429 avg 261mA/30s` | `60%~ 3975 mV, cable 1, chg 0` |
+| 14:32 (ocioso) | `chg+ S47/08 E00 U00 W62/8c I0 avg 0mA/30s` | `60%~ 3977 mV, cable 1, chg 0` |
+
+- O watchdog foi alimentado sem recusa (`chg+`), mas o carregador continuou desligado.
+- `S47`: os bits 2:0 do STATUS_1 valem 7 (DISABLE_CHARGE).
+- `E00`: o bit 0 do CHARGING_ENABLE_CMD (CHGR 0x42) está em 0. No Android, quem escreve esse bit é o `smblib_chg_disable_vote_callback`; aqui ninguém escreve.
+- Com o cabo alimentando o sistema, a bateria fica parada: corrente 0 e tensão estável.
+- STATUS_2 = 0x08: o bit 3 não está descrito no smb5-reg.h deste kernel. Fica anotado.
+
+O próximo passo, `charge=2` (`CHARGE=2` no `run-ios-flash.sh`), faz o mesmo que o charge=1 e, além disso, escreve 1 no bit 0 do CHGR 0x42 enquanto o cabo estiver conectado e o bit ler 0. A escrita passa pelo canal de escrita do árbitro do CHGR (0x210), e só se esse canal for deste sistema. Os limites de tensão, corrente e temperatura continuam os da PMIC, como o Android os deixou. Se a escrita for recusada, o código para e o HUD mostra `chg+x`; quando dá certo, mostra `chg+e` e `E01`. Kernel compilado às 14:36 (2026-11-12).
+
+## Carga, teste charge=2 (2026-11-12, kernel 14:36, junto com MSS=11): **o iOS carrega**
+
+Cabo conectado.
+
+| hora | HUD Wi-Fi | HUD Battery |
+|---|---|---|
+| 14:39 (boot) | `chg+e S03/08 E01 U00 W62/8c I256 avg 342mA/30s` | `60%~ 3977 mV, cable 1, chg 1` |
+| 14:44 (ocioso) | `chg+e S03/08 E01 U00 W62/8c I-31 avg -99mA/30s` | `65%~ 4017 mV, cable 1, chg 1` |
+
+- O comando de carga foi escrito sem recusa (`e`, `E01`). Estado 3 = full-on, e o iOS mostra o raio na barra de status.
+- A corrente média ficou baixa, cerca de 100 mA entrando na bateria em repouso. Provável causa: o limite de entrada está no valor padrão de USB (~500 mA, porque não há detecção do tipo de carregador), e o sistema consome parte disso. A ICL não foi mexida.
+- Os +5 % em 5 minutos não batem com ~100 mA: isso seria ~0,2 % em 5 min numa bateria de 4000 mAh. O nível vem da tensão, e a tensão sobe quando entra corrente (4017 mV contra 3977). Por isso a porcentagem fica superestimada durante a carga. O passo 4, que calcula o nível pela curva OCV do KD40 compensando a corrente (V − I·R), corrige isso.
+- Próximos passos possíveis: deixar CHARGE=2 como padrão; ler o ICL efetivo (DCDC 0x07) e o tipo de carregador (APSD) para entender o limite de ~500 mA.
+- Desde 2026-11-12, `CHARGE=2` é o padrão do `run-ios-flash.sh`. Para não escrever nada no carregador, use `CHARGE=0`.
