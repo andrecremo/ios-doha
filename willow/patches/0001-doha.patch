@@ -1,6 +1,6 @@
-From 98a00aa2182d84ebd17b94449fa965b26223b845 Mon Sep 17 00:00:00 2001
+From e9b1c3ae3d5e4050f48eca7cf7b04ce92665889d Mon Sep 17 00:00:00 2001
 From: andrecremo <andreljsantos@gmail.com>
-Date: Wed, 11 Nov 2026 15:48:41 -0300
+Date: Thu, 12 Nov 2026 10:34:05 -0300
 Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
 
 ---
@@ -10,6 +10,7 @@ Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
  xnu/files/bsd/dev/redwood_buttons.c           | 256 +++++
  xnu/files/bsd/dev/redwood_focaltech.c         | 943 ++++++++++++++++++
  xnu/files/bsd/dev/redwood_input.c             |   4 +
+ xnu/files/bsd/dev/redwood_mss.c               | 329 +++++-
  xnu/files/bsd/dev/redwood_osm.c               | 154 ++-
  xnu/files/bsd/dev/redwood_rpm.c               |  11 +-
  xnu/files/bsd/dev/redwood_ufs.c               |   5 +
@@ -22,7 +23,7 @@ Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
  xnu/redwood.patch                             |   9 +-
  xnuloader/build.sh                            |   3 +-
  xnuloader/loader.c                            | 435 +++++++-
- 18 files changed, 2386 insertions(+), 22 deletions(-)
+ 19 files changed, 2702 insertions(+), 35 deletions(-)
  create mode 100644 xnu/files/bsd/dev/redwood_focaltech.c
 
 diff --git a/xnu/files/bsd/dev/redwood_a610.c b/xnu/files/bsd/dev/redwood_a610.c
@@ -1439,6 +1440,428 @@ index 5f0ee3e..ca46795 100644
  	redwood_buttons_init();
  	redwood_battery_init();
  	redwood_ufs_init();
+diff --git a/xnu/files/bsd/dev/redwood_mss.c b/xnu/files/bsd/dev/redwood_mss.c
+index a1c8b23..cad7918 100755
+--- a/xnu/files/bsd/dev/redwood_mss.c
++++ b/xnu/files/bsd/dev/redwood_mss.c
+@@ -72,6 +72,64 @@ extern bool redwood_rpm_ldo(const char *what, uint32_t id, uint32_t microvolts);
+ 
+ static uint32_t mss_step, step;
+ static bool modem_started;             /* TrustZone has let it out of reset (step 7) */
++static const char *mss_modem_partition = "modem";      /* doha: "modem_a" (redwood_mss_init()) */
++
++/* doha: every line said also onto the panel's Sound line (the modem has no screen of its own to say it on) */
++static char mss_last[200];
++static uint32_t mss_located, mss_files;         /* the locator asked, files read over TFTP */
++static char mss_wifi[16] = "-", mss_failed[48]; /* the Wi-Fi domain's last state, a domain's failure */
++
++static int
++mss_say(const char *format, ...)
++{
++	char line[300];
++	va_list list;
++	size_t length;
++	int n;
++
++	va_start(list, format);
++	n = vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	printf("%s", line);
++	length = strlen(line);
++	if (length > 0 && line[length - 1] == '\n') {
++		line[length - 1] = 0;
++	}
++	{
++		const char *at;
++
++		if (strnstr(line, "THE LOCATOR IS ASKED", sizeof(line)) != NULL) {
++			mss_located++;
++		}
++		if (strnstr(line, "TFTP: READ", sizeof(line)) != NULL) {
++			mss_files++;
++		}
++		if ((at = strnstr(line, "DOMAIN IS NOW ", sizeof(line))) != NULL) {
++			size_t k = 0;
++
++			for (at += 14; at[k] != 0 && at[k] != ' ' && k < sizeof(mss_wifi) - 1; k++) {
++				mss_wifi[k] = at[k];
++			}
++			mss_wifi[k] = 0;
++		}
++		if ((at = strnstr(line, "HAS FAILED: ", sizeof(line))) != NULL || (at = strnstr(line, "GIVEN UP", sizeof(line))) != NULL) {
++			size_t n = strlen(at);
++
++			/* (the end of it: where an assert says its file and line) */
++			strlcpy(mss_failed, n > sizeof(mss_failed) - 1 ? at + n - (sizeof(mss_failed) - 1) : at, sizeof(mss_failed));
++		}
++		if (strncmp(line, "mss: done", 9) == 0 && step > 11) {   /* (a STOP before the services keeps its line) */
++			redwood_status(REDWOOD_STATUS_SOUND, "loc %u tftp %u wifi %s %.34s", mss_located, mss_files, mss_wifi,
++			    mss_failed[0] ? mss_failed : "no failure");
++		}
++	}
++	if (strnstr(line, "STOP", sizeof(line)) == NULL && strncmp(line, "mss: done", 9) != 0) {
++		strlcpy(mss_last, strncmp(line, "mss: ", 5) == 0 ? line + 5 : line, sizeof(mss_last));
++		redwood_status(REDWOOD_STATUS_SOUND, "modem %.52s", mss_last);
++	}
++	return n;
++}
++#define printf mss_say
+ 
+ static uint32_t
+ rd(vm_offset_t address)
+@@ -386,7 +444,7 @@ struct fat_dirent {
+ static int
+ part_read(uint64_t offset, void *to, uint64_t length)
+ {
+-	return redwood_ufs_read_named("modem", offset, to, length, NULL);
++	return redwood_ufs_read_named(mss_modem_partition, offset, to, length, NULL);
+ }
+ 
+ static bool
+@@ -397,7 +455,7 @@ fat_open(void)
+ 	uint64_t part_size = 0;
+ 	int error;
+ 
+-	if ((error = redwood_ufs_read_named("modem", 0, NULL, 0, &part_size)) != 0) {
++	if ((error = redwood_ufs_read_named(mss_modem_partition, 0, NULL, 0, &part_size)) != 0) {
+ 		printf("mss: %u: the partition \"modem\" is not there (%d): the storage has to be up (ufs=2)\n", step, error);
+ 		return false;
+ 	}
+@@ -437,6 +495,214 @@ fat_open(void)
+ 	return true;
+ }
+ 
++/*
++ * doha: its modem partition (modem_a) is ext4, not willow's FAT16 (mss_step=2 on doha: "not the FAT16 this reads"; Lineage's
++ * recovery mounts it as ext4, image/ in its root). So the files of its directory image are found and read here, read
++ * only: the superblock (at 1024), the group descriptors, an inode, its extent tree (depth 0 in the inode, or index blocks
++ * below it), and a directory's entries read through as a file. image_file() and file_read() take this way when ext.on;
++ * a file's "first" is then its inode.
++ */
++static struct {
++	bool on;
++	uint32_t block, inode_size, inodes_per_group, desc_size, image_inode;
++	bool is64;
++	uint64_t gdt;
++	uint8_t *leaf;                          /* the last extent block read, and which it was */
++	uint64_t leaf_at;
++} ext;
++
++static uint32_t
++ext_le32(const uint8_t *p)
++{
++	return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static uint16_t
++ext_le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | p[1] << 8);
++}
++
++static bool
++ext_open(void)
++{
++	uint8_t sb[1024];
++	uint32_t incompat;
++
++	if (part_read(1024, sb, sizeof(sb)) != 0 || ext_le16(sb + 0x38) != 0xef53) {
++		printf("mss: %u: not ext4 either (magic %#x)\n", step, ext_le16(sb + 0x38));
++		return false;
++	}
++	ext.block = 1024u << ext_le32(sb + 0x18);
++	ext.inodes_per_group = ext_le32(sb + 0x28);
++	ext.inode_size = ext_le32(sb + 0x4c) >= 1 ? ext_le16(sb + 0x58) : 128;
++	incompat = ext_le32(sb + 0x60);
++	ext.is64 = (incompat & 0x80) != 0;
++	ext.desc_size = ext.is64 && ext_le16(sb + 0xfe) >= 32 ? ext_le16(sb + 0xfe) : 32;
++	ext.gdt = (uint64_t)(ext_le32(sb + 0x14) + 1) * ext.block;
++	if (ext.block > 65536 || ext.inode_size < 128 || ext.inode_size > 1024 || ext.inodes_per_group == 0 || !(incompat & 0x40)) {
++		printf("mss: %u: ext4 this does not read: %u-byte blocks, %u-byte inodes, features %#x\n", step, ext.block,
++		    ext.inode_size, incompat);
++		return false;
++	}
++	ext.leaf = kalloc_data(ext.block, Z_WAITOK);
++	if (ext.leaf == NULL) {
++		return false;
++	}
++	ext.leaf_at = ~0ull;
++	ext.on = true;
++	printf("mss: %u: ext4: %u-byte blocks, %u inodes a group of %u bytes, descriptors of %u\n", step, ext.block,
++	    ext.inodes_per_group, ext.inode_size, ext.desc_size);
++	return true;
++}
++
++/* inode n's first 160 bytes (enough for the size and the extent tree's root) */
++static bool
++ext_inode(uint32_t n, uint8_t inode[160])
++{
++	uint8_t desc[64];
++	uint32_t group = (n - 1) / ext.inodes_per_group, index = (n - 1) % ext.inodes_per_group;
++	uint64_t table;
++
++	if (n == 0 || part_read(ext.gdt + (uint64_t)group * ext.desc_size, desc, ext.desc_size > 64 ? 64 : ext.desc_size) != 0) {
++		return false;
++	}
++	table = ext_le32(desc + 8) | (ext.is64 ? (uint64_t)ext_le32(desc + 0x28) << 32 : 0);
++	return part_read(table * ext.block + (uint64_t)index * ext.inode_size, inode, 160) == 0;
++}
++
++static uint64_t
++ext_size(const uint8_t *inode)
++{
++	return ext_le32(inode + 4) | (uint64_t)ext_le32(inode + 0x6c) << 32;
++}
++
++/* the physical block of logical block `lb` of a file, and how many follow it in one piece; 0: a hole or an error */
++static uint64_t
++ext_map(const uint8_t *inode, uint32_t lb, uint32_t *run)
++{
++	const uint8_t *node = inode + 0x28;
++
++	if (!(ext_le32(inode + 0x20) & 0x80000)) {
++		return 0;                       /* not extents (this reads no block maps) */
++	}
++	for (int level = 0; level < 6; level++) {
++		uint16_t entries = ext_le16(node + 2), depth = ext_le16(node + 6);
++
++		if (ext_le16(node) != 0xf30a) {
++			return 0;
++		}
++		if (depth == 0) {
++			for (uint16_t i = 0; i < entries; i++) {
++				const uint8_t *e = node + 12 + 12 * i;
++				uint32_t first = ext_le32(e), length = ext_le16(e + 4);
++
++				length = length > 32768 ? length - 32768 : length;
++				if (lb >= first && lb < first + length) {
++					*run = first + length - lb;
++					return ((uint64_t)ext_le16(e + 6) << 32 | ext_le32(e + 8)) + (lb - first);
++				}
++			}
++			return 0;
++		}
++		{
++			const uint8_t *chosen = NULL;
++			uint64_t at;
++
++			for (uint16_t i = 0; i < entries; i++) {
++				const uint8_t *e = node + 12 + 12 * i;
++
++				if (ext_le32(e) <= lb) {
++					chosen = e;
++				}
++			}
++			if (chosen == NULL) {
++				return 0;
++			}
++			at = ((uint64_t)ext_le16(chosen + 8) << 32 | ext_le32(chosen + 4)) * ext.block;
++			if (at != ext.leaf_at) {
++				if (part_read(at, ext.leaf, ext.block) != 0) {
++					ext.leaf_at = ~0ull;
++					return 0;
++				}
++				ext.leaf_at = at;
++			}
++			node = ext.leaf;
++		}
++	}
++	return 0;
++}
++
++/* Bytes [offset, offset + length) of inode n's file, a piece of the disk at a time */
++static int
++ext_read(uint32_t n, uint64_t offset, void *to, uint64_t length)
++{
++	uint8_t inode[160];
++	uint8_t *dst = to;
++
++	if (!ext_inode(n, inode) || offset + length > ext_size(inode)) {
++		return EIO;
++	}
++	while (length > 0) {
++		uint32_t lb = (uint32_t)(offset / ext.block), within = (uint32_t)(offset % ext.block), run = 0;
++		uint64_t pb = ext_map(inode, lb, &run), take = (uint64_t)run * ext.block - within;
++		int error;
++
++		take = take < length ? take : length;
++		take = take < (4u << 20) ? take : (4u << 20);   /* (the storage's own buffer: 4 MB a request) */
++		if (pb == 0) {
++			if (run == 0) {
++				take = ext.block - within < length ? ext.block - within : length;
++			}
++			bzero(dst, take);
++		} else if ((error = part_read(pb * ext.block + within, dst, take)) != 0) {
++			return error;
++		}
++		dst += take;
++		offset += take;
++		length -= take;
++	}
++	return 0;
++}
++
++/* The inode of `name` in directory `dir`; 0 if it is not there */
++static uint32_t
++ext_find(uint32_t dir, const char *name)
++{
++	uint8_t inode[160], *buffer;
++	uint64_t size, at;
++	uint32_t found = 0;
++	size_t want = strlen(name);
++
++	if (!ext_inode(dir, inode) || (size = ext_size(inode)) == 0 || size > (16u << 20) ||
++	    (buffer = kalloc_data(ext.block, Z_WAITOK)) == NULL) {
++		return 0;
++	}
++	for (at = 0; at < size && found == 0; at += ext.block) {
++		uint32_t i = 0;
++
++		if (ext_read(dir, at, buffer, ext.block) != 0) {
++			break;
++		}
++		while (i + 8 <= ext.block) {
++			uint32_t ino = ext_le32(buffer + i);
++			uint16_t rec = ext_le16(buffer + i + 4);
++			uint8_t len = buffer[i + 6];
++
++			if (rec < 8 || i + rec > ext.block) {
++				break;
++			}
++			if (ino != 0 && len == want && i + 8 + len <= ext.block && memcmp(buffer + i + 8, name, len) == 0) {
++				found = ino;
++				break;
++			}
++			i += rec;
++		}
++	}
++	kfree_data(buffer, ext.block);
++	return found;
++}
++
+ /* The entry of a directory (cluster 0: the root) with that 8.3 name ("MODEM   MDT"); false if there is none. */
+ static bool
+ fat_find(uint32_t cluster, const char name[11], struct fat_dirent *found)
+@@ -509,6 +775,17 @@ image_file(const char *file, uint32_t *size, uint32_t *first)
+ 	struct fat_dirent e;
+ 	char name[11];
+ 
++	if (ext.on) {
++		uint8_t inode[160];
++		uint32_t n = ext.image_inode != 0 ? ext_find(ext.image_inode, file) : 0;
++
++		if (n == 0 || !ext_inode(n, inode) || ext_size(inode) > 0xffffffffull) {
++			return false;
++		}
++		*size = (uint32_t)ext_size(inode);
++		*first = n;
++		return true;
++	}
+ 	short_name(file, name);
+ 	if (fat.image_cluster == 0 || !fat_find(fat.image_cluster, name, &e) || (e.attributes & 0x10)) {
+ 		return false;
+@@ -522,9 +799,15 @@ image_file(const char *file, uint32_t *size, uint32_t *first)
+ static int
+ file_read(uint32_t first, uint32_t offset, void *to, uint32_t length)
+ {
+-	uint32_t cluster = first, skip = offset / fat.cluster, within = offset % fat.cluster;
++	uint32_t cluster = first, skip, within;
+ 	uint8_t *dst = to;
+ 
++	if (ext.on) {
++		return ext_read(first, offset, to, length);
++	}
++	skip = offset / fat.cluster;
++	within = offset % fat.cluster;
++
+ 	for (uint32_t i = 0; i < skip; i++) {
+ 		cluster = cluster < fat.table_entries ? fat.table[cluster] : 0xffff;
+ 		if (cluster < 2 || cluster >= 0xfff8) {
+@@ -559,14 +842,22 @@ step_partition(void)
+ 
+ 	announce("read the partition \"modem\" through the storage driver: its FAT, and the directory IMAGE");
+ 	if (!fat_open()) {
+-		return false;
+-	}
+-	if (!fat_find(0, "IMAGE      ", &e) || !(e.attributes & 0x10)) {
+-		printf("mss: %u: there is no directory IMAGE in its root\n", step);
+-		return false;
++		if (!ext_open()) {
++			return false;
++		}
++		if ((ext.image_inode = ext_find(2, "image")) == 0) {
++			printf("mss: %u: ext4: no directory image in its root\n", step);
++			return false;
++		}
++		printf("mss: %u: ext4: image is a directory, inode %u\n", step, ext.image_inode);
++	} else {
++		if (!fat_find(0, "IMAGE      ", &e) || !(e.attributes & 0x10)) {
++			printf("mss: %u: there is no directory IMAGE in its root\n", step);
++			return false;
++		}
++		fat.image_cluster = e.cluster | (uint32_t)e.cluster_high << 16;
++		printf("mss: %u: IMAGE is a directory, from cluster %u\n", step, fat.image_cluster);
+ 	}
+-	fat.image_cluster = e.cluster | (uint32_t)e.cluster_high << 16;
+-	printf("mss: %u: IMAGE is a directory, from cluster %u\n", step, fat.image_cluster);
+ 	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+ 		uint32_t size = 0, first = 0;
+ 
+@@ -2491,13 +2782,15 @@ rmtfs_memory_setup(void)
+ 	uint64_t *ext, answer = 0, base;
+ 	int32_t result;
+ 
+-	if (kmem_alloc_contig(kernel_map, &rmtfs_memory, RMTFS_MEMORY_SIZE, PAGE_MASK, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	if (kmem_alloc_contig(kernel_map, &rmtfs_memory, RMTFS_MEMORY_SIZE, PAGE_MASK, (ppnum_t)((0x100000000ull >> PAGE_SHIFT) - 1), 0,
++	    KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+ 	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
+ 	    kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("mss: %u: RMTFS: no memory for its buffer\n", step);
+ 		return false;
+ 	}
+ 	rmtfs_memory_phys = kvtophys(rmtfs_memory);
++	printf("mss: %u: RMTFS: its buffer at %#llx (below 4 GB: the modem gives its addresses in 32 bits)\n", step, rmtfs_memory_phys);
+ 	to_memory_range(rmtfs_memory, RMTFS_MEMORY_SIZE);
+ 	base = kvtophys(page);
+ 	{
+@@ -2578,7 +2871,7 @@ rmtfs_receive(__unused void *context, uint32_t node, uint32_t port, const void *
+ 				continue;
+ 			}
+ 			if (rmtfs_files[f].bytes == NULL && redwood_ufs_read_named(rmtfs_files[f].partition, 0, NULL, 0,
+-			    &rmtfs_files[f].size) == 0 && rmtfs_files[f].size != 0 && rmtfs_files[f].size <= 16u << 20) {
++			    &rmtfs_files[f].size) == 0 && rmtfs_files[f].size != 0 && rmtfs_files[f].size <= 32u << 20) {
+ 				rmtfs_files[f].bytes = kalloc_data(rmtfs_files[f].size, Z_WAITOK | Z_ZERO);
+ 				if (rmtfs_files[f].bytes != NULL && redwood_ufs_read_named(rmtfs_files[f].partition, 0,
+ 				    rmtfs_files[f].bytes, rmtfs_files[f].size, NULL) != 0) {
+@@ -3247,6 +3540,7 @@ mss_thread(__unused void *arg, __unused wait_result_t wr)
+ 	for (step = 1; step <= mss_step && step < sizeof(steps) / sizeof(steps[0]); step++) {
+ 		if (!steps[step]()) {
+ 			printf("mss: %u: STOP: the step did not find what it needs\n", step);
++			redwood_status(REDWOOD_STATUS_SOUND, "modem STOP %u: %.44s", step, mss_last);
+ 			break;
+ 		}
+ 	}
+@@ -3260,10 +3554,19 @@ redwood_mss_init(void)
+ 	char device[16] = "";
+ 	thread_t thread;
+ 
+-	if (!PE_parse_boot_arg_str("device", device, sizeof(device)) || strcmp(device, "willow") != 0 ||
++	if (!PE_parse_boot_arg_str("device", device, sizeof(device)) ||
++	    (strcmp(device, "willow") != 0 && strcmp(device, "doha") != 0) ||
+ 	    !PE_parse_boot_argn("mss_step", &mss_step, sizeof(mss_step)) || mss_step == 0) {
+ 		return;
+ 	}
++	if (strcmp(device, "doha") == 0) {
++		mss_modem_partition = "modem_a";
++		for (unsigned f = 0; f < sizeof(rmtfs_files) / sizeof(rmtfs_files[0]); f++) {
++			if (strcmp(rmtfs_files[f].partition, "fsg") == 0) {
++				rmtfs_files[f].partition = "fsg_a";
++			}
++		}
++	}
+ 	if (kernel_thread_start(mss_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
 diff --git a/xnu/files/bsd/dev/redwood_osm.c b/xnu/files/bsd/dev/redwood_osm.c
 index 1546703..f10ba91 100755
 --- a/xnu/files/bsd/dev/redwood_osm.c

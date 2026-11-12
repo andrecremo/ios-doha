@@ -857,3 +857,31 @@ muda de brilho. Falta: o kernel mandar o comando, e o SpringBoard passar o brilh
   controle de brilho do iOS (Central de Controle e Ajustes) mudar o painel. Primeira rodada: funciona, mas com
   travadinhas e às vezes a rodinha ao arrastar: cada comando segurava a thread do backboardd (até ~13 ms). Agora o envio
   vai para uma thread call, a última pedida substituindo a anterior.
+
+Wi-Fi, levantamento (2026-11-11, só leitura):
+- O doha usa o WCN3990, cujo firmware roda dentro do modem (domínio `msm/modem/wlan_pd`). Memória reservada no
+  `trinket.dtsi` da Motorola igual à do willow (mesmo SoC): modem 0x4b000000 (0x7e00000), MSA 0x53300000 (0x200000),
+  SMEM 0x46000000. O `modem-image/` do doha tem `modem.mdt`/`.bXX`, `wlanmdsp.mbn`, `qdsp6m.qdb` e os arquivos de
+  calibração da placa do próprio doha (`bdwlan_doha_{ipa,India,Brazil,Argentina}.bin`, além de `bdwlan.bin`).
+- Nossa árvore (willow-hackios) já tem `redwood_mss.c` (`mss_step=1..11`, só com `device=willow`): sobe o modem do
+  SM6125 até ~40 serviços QMI, com localizador, RMTFS e TFTP. No willow, 1,6 ms depois do domínio do Wi-Fi subir, o
+  firmware afirma (`platform_main.c:230`). Também tem `wifi/lx` (camada Linux→XNU) e `redwood_wifi.c` (WCN6750,
+  redwood).
+- O port do miatoll (SM7125, `qdizax-w/hakios-xnu-kernel`, commits de 30/10) passou desse ponto: troca WLFW feita à
+  mão (o `qmi.c` do ath10k), firmware configurado e em "mission mode" (`wlfw_mission=1`), modem em baixo consumo, buffer
+  do RMTFS abaixo de 4 GB; depois o `ath10k` do Linux (`tools/mk-ath10k.sh`) sobre `wifi/lx`. O próprio README dele
+  diz "not yet seen on the phone": ninguém confirmou o Wi-Fi do WCN3990 navegando ainda.
+- Plano: (1) o `redwood_mss.c` liberado para o doha, com o firmware do modem do doha na imagem, até os serviços QMI;
+  (2) a troca WLFW do miatoll, com o `bdwlan_doha_*`, até o firmware em mission mode; (3) o `ath10k` sobre `wifi/lx` e a
+  integração com o iOS (no upstream: `drivers/wifi/hakios.apple80211.c`, `hakios.sta.c`, `hakios.wlan.cpp`).
+- Etapa 1, modem no doha (2026-11-11/12): `redwood_mss.c` liberado para `device=doha` (`modem_a`, `fsg_a`); a
+  `modem_a` do doha é ext4, então um leitor de ext4 só de leitura (superbloco, descritores, inode, extents, entradas de
+  diretório) fica atrás de `image_file()`/`file_read()`. `MSS=3`: firmware de 0x4b000000 a 0x52e00000. `MSS=7`: o
+  TrustZone autenticou e soltou o modem. `MSS=11`: localizador consultado 4 vezes, 11 arquivos por TFTP, domínio do
+  Wi-Fi UP e então "A DOMAIN HAS FAILED: wlan_process" (o mesmo assert do willow); o modem não leu o próprio sistema de
+  arquivos (modemst2: 0 setores). Corrigido: `fsg_a` tem 24 MB (o limite era 16); o buffer do RMTFS agora abaixo de 4
+  GB (o miatoll achou que o modem dá endereços de 32 bits; a RAM do XNU do doha vai até 0x13fffffff).
+- Quarta rodada (2026-11-12), buffer do RMTFS abaixo de 4 GB e `fsg_a` até 32 MB: o mesmo fim, "wlan_process ...
+  Asserted in platform_main.c:platform_main_task:230", logo depois do domínio do Wi-Fi ficar UP. O miatoll não esbarrou
+  nisso; o que o `hakios.mpss.c` dele faz antes do domínio subir (modem em baixo consumo, sem handshake do IPA, item 497
+  deixado ao modem, fila GLINK do host, localizador do ADSP) é o próximo lugar a olhar.

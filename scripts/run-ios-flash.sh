@@ -138,6 +138,9 @@ GPUARG="$GPUARG rpm_bimc=${BIMC:-1804000}"
 [ "${BLTEST:-0}" = 1 ] && GPUARG="$GPUARG bltest=1"
 # DCSTEST=1: dcstest=1, the loader sends the panel the DCS brightness command (0x51) over DSI: levels 400, 1600, 4095
 [ "${DCSTEST:-0}" = 1 ] && GPUARG="$GPUARG dcstest=1"
+# MSS=N: mss_step=N, the modem (for the Wi-Fi in it) brought up to step N (bsd/dev/redwood_mss.c: 1-3 read only, 4 on
+# ask TrustZone, 5 write its memory, 7 start it, 11 serve it); the panel's Sound line says the last thing it said
+[ -n "$MSS" ] && GPUARG="$GPUARG mss_step=$MSS"
 # BACKLIGHT=1: backlight=1, iOS's brightness (Control Center, Settings) sets the panel's: AppleARMBacklight and the DCS
 # brightness command over DSI (iokit/Kernel/MiniIOMobileFramebuffer.cpp); the panel starts at 2400 of 4095
 # (on by default since 2026-11-11; BACKLIGHT=0 leaves the panel at the UEFI's brightness, iOS's slider doing nothing)
