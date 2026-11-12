@@ -3632,3 +3632,54 @@ sub1(MSS, """					snprintf(mss_smp2p + n, sizeof(mss_smp2p) - n, " %u", (unsigne
 
 					smem_peek(listed[i].offset, &first, 4);
 					snprintf(mss_smp2p + n, sizeof(mss_smp2p) - n, " %u:%x", (unsigned)listed[i].item, first & 0xffff);""")
+
+# The modem on doha, the Wi-Fi domain's assert read in its firmware (2026-11-12): in Motorola's own wlanmdsp.mbn
+# (QPIS30.28-Q3-28-26-1), platform_main_task calls err_crash_cb_register, then smp2p_user_init, then
+# smp2p_create(&handle, 0 -- us --, "wlan"), and asserts at line 230 when either of the last two fails: the domain dies
+# for want of the modem's SMP2P towards us, which (no item 428 anywhere we can read) the modem never sets up. What the
+# modem's two other items say may tell why: at the end of the run the panel's Keys line shows item 605's first words,
+# its Storage line item 611's first bytes as text (mss_items=0: the usual lines)
+sub1(MSS, """static char mss_smp2p[80] = "no modem SMP2P";   /* the modem's SMP2P entries, the last time they changed */
+""", """static char mss_smp2p[80] = "no modem SMP2P";   /* the modem's SMP2P entries, the last time they changed */
+static bool smem_peek(uint64_t offset, void *to, uint32_t size);
+static uint32_t smem_item(uint32_t item, uint32_t *size);
+""")
+sub1(MSS, """			redwood_status(REDWOOD_STATUS_STORAGE, "wlfw: %.50s", mss_wlfw);
+		}""", """			redwood_status(REDWOOD_STATUS_STORAGE, "wlfw: %.50s", mss_wlfw);
+			{
+				uint32_t items = 1, size = 0, at;
+
+				PE_parse_boot_argn("mss_items", &items, sizeof(items));
+				if (items && (at = smem_item(605, &size)) != 0) {
+					uint32_t words[6] = { 0 };
+
+					smem_peek(at, words, size < sizeof(words) ? size : sizeof(words));
+					redwood_status(REDWOOD_STATUS_KEYS, "605/%u %x %x %x %x %x %x", size, words[0], words[1], words[2], words[3],
+					    words[4], words[5]);
+				}
+				if (items && (at = smem_item(611, &size)) != 0) {
+					char text[53];
+
+					bzero(text, sizeof(text));
+					smem_peek(at, text, size < sizeof(text) - 1 ? size : sizeof(text) - 1);
+					for (unsigned i = 0; i < sizeof(text) - 1; i++) {
+						if (text[i] < 0x20 || text[i] > 0x7e) {
+							text[i] = '.';
+						}
+					}
+					redwood_status(REDWOOD_STATUS_STORAGE, "611:%s", text);
+				}
+			}
+		}""")
+
+# The modem on doha, SMP2P's items the right way round (2026-11-12): the modem's own code (Motorola's MPSS.AT.4, the
+# root's SMP2P: a table of bases, 427 for us, 435 for the modem, 443 the ADSP ...; an item is its maker's base plus the
+# other's number) and Linux's qcom_smp2p.c (qcom,smem = <inbound outbound>) agree: ours to the modem is 428 (427 + 1), the
+# modem's to us 435 (435 + 0). willow had them the other way: our item sat at 435, where the modem makes its own -- it
+# found the number taken and made none, and its Wi-Fi domain, whose smp2p_create(us, "wlan") then fails, asserted at
+# platform_main.c:230. Swapped
+sub1(MSS, """#define ITEM_SMP2P_OURS         435             /* dt: qcom,smp2p-modem, qcom,smem = <0x1b3 0x1ac> */
+#define ITEM_SMP2P_THEIRS       428""", """#define ITEM_SMP2P_OURS         428             /* dt: qcom,smp2p-modem, qcom,smem = <435 (in) 428 (out)> */
+#define ITEM_SMP2P_THEIRS       435""")
+# (the two items' dump of the run before, off by default now that the WLFW exchange's line matters: mss_items=1 shows it)
+sub1(MSS, """				uint32_t items = 1, size = 0, at;""", """				uint32_t items = 0, size = 0, at;""")

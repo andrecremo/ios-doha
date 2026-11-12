@@ -928,3 +928,18 @@ Cabo conectado.
 - Os +5 % em 5 minutos não batem com ~100 mA: isso seria ~0,2 % em 5 min numa bateria de 4000 mAh. O nível vem da tensão, e a tensão sobe quando entra corrente (4017 mV contra 3977). Por isso a porcentagem fica superestimada durante a carga. O passo 4, que calcula o nível pela curva OCV do KD40 compensando a corrente (V − I·R), corrige isso.
 - Próximos passos possíveis: deixar CHARGE=2 como padrão; ler o ICL efetivo (DCDC 0x07) e o tipo de carregador (APSD) para entender o limite de ~500 mA.
 - Desde 2026-11-12, `CHARGE=2` é o padrão do `run-ios-flash.sh`. Para não escrever nada no carregador, use `CHARGE=0`.
+
+## Wi-Fi: o firmware sobe (2026-11-12, kernel 15:48, MSS=11): **"THE WI-FI FIRMWARE IS READY"**
+
+O domínio do Wi-Fi no modem (`msm/modem/wlan_pd`) travava logo depois de ficar UP, em `platform_main.c:platform_main_task:230`, igual no willow. Fomos descartando suspeitas: as cinco tensões do chip de rádio ligam ("ALL FIVE ON"); a entrada "ipa" do SMP2P não fez diferença; tocar a campainha do SMP2P mais de 40 vezes também não.
+
+A causa apareceu nos firmwares originais da Motorola (zip `QPIS30.28-Q3-28-26-1`, `NON-HLOS.bin`), desmontados com `llvm-objdump --triple=hexagon`:
+- **`wlanmdsp.mbn`:** `platform_main_task` chama `err_crash_cb_register`, depois `smp2p_user_init`, depois `smp2p_create(&h, 0 /* apps */, "wlan")`, e trava na linha 230 se uma das duas últimas falhar. Então ele precisa de um canal SMP2P do modem para nós.
+- **O núcleo do modem (segmento 11, ~0xc05b1000):** tem uma tabela de bases para os itens SMP2P (427 do processador principal, 435 do modem, 443 do ADSP…). O item que um processador cria para outro é a sua base mais o número do outro. Portanto o **nosso item para o modem é o 428** e o **do modem para nós é o 435**. O Linux concorda: no `qcom_smp2p.c`, `qcom,smem = <entrada saída>`.
+- **O willow tinha os números invertidos:** criava o nosso item no 435. O modem achava o seu número ocupado, não criava o canal, e o `smp2p_create("wlan")` falhava.
+
+Com a troca (`ITEM_SMP2P_OURS` 428, `ITEM_SMP2P_THEIRS` 435), o HUD mostra:
+- **Touch:** `i435 smp2p=0 sk=6 wlan=0`. O modem cria o canal e o Wi-Fi cria a sua entrada.
+- **Storage:** `wlfw: THE WI-FI FIRMWARE IS READY`. A troca WLFW (MSA, BDF) vai até o fim.
+
+Próximos passos: o driver do rádio (copy engines em 0xC800000, modo mission, WMI, como o ath10k/snoc do miatoll) e a camada Apple80211 para o `wifid`.
