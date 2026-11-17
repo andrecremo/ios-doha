@@ -284,3 +284,22 @@ else:
     s = s.replace(init_old, WALLPAPER_CODE + init_old + "\twallpaper_freeze();\n")
     sb.open('w', encoding='utf-8', newline='').write(s)
     print("userland/src/inject_sb.c: wallpaper_freeze")
+
+# the network doha's radio is to join (ath10k; bsd/dev/redwood_wifi.c reads fw/network: the name on its first line, the
+# passphrase on its second). willow installs it only beside redwood's WPSS image, and only without SHARE; doha's comes
+# from ../fw-wifi/network when DOHA_NETWORK=1 (run-ios-flash.sh NETWORK=1), whatever SHARE says -- it is yours
+nb = (tree / 'userland/build.sh').open(encoding='utf-8', newline='').read()
+nold = """# ... and the vibration motor's waveforms, the phone's /vendor/firmware/aw8697_haptic.bin, from ../fw-haptic"""
+nnew = """# ... and doha's network to join (DOHA_NETWORK=1: ../fw-wifi/network, a name and a passphrase; never in a repository)
+if [ -n "$DOHA_NETWORK" ] && [ -f ../fw-wifi/network ]; then
+	mkdir -p root/fw
+	install -m 0600 ../fw-wifi/network root/fw/network
+fi
+""" + nold
+if 'DOHA_NETWORK' in nb:
+    print("userland/build.sh: has doha's network already")
+elif nb.count(nold) != 1:
+    raise SystemExit(f'userland/build.sh: expected 1x the haptic block, found {nb.count(nold)}')
+else:
+    (tree / 'userland/build.sh').open('w', encoding='utf-8', newline='').write(nb.replace(nold, nnew))
+    print("userland/build.sh: doha's network into fw/ (DOHA_NETWORK=1)")

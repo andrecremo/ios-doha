@@ -85,6 +85,14 @@ if [ "${GL:-0}" = 1 ]; then
 	export PATH=$HOME/doha-xnu/venv/bin:$PATH GL=1
 	echo "GL=1: Mesa with meson $(meson --version); its first build takes a while (log: ~/doha-xnu/ios-flash-build.log)"
 fi
+# NETWORK=1: the radio joins the network of F:/doha-ios/network.txt (its name on the first line, its passphrase on the
+# second; yours, never in a repository) at the start -- copied to fw-wifi/network and into the image's fw/
+if [ "${NETWORK:-0}" = 1 ]; then
+	NWF=${F:-/mnt/f/doha-ios}/network.txt
+	[ -f "$NWF" ] || { echo "NETWORK=1: $NWF is not there"; exit 1; }
+	mkdir -p $W/fw-wifi && install -m 0600 "$NWF" $W/fw-wifi/network && export DOHA_NETWORK=1
+	echo "NETWORK=1: the network file goes into the image (not shown here)"
+fi
 FLASHBOOT=1 CRYPTEXES=flash REST=1 RC_JOBS=rc.jobs.unlock SHARE=1 bash userland/build.sh > ~/doha-xnu/ios-flash-build.log 2>&1 ||
 	{ tail -n 20 ~/doha-xnu/ios-flash-build.log; echo "build.sh failed: see ~/doha-xnu/ios-flash-build.log"; exit 1; }
 grep -E 'flashboot.apfs|root.apfs:' ~/doha-xnu/ios-flash-build.log | tail -3
@@ -135,7 +143,10 @@ GPUARG="$GPUARG rpm_bimc=${BIMC:-1804000}"
 # then puts it back: whether a picture anywhere in RAM can be shown without the GPU's copy
 [ "${FLIPTEST:-0}" = 1 ] && GPUARG="$GPUARG fliptest=1"
 # LASTPANIC=1: lastpanic=1, the loader shows the text left in the panic log region by the run before (30 s)
-[ "${LASTPANIC:-0}" = 1 ] && GPUARG="$GPUARG lastpanic=1"
+# LASTPANIC=2: lastpanic=2, the last 40 lines of the Wi-Fi driver's log of the run before (60 s)
+[ -n "$LASTPANIC" ] && [ "$LASTPANIC" != 0 ] && GPUARG="$GPUARG lastpanic=$LASTPANIC"
+# MOREARGS="a=1 b=2": more boot arguments, as they are
+[ -n "$MOREARGS" ] && GPUARG="$GPUARG $MOREARGS"
 # BLTEST=1: bltest=1, the loader tries the UEFI's display power control protocol: the backlight at 20% and 60%, 3 s each
 [ "${BLTEST:-0}" = 1 ] && GPUARG="$GPUARG bltest=1"
 # DCSTEST=1: dcstest=1, the loader sends the panel the DCS brightness command (0x51) over DSI: levels 400, 1600, 4095
@@ -143,6 +154,17 @@ GPUARG="$GPUARG rpm_bimc=${BIMC:-1804000}"
 # MSS=N: mss_step=N, the modem (for the Wi-Fi in it) brought up to step N (bsd/dev/redwood_mss.c: 1-3 read only, 4 on
 # ask TrustZone, 5 write its memory, 7 start it, 11 serve it); the panel's Sound line says the last thing it said
 [ -n "$MSS" ] && GPUARG="$GPUARG mss_step=$MSS"
+# WIFI=1: wifi=1, the radio's driver (ath10k, tools/mk-ath10k.sh) started on the modem's Wi-Fi firmware when it is
+# ready; wants MSS=11. WIFIMAC=aa:bb:cc:dd:ee:ff gives the radio its address (else 02:4e:44:4f:48:41)
+[ "${WIFI:-0}" = 1 ] && GPUARG="$GPUARG wifi=1"
+[ -n "$WIFIMAC" ] && GPUARG="$GPUARG wifi_mac=$WIFIMAC"
+# WIFIMEM=0: wifi_mem=0, the radio's 44 MB not taken while the system starts; WIFINET=0: wifi_net=0, en0 not made early
+[ -n "$WIFIMEM" ] && GPUARG="$GPUARG wifi_mem=$WIFIMEM"
+[ -n "$WIFINET" ] && GPUARG="$GPUARG wifi_net=$WIFINET"
+# WIFIDELAY=S: wifi_delay=S, the driver started S seconds after the modem's Wi-Fi firmware is ready (40)
+[ -n "$WIFIDELAY" ] && GPUARG="$GPUARG wifi_delay=$WIFIDELAY"
+# WIFIPHYS=1: wifi_phys=1, the radio given our memory's physical addresses, the SMMU left alone
+[ "${WIFIPHYS:-0}" = 1 ] && GPUARG="$GPUARG wifi_phys=1"
 # BACKLIGHT=1: backlight=1, iOS's brightness (Control Center, Settings) sets the panel's: AppleARMBacklight and the DCS
 # brightness command over DSI (iokit/Kernel/MiniIOMobileFramebuffer.cpp); the panel starts at 2400 of 4095
 # (on by default since 2026-11-11; BACKLIGHT=0 leaves the panel at the UEFI's brightness, iOS's slider doing nothing)

@@ -3801,3 +3801,1330 @@ sub1(BTN, """		redwood_status(REDWOOD_STATUS_WIFI, "chg%s%s S%02x/%02x E%02x U%0
 		    pet_stopped ? "!" : pets != 0 ? "+" : "", enable_stopped ? "x" : enables != 0 ? "e" : "", st[0], en,
 		    gauge_subtype, current_now(), current_average(), level_ocv, level_est,
 		    level_u < 0 ? 0 : level_u / 1000000, level_u < 0 ? 0 : level_u / 100000 % 10);""")
+
+# The Wi-Fi firmware on doha, mission mode (2026-11-12): with SMP2P's items the right way round the WLFW exchange ends in
+# "the Wi-Fi firmware is ready". What ath10k's snoc.c asks next (ath10k_qmi_wlan_enable()), as miatoll's port sends it
+# (its numbers: the WCN3990's copy engines, target_ce_config_wlan, target_service_to_ce_map_wlan,
+# target_shadow_reg_cfg_map): the copy engines' configuration -- 12 pipes, 21 services, 12 shadow registers -- and the
+# mode "mission", after which the firmware has the radio on. Then, 2 s later, the radio answers or not: a few words of
+# its copy engine 0 and of the copy engines' wrapper (doha's dt: membase 0xC800000; ath10k's wcn3990_regs: ce0 at
+# +0x240000, the wrapper at +0x24C000), read once the panel says they are about to be (a read of a block that is off
+# hangs the core). wlfw_mission=0: neither; wlfw_radio_read=0: the mode, no reads
+sub1(MSS, """	printf("mss: wlfw: %s\\n", wlfw2_fw_ready ? "THE WI-FI FIRMWARE IS READY" : "not ready in 15 s");
+""", """	printf("mss: wlfw: %s\\n", wlfw2_fw_ready ? "THE WI-FI FIRMWARE IS READY" : "not ready in 15 s");
+	{
+		static const uint32_t pipes[][5] = {
+			{ 0, 2, 32, 2048, 0 }, { 1, 1, 32, 2048, 0 }, { 2, 1, 64, 2048, 0 }, { 3, 2, 32, 2048, 0 }, { 4, 2, 256, 256, 8 },
+			{ 5, 2, 1024, 64, 8 }, { 6, 3, 32, 16384, 0 }, { 7, 4, 0, 0, 8 }, { 8, 1, 32, 2048, 0 }, { 9, 1, 32, 2048, 0 },
+			{ 10, 1, 32, 2048, 0 }, { 11, 1, 32, 2048, 0 },
+		};
+		static const uint32_t services[][3] = {
+			{ 0x104, 2, 3 }, { 0x104, 1, 2 }, { 0x102, 2, 3 }, { 0x102, 1, 2 }, { 0x101, 2, 3 }, { 0x101, 1, 2 }, { 0x103, 2, 3 },
+			{ 0x103, 1, 2 }, { 0x100, 2, 3 }, { 0x100, 1, 2 }, { 0x001, 2, 0 }, { 0x001, 1, 2 }, { 0xfe00, 2, 0 }, { 0xfe00, 1, 2 },
+			{ 0x300, 2, 4 }, { 0x300, 1, 1 }, { 0xfe00, 2, 5 }, { 0x301, 1, 9 }, { 0x302, 1, 10 }, { 0x600, 1, 11 }, { 0, 0, 0 },
+		};
+		static const uint16_t shadow[][2] = {
+			{ 0, 0x3c }, { 3, 0x3c }, { 4, 0x3c }, { 5, 0x3c }, { 7, 0x3c }, { 1, 0x40 }, { 2, 0x40 }, { 7, 0x40 }, { 8, 0x40 },
+			{ 9, 0x40 }, { 10, 0x40 }, { 11, 0x40 },
+		};
+		uint32_t mission = 1, radio_read = 1, ce[5] = { 0 };
+		bool read = false;
+		unsigned n;
+
+		PE_parse_boot_argn("wlfw_mission", &mission, sizeof(mission));
+		PE_parse_boot_argn("wlfw_radio_read", &radio_read, sizeof(radio_read));
+		if (!wlfw2_fw_ready || mission == 0) {
+			goto out;
+		}
+		at = 0;
+		n = sizeof(pipes) / sizeof(pipes[0]);
+		tlvs[at++] = 0x11;
+		tlvs[at++] = (uint8_t)(1 + 20 * n);
+		tlvs[at++] = (uint8_t)((1 + 20 * n) >> 8);
+		tlvs[at++] = (uint8_t)n;
+		for (unsigned i = 0; i < n; i++) {
+			for (unsigned w = 0; w < 5; w++) {
+				for (unsigned b = 0; b < 4; b++) {
+					tlvs[at++] = (uint8_t)(pipes[i][w] >> (8 * b));
+				}
+			}
+		}
+		n = sizeof(services) / sizeof(services[0]);
+		tlvs[at++] = 0x12;
+		tlvs[at++] = (uint8_t)(1 + 12 * n);
+		tlvs[at++] = (uint8_t)((1 + 12 * n) >> 8);
+		tlvs[at++] = (uint8_t)n;
+		for (unsigned i = 0; i < n; i++) {
+			for (unsigned w = 0; w < 3; w++) {
+				for (unsigned b = 0; b < 4; b++) {
+					tlvs[at++] = (uint8_t)(services[i][w] >> (8 * b));
+				}
+			}
+		}
+		n = sizeof(shadow) / sizeof(shadow[0]);
+		tlvs[at++] = 0x13;
+		tlvs[at++] = (uint8_t)(1 + 4 * n);
+		tlvs[at++] = (uint8_t)((1 + 4 * n) >> 8);
+		tlvs[at++] = (uint8_t)n;
+		for (unsigned i = 0; i < n; i++) {
+			tlvs[at++] = (uint8_t)shadow[i][0];
+			tlvs[at++] = (uint8_t)(shadow[i][0] >> 8);
+			tlvs[at++] = (uint8_t)shadow[i][1];
+			tlvs[at++] = (uint8_t)(shadow[i][1] >> 8);
+		}
+		if (!wlfw2_ask("the copy engines' configuration", 0x0023, tlvs, at)) {
+			goto out;
+		}
+		at = wlfw2_u32(tlvs, 0x01, 0);                          /* mode: mission */
+		if (!wlfw2_ask("the mode: mission", 0x0022, tlvs, at)) {
+			goto out;
+		}
+		printf("mss: wlfw: MISSION MODE; the radio %s\\n", radio_read ? "is read in 2 s" : "is not read (wlfw_radio_read=0)");
+		IOSleep(2000);
+		if (radio_read && wlfw2_there) {
+			volatile uint32_t *ce0 = (volatile uint32_t *)ml_io_map(0x0C800000 + 0x240000, 0x1000);
+			volatile uint32_t *wrap = (volatile uint32_t *)ml_io_map(0x0C800000 + 0x24C000, 0x1000);
+
+			printf("mss: wlfw: MISSION; reading the radio's copy engines...\\n");
+			if (ce0 != NULL && wrap != NULL) {
+				ce[0] = ce0[0];
+				ce[1] = ce0[1];
+				ce[2] = ce0[0x3c / 4];
+				ce[3] = ce0[0x40 / 4];
+				ce[4] = wrap[0];
+				read = true;
+				printf("mss: wlfw: MISSION; CE0 %x %x %x %x, wrapper %x\\n", ce[0], ce[1], ce[2], ce[3], ce[4]);
+			}
+		}
+		IOSleep(10000);
+		if (read) {
+			printf("mss: wlfw: MISSION %s; CE0 %x %x %x %x W %x\\n", wlfw2_there ? "ok" : "GONE", ce[0], ce[1], ce[2], ce[3],
+			    ce[4]);
+		} else {
+			printf("mss: wlfw: MISSION; 12 s on, the service is %s\\n", wlfw2_there ? "THERE" : "GONE");
+		}
+	}
+""")
+
+# The radio of doha, its driver (2026-11-12): Linux's ath10k for the WCN3990, as miatoll's HakiOS port runs it
+# (qdizax-w/hakios-xnu-kernel: tools/mk-ath10k.sh, wifi/lx/src10/lx_snoc.c, the miatoll part of drivers/wifi/hakios.wifi.c),
+# on the layer willow already has for ath11k (wifi/lx, bsd/dev/redwood_lx.c). What doha has of its own: the modem's
+# WLFW exchange (redwood_mss.c, wlfw2) hands the firmware over when it is ready instead of sending the mission mode
+# itself; the radio's copy engines at 0xC800000 (lx_snoc.c), its stream 0x80 in apps-smmu@0xC600000; the rails voted by
+# the modem's step 11 (RPM, not RPMh). wifi=1 with mss_step=11 turns it on. The layer and the build script come from
+# beside this script (wifi10/), as redwood_focaltech.c does
+import shutil
+shutil.copytree(Path(__file__).parent / 'wifi10' / 'lx', tree / 'wifi' / 'lx', dirs_exist_ok=True)
+shutil.copy(Path(__file__).parent / 'wifi10' / 'mk-ath10k.sh', tree / 'tools' / 'mk-ath10k.sh')
+sub1('xnu-build.sh', """LX=$XNUDEPS/build/ath11k/out/ath11k.o
+""", """LX=$XNUDEPS/build/ath10k/out/ath10k.o            # (doha: ath10k, tools/mk-ath10k.sh; else willow's ath11k)
+[ -f "$LX" ] || LX=$XNUDEPS/build/ath11k/out/ath11k.o
+""")
+
+LXH = 'xnu/files/bsd/sys/redwood_lx.h'
+LXC = 'xnu/files/bsd/dev/redwood_lx.c'
+WIFI = 'xnu/files/bsd/dev/redwood_wifi.c'
+INP = 'xnu/files/bsd/sys/redwood_input.h'
+
+# -- the kernel's side of the layer: what lx_snoc.c asks that ath11k's bus did not
+sub1(LXH, """unsigned long long lx_os_irq_count(unsigned vector);		/* how many have arrived */
+""", """unsigned long long lx_os_irq_count(unsigned vector);		/* how many have arrived */
+int	 lx_os_irq_wired(unsigned first_intid, int level);	/* instead: wires to the GIC, vector v = INTID first + v: 1, or 0 */
+/*
+ * (doha, as miatoll) asked before every look at the radio's copy engines: has the radio's firmware stopped -- the modem's
+ * SMP2P entry "wlan" says early-crash or fatal, or the modem itself is fatal? Then nothing of the radio may be touched again.
+ */
+int	 lx_os_radio_gone(void);
+""")
+sub1(INP, """void redwood_lx_net_early(void);        /* ... and en0 made on the radio now, if the kernel was given its address */
+""", """void redwood_lx_net_early(void);        /* ... and en0 made on the radio now, if the kernel was given its address */
+void redwood_lx_keep(unsigned long size);       /* the radio's memory in one piece, taken early (doha: the radio comes late) */
+bool redwood_wifi_modem_firmware_ready(void);   /* doha: the modem's Wi-Fi firmware is ready; true: the driver takes it */
+""")
+sub1(LXC, """#include <sys/redwood_net.h>
+""", """#include <sys/redwood_net.h>
+
+/* the memory in one piece, taken while the system starts, for a radio that is brought up later (redwood_lx_keep()) */
+static vm_offset_t lx_kept;
+static unsigned long lx_kept_size;
+static bool lx_irq_level;                       /* wired, level-triggered lines (lx_os_irq_wired()), not MSIs */
+""")
+sub1(LXC, """	size = round_page(size);
+	if (kmem_alloc_contig(kernel_map, &cached, size, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
+	    KERN_SUCCESS) {""", """	size = round_page(size);
+	if (lx_kept != 0 && size <= lx_kept_size) {
+		cached = lx_kept;               /* (the rest of it, if any, is not given out again) */
+		lx_kept = 0;
+	} else if (kmem_alloc_contig(kernel_map, &cached, size, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
+	    KERN_SUCCESS) {""")
+sub1(LXC, """/* ---- the station (sys/redwood_sta.h) --------------------------------------------------------------------- */
+""", """void
+redwood_lx_keep(unsigned long size)
+{
+	size = round_page(size);
+	if (lx_kept == 0 && kmem_alloc_contig(kernel_map, &lx_kept, size, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	    VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
+		lx_kept_size = size;
+		say("lx: %lu MB in one piece kept for the radio\\n", size >> 20);
+	} else if (lx_kept == 0) {
+		say("lx: NO %lu MB IN ONE PIECE for the radio, even now\\n", size >> 20);
+	}
+}
+
+/*
+ * A radio whose interrupts are wires to the GIC, not messages (doha's WCN3990: dt qcom,icnss@C800000, its twelve
+ * "interrupts", SPIs 358..369, the copy engines' in order): vector v is INTID first + v. 1, or 0 if the number is no SPI's.
+ */
+int
+lx_os_irq_wired(unsigned first_intid, int level)
+{
+	if (first_intid < 32 || first_intid + LX_VECTORS > 1020) {
+		return 0;
+	}
+	lx_irq_first = first_intid;
+	lx_irq_level = level != 0;
+	return 1;
+}
+
+/* (redwood_mss.c) */
+extern uint32_t redwood_mss_smp2p_bits(const char *name);
+extern void redwood_mss_show_crash_reason(void);
+
+/*
+ * The radio's firmware is the modem's: when it stops, the modem says so in its SMP2P entry "wlan" -- bit 1 "early crash",
+ * bit 0 "force fatal" -- or, if the whole modem stops, bit 0 of its "slave-kernel". Asked before each look at the radio.
+ */
+int
+lx_os_radio_gone(void)
+{
+	static uint32_t last_wlan = 0x5a5a5a5au, last_modem = 0x5a5a5a5au;
+	static int gone;
+	uint32_t wlan, modem;
+
+	if (gone) {
+		return gone;
+	}
+	wlan = redwood_mss_smp2p_bits("wlan");
+	modem = redwood_mss_smp2p_bits("slave-kernel");
+	if (wlan != last_wlan || modem != last_modem) {
+		printf("lx: the modem's SMP2P: \\"wlan\\" %#x, \\"slave-kernel\\" %#x\\n", wlan, modem);
+		last_wlan = wlan;
+		last_modem = modem;
+	}
+	if ((wlan != ~0u && (wlan & 3) != 0) || (modem != ~0u && (modem & 1) != 0)) {
+		gone = 1;
+		printf("lx: THE RADIO'S FIRMWARE HAS STOPPED (the modem's \\"wlan\\" %#x, \\"slave-kernel\\" %#x): nothing of the radio "
+		    "is touched again\\n", wlan, modem);
+		redwood_mss_show_crash_reason();
+	}
+	return gone;
+}
+
+/* ---- the station (sys/redwood_sta.h) --------------------------------------------------------------------- */
+""")
+sub1(LXC, """	if ((kr = gic_v3_spi_attach(lx_irq_first + vector, true, lx_irq_arrived, NULL)) != KERN_SUCCESS) {""",
+     """	if ((kr = gic_v3_spi_attach(lx_irq_first + vector, !lx_irq_level, lx_irq_arrived, NULL)) != KERN_SUCCESS) {""")
+
+# -- the modem's side: its SMP2P entries, its last words and its QRTR for the driver; the firmware handed over
+sub1(MSS, """void
+redwood_mss_init(void)
+{""", """/* For the radio's driver (redwood_lx.c, redwood_wifi.c): an entry of the modem's SMP2P item (~0: none), its last words, its QRTR */
+uint32_t
+redwood_mss_smp2p_bits(const char *name)
+{
+	struct smp2p words;
+
+	if (!modem_words(&words)) {
+		return ~0u;
+	}
+	for (unsigned i = 0; i < words.valid && i < 16; i++) {
+		if (strncmp(words.entry[i].name, name, 16) == 0) {
+			return words.entry[i].value;
+		}
+	}
+	return ~0u;
+}
+
+void
+redwood_mss_show_crash_reason(void)
+{
+	modem_last_words();
+}
+
+const struct redwood_qrtr_ops *
+redwood_mss_qrtr(void)
+{
+	return glink.open && qrtr_peer_known ? &qrtr_ops : NULL;
+}
+
+void
+redwood_mss_init(void)
+{""")
+sub1(MSS, """		if (!wlfw2_fw_ready || mission == 0) {
+			goto out;
+		}""", """		if (wlfw2_fw_ready && redwood_wifi_modem_firmware_ready()) {
+			printf("mss: wlfw: the firmware is the radio's driver's from here on (ath10k)\\n");
+			goto out;
+		}
+		if (!wlfw2_fw_ready || mission == 0) {
+			goto out;
+		}""")
+
+# -- the Wi-Fi driver's side: doha's radio (as miatoll's in hakios.wifi.c)
+sub1(WIFI, """static struct block apps_smmu = { "apps smmu", 0x15000000, 0x2000 };""",
+     """static struct block apps_smmu = { "apps smmu", 0x15000000, 0x2000 };     /* doha: 0xC600000 (redwood_wifi_init()) */""")
+sub1(WIFI, """#define RADIO_STREAM            0x1c00
+#define RADIO_STREAM_MASK       0x0001""", """#define RADIO_STREAM            radio_stream    /* 0x1c00; doha's WCN3990 (dt: qcom,icnss@C800000, "iommus"): 0x80 */
+#define RADIO_STREAM_MASK       0x0001
+static uint32_t radio_stream = 0x1c00;
+static bool doha_radio;                         /* the radio is doha's: its firmware the modem's, its driver ath10k */""")
+sub1(WIFI, """	if (2 * radio_space.pages * radio_space.page != 0x100000) {    /* dt: "reg" of apps-smmu */""",
+     """	if (!doha_radio && 2 * radio_space.pages * radio_space.page != 0x100000) {    /* dt: "reg" of apps-smmu */""")
+sub1(WIFI, """bool
+redwood_wifi_dsp_is_up(void)
+{""", """bool
+redwood_wifi_dsp_is_up(void)
+{
+	if (doha_radio) {
+		return true;                    /* (the modem's Wi-Fi firmware has said it is ready) */
+	}""")
+sub1(WIFI, """	static const char *const files[][2] = { { "board.bin", "bd_m20gl.elf" }, { "regdb.bin", "regdb_xiaomi.bin" } };
+	const char *last = strrchr(name, '/');
+""", """	static const char *const files[][2] = { { "board.bin", "bd_m20gl.elf" }, { "regdb.bin", "regdb_xiaomi.bin" } };
+	/*
+	 * doha: ath10k's "firmware-N.bin" for the WCN3990 holds no firmware -- it is the modem's -- only what the driver is to
+	 * know of its interfaces, as Linux's ath10k/WCN3990/hw1.0 file and miatoll's port say: WMI and HTT the "TLV" ones, the
+	 * firmware not loaded by the driver ("non-bmi", feature 19), management frames by reference (18)
+	 */
+	static const uint8_t features[] = {
+		'Q', 'C', 'A', '-', 'A', 'T', 'H', '1', '0', 'K', 0, 0,
+		0, 0, 0, 0, 8, 0, 0, 0, 'd', 'o', 'h', 'a', '-', 'i', 'o', 's',
+		2, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0x0c, 0,
+		5, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0,
+		6, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0,
+	};
+	const char *last = strrchr(name, '/');
+
+	if (doha_radio) {
+		last = last == NULL ? name : last + 1;
+		if (strcmp(last, "firmware-5.bin") == 0) {
+			*size = sizeof(features);
+			return features;
+		}
+		printf("wifi: the driver asks for %s, which there is none of here\\n", name);
+		return NULL;
+	}
+""")
+sub1(WIFI, """	if (!PE_parse_boot_arg_str("wifi_mac", text, sizeof(text)) || text[0] == 0) {
+		printf("wifi: %u: the driver asks for the radio's address: none was given (wifi_mac)\\n", step);
+		return false;
+	}""", """	if (!PE_parse_boot_arg_str("wifi_mac", text, sizeof(text)) || text[0] == 0) {
+		if (doha_radio) {
+			/* (doha: a locally administered one, the same every run, until the phone's own is read from its storage) */
+			static const uint8_t made[6] = { 0x02, 0x4e, 0x44, 0x4f, 0x48, 0x41 };
+
+			printf("wifi: the radio's address: none was given (wifi_mac): 02:4e:44:4f:48:41\\n");
+			memcpy(address, made, sizeof(made));
+			return true;
+		}
+		printf("wifi: %u: the driver asks for the radio's address: none was given (wifi_mac)\\n", step);
+		return false;
+	}""")
+sub1(WIFI, """void
+redwood_wifi_init(void)
+{
+	uint32_t on = 0, back = 0, done = 0;
+	uint64_t size = 0;
+	thread_t thread;
+""", """/* (redwood_mss.c) the modem's QRTR, once its link is up */
+extern const struct redwood_qrtr_ops *redwood_mss_qrtr(void);
+
+static void
+doha_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	uint64_t began = now_us();
+	const struct redwood_qrtr_ops *transport = redwood_mss_qrtr();
+	int error;
+
+	if (transport == NULL) {
+		tell("wifi: the modem's QRTR is not there: the radio is not brought up\\n");
+		whole_runs = false;
+		thread_terminate(current_thread());
+	}
+	redwood_qmi_set_transport(transport);
+	tell("wifi: the modem's Wi-Fi firmware is ready: now the driver (ath10k)\\n");
+	error = redwood_lx_start();
+	if (error == 0) {
+		tell("wifi: THE RADIO IS UP, %llu.%llu s after the firmware said it was ready\\n", (now_us() - began) / 1000000,
+		    (now_us() - began) / 100000 % 10);
+		join_given(began);
+	} else {
+		tell("wifi: THE RADIO DID NOT COME UP: the driver's start returns %d, %llu s in\\n", error, (now_us() - began) / 1000000);
+		say_kept();
+	}
+	whole_runs = false;
+	thread_terminate(current_thread());
+}
+
+/* Called by the modem's driver when the Wi-Fi firmware has said it is ready: true if the driver is started on it. */
+bool
+redwood_wifi_modem_firmware_ready(void)
+{
+	thread_t thread;
+
+	if (!doha_radio || whole_runs) {
+		return false;
+	}
+	whole_runs = true;
+	if (kernel_thread_start(doha_thread, NULL, &thread) != KERN_SUCCESS) {
+		whole_runs = false;
+		tell("wifi: no thread: the radio is not brought up\\n");
+		return false;
+	}
+	thread_deallocate(thread);
+	return true;
+}
+
+void
+redwood_wifi_init(void)
+{
+	uint32_t on = 0, back = 0, done = 0;
+	uint64_t size = 0;
+	thread_t thread;
+	char device[16] = "";
+""")
+sub1(WIFI, """	if (pe_arm_get_soc_base_phys() != REDWOOD_SOC_BASE) {
+		if (last_step != 0 && PE_parse_boot_argn("wifi_lx", &back, sizeof(back)) && back) {""",
+     """	if (last_step == 0 && PE_parse_boot_arg_str("device", device, sizeof(device)) && strcmp(device, "doha") == 0) {
+		uint32_t mss = 0, loud = 1;
+
+		if (!PE_parse_boot_argn("mss_step", &mss, sizeof(mss)) || mss < 11) {
+			tell("wifi: on doha the radio's firmware runs in the modem: wifi=1 wants mss_step=11 as well. No Wi-Fi\\n");
+			return;
+		}
+		doha_radio = whole = true;
+		radio_stream = 0x80;
+		apps_smmu.phys = 0x0C600000;
+		PE_parse_boot_argn("wifi_loud", &loud, sizeof(loud));
+		quiet = loud == 0;
+		pause_ms = watch_seconds = 0;
+		new_from = STEPS + 1;
+		redwood_lx_keep(44ul << 20);
+		redwood_lx_net_early();
+		tell("wifi: the radio is brought up when the modem's Wi-Fi firmware says it is ready (wifi=1)\\n");
+		return;
+	}
+	if (pe_arm_get_soc_base_phys() != REDWOOD_SOC_BASE) {
+		if (last_step != 0 && PE_parse_boot_argn("wifi_lx", &back, sizeof(back)) && back) {""")
+
+# (doha's radio on the panel: what the Wi-Fi driver tells -- "now the driver", "THE RADIO IS UP", "DID NOT COME UP: ... %d" --
+# goes to the Touch line as well, and the modem's summary leaves that line alone when wifi=1)
+sub1(WIFI, """redwood_wifi_tell(const char *format, ...)
+{
+	char line[400];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);""", """redwood_wifi_tell(const char *format, ...)
+{
+	char line[400];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	if (wifi_hud) {
+		redwood_status(REDWOOD_STATUS_TOUCH, "%.56s", strncmp(line, "wifi: ", 6) == 0 ? line + 6 : line);
+	}""")
+sub1(WIFI, """int
+redwood_wifi_tell(const char *format, ...)""", """static bool wifi_hud;                   /* doha: what is told goes to the panel's Touch line too */
+
+int
+redwood_wifi_tell(const char *format, ...)""")
+sub1(WIFI, """		doha_radio = whole = true;
+		radio_stream = 0x80;""", """		doha_radio = whole = wifi_hud = true;
+		radio_stream = 0x80;""")
+sub1(MSS, """			redwood_status(REDWOOD_STATUS_TOUCH, "%.56s", mss_smp2p);""", """			{
+				uint32_t wifi = 0;
+
+				if (!PE_parse_boot_argn("wifi", &wifi, sizeof(wifi)) || wifi == 0) {
+					redwood_status(REDWOOD_STATUS_TOUCH, "%.56s", mss_smp2p);
+				}
+			}""")
+
+# (doha's radio, first run: with wifi=1 the system did not come up at all -- without it, the same kernel did. Of what wifi=1
+# does while the system starts, two can be left out to find which: wifi_mem=0, the 44 MB not taken early (the driver asks
+# for them when it starts); wifi_net=0, en0 not made on the radio early)
+sub1(WIFI, """		redwood_lx_keep(44ul << 20);
+		redwood_lx_net_early();""", """		{
+			uint32_t keep = 1, net = 1;
+
+			PE_parse_boot_argn("wifi_mem", &keep, sizeof(keep));
+			PE_parse_boot_argn("wifi_net", &net, sizeof(net));
+			if (keep) {
+				redwood_lx_keep(44ul << 20);
+			}
+			if (net) {
+				redwood_lx_net_early();
+			}
+		}""")
+
+# (doha's radio, second run: the system stopped where the loader's text stays on the screen, with or without the 44 MB and
+# en0 taken early. What is left is what comes ~20 s in, when the modem's Wi-Fi firmware is ready and the driver starts --
+# the SMMU written, the radio's registers read -- before iOS has drawn anything. So the driver starts later, wifi_delay=S
+# seconds after the firmware is ready (40), with iOS on the screen, and every line the driver's layer says goes to the
+# panel's Touch line as well: a stop leaves the last one there)
+sub1(WIFI, """static bool wifi_hud;                   /* doha: what is told goes to the panel's Touch line too */
+
+int
+redwood_wifi_tell""", """int
+redwood_wifi_tell""")
+sub1(WIFI, """static void
+say_line(const char *line, bool aloud)
+{""", """static bool wifi_hud;                   /* doha: what is said and told goes to the panel's Touch line too */
+
+static void
+say_line(const char *line, bool aloud)
+{
+	if (wifi_hud) {
+		size_t n = strlen(line);
+		char shown[60];
+
+		strlcpy(shown, strncmp(line, "wifi: ", 6) == 0 ? line + 6 : line, sizeof(shown));
+		n = strlen(shown);
+		if (n > 0 && shown[n - 1] == '\\n') {
+			shown[n - 1] = 0;
+		}
+		redwood_status(REDWOOD_STATUS_TOUCH, "%.56s", shown);
+	}""")
+sub1(WIFI, """	if (wifi_hud) {
+		redwood_status(REDWOOD_STATUS_TOUCH, "%.56s", strncmp(line, "wifi: ", 6) == 0 ? line + 6 : line);
+	}""", "")
+sub1(WIFI, """	redwood_qmi_set_transport(transport);
+	tell("wifi: the modem's Wi-Fi firmware is ready: now the driver (ath10k)\\n");""", """	{
+		uint32_t delay = 40;
+
+		PE_parse_boot_argn("wifi_delay", &delay, sizeof(delay));
+		tell("wifi: the firmware is ready; the driver in %u s\\n", delay);
+		sleep_ms(delay * 1000);
+	}
+	redwood_qmi_set_transport(transport);
+	tell("wifi: the modem's Wi-Fi firmware is ready: now the driver (ath10k)\\n");""")
+
+# (doha's radio, third run: the driver started, said "device is wedged, will not restart" on the panel and the system
+# stopped; the lines before it were gone. Every line of the Wi-Fi driver's (and its layer's: their printf comes here too)
+# is now kept in the second half of the panic log region, which the RAM has kept through a reset before: a ring of
+# 256 KB behind "WLOG" and where it is at. The loader's lastpanic=2 shows its last 40 lines, for 60 s)
+sub1(WIFI, """static bool wifi_hud;                   /* doha: what is said and told goes to the panel's Touch line too */
+""", """static bool wifi_hud;                   /* doha: what is said and told goes to the panel's Touch line too */
+extern vm_offset_t gPanicBase;
+extern unsigned int gPanicSize;
+#define WIFI_LOG_AT             0x40000u        /* in the panic log region: its second half */
+#define WIFI_LOG_RING           (0x40000u - 16)
+
+static void
+wifi_log_keep(const char *line)
+{
+	static bool ready;
+	volatile uint8_t *area;
+	volatile uint32_t *head;
+	uint32_t at;
+
+	if (!wifi_hud || gPanicBase == 0 || gPanicSize < 0x80000) {
+		return;
+	}
+	area = (volatile uint8_t *)(gPanicBase + WIFI_LOG_AT);
+	head = (volatile uint32_t *)area;
+	if (!ready) {
+		for (uint32_t i = 16; i < 16 + WIFI_LOG_RING; i++) {
+			area[i] = 0;
+		}
+		head[1] = 0;
+		head[0] = 0x474f4c57;           /* "WLOG" */
+		ready = true;
+	}
+	at = head[1];
+	for (const char *c = line; *c != 0; c++) {
+		area[16 + at] = (uint8_t)*c;
+		if (++at == WIFI_LOG_RING) {
+			at = 0;
+		}
+	}
+	head[1] = at;
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+""")
+sub1(WIFI, """	lck_mtx_lock(&say_lock);
+	if (quiet && !aloud) {""", """	lck_mtx_lock(&say_lock);
+	wifi_log_keep(line);
+	if (quiet && !aloud) {""")
+sub1(L, """		for (const char *c = pi.cmdline; *c; c++) {
+			if (starts_with(c, "bltest=1") && (c == pi.cmdline || c[-1] == ' ')) {""", """		for (const char *c = pi.cmdline; *c; c++) {
+			if (starts_with(c, "lastpanic=2") && (c == pi.cmdline || c[-1] == ' ')) {
+				const unsigned char *area = (const unsigned char *)(uintptr_t)(PANIC_LOG_BASE + 0x40000);
+				const unsigned char *ring = area + 16;
+				uint64_t size = 0x40000 - 16, magic = *(const uint32_t *)area, at = *(const uint32_t *)(area + 4);
+				uint64_t back = 0, lines = 0, k = 0;
+				char line[120];
+
+				if (magic != 0x474f4c57 || at >= size) {
+					print("lastpanic=2: no Wi-Fi log in the panic log region (%x)\\n", magic);
+					BS->stall(5000000);
+					break;
+				}
+				while (back < size && lines < 41) {
+					unsigned char ch = ring[(at + size - 1 - back) % size];
+
+					if (ch == 0) {
+						break;
+					}
+					lines += ch == 10;
+					back++;
+				}
+				for (uint64_t j = 0; j < back; j++) {
+					char ch = (char)ring[(at + size - back + j) % size];
+
+					if (ch == 10 || k == sizeof(line) - 2) {
+						line[k] = 0;
+						print("%s\\n", line);
+						k = 0;
+						if (ch == 10) {
+							continue;
+						}
+					}
+					if (ch >= 32 && ch < 127) {
+						line[k++] = ch;
+					}
+				}
+				if (k > 0) {
+					line[k] = 0;
+					print("%s\\n", line);
+				}
+				print("lastpanic=2: the last lines of the Wi-Fi driver's log of the run before; 60 s to read this\\n");
+				BS->stall(60000000);
+				break;
+			}
+		}
+		for (const char *c = pi.cmdline; *c; c++) {
+			if (starts_with(c, "bltest=1") && (c == pi.cmdline || c[-1] == ' ')) {""")
+
+# (doha's radio, the kept log read: "ctl_resp never came in (-60)", "failed to connect to HTC: -60" -- the radio never answered
+# over its copy engines; the 40 last lines were mostly the driver's "(dbg)" polling. lastpanic=3 shows the last 40 lines that
+# are not "(dbg)" ones, where the SMMU's and the bus's lines are)
+sub1(L, """			if (starts_with(c, "lastpanic=2") && (c == pi.cmdline || c[-1] == ' ')) {""",
+     """			if ((starts_with(c, "lastpanic=2") || starts_with(c, "lastpanic=3")) && (c == pi.cmdline || c[-1] == ' ')) {""")
+sub1(L, """				uint64_t back = 0, lines = 0, k = 0;
+				char line[120];
+""", """				uint64_t back = 0, lines = 0, k = 0, end = 0, skip_dbg = c[10] == '3', dbg = 0;
+				char line[120];
+""")
+sub1(L, """					if (ch == 0) {
+						break;
+					}
+					lines += ch == 10;
+					back++;""", """					if (ch == 0) {
+						break;
+					}
+					if (ch == 10) {
+						uint64_t is_dbg = 0;
+
+						/* the line after this newline: back offsets end .. back-1, read backwards ")gbd(" is "(dbg)" */
+						for (uint64_t o = end; skip_dbg && o + 5 <= back && !is_dbg; o++) {
+							is_dbg = ring[(at + size - 1 - o) % size] == ')' && ring[(at + size - 2 - o) % size] == 'g' &&
+							    ring[(at + size - 3 - o) % size] == 'b' && ring[(at + size - 4 - o) % size] == 'd' &&
+							    ring[(at + size - 5 - o) % size] == '(';
+						}
+						lines += !is_dbg;
+						end = back + 1;
+					}
+					back++;""")
+sub1(L, """					if (ch == 10 || k == sizeof(line) - 2) {
+						line[k] = 0;
+						print("%s\\n", line);
+						k = 0;
+						if (ch == 10) {
+							continue;
+						}
+					}
+					if (ch >= 32 && ch < 127) {
+						line[k++] = ch;
+					}""", """					if (ch == 10 || k == sizeof(line) - 2) {
+						line[k] = 0;
+						for (uint64_t q = 0; q + 5 <= k && !dbg; q++) {
+							dbg = line[q] == '(' && line[q + 1] == 'd' && line[q + 2] == 'b' && line[q + 3] == 'g' &&
+							    line[q + 4] == ')';
+						}
+						if (!(skip_dbg && dbg)) {
+							print("%s\\n", line);
+						}
+						k = 0;
+						if (ch == 10) {
+							dbg = 0;
+							continue;
+						}
+					}
+					if (ch >= 32 && ch < 127) {
+						line[k++] = ch;
+					}""")
+
+# (doha's radio, the kept log without "(dbg)": the bus took the copy engines' twelve interrupts (wifi_irq, on by default
+# with wifi=1) and "60009 ms after its probe the driver HAS NOT REGISTERED THE RADIO ... the copy engines looked at 0
+# times": none of them came -- the radio's answers were never fetched, hence HTC's -60. On doha the engines are looked at
+# once a millisecond instead, as miatoll's bus did first (wifi_irq=1 still tries the interrupts)
+sub1(WIFI, """static bool doha_radio;                         /* the radio is doha's: its firmware the modem's, its driver ath10k */""", "")
+sub1(WIFI, """	for (unsigned i = 0; whole && i < sizeof(stands_for) / sizeof(stands_for[0]); i++) {""",
+     """	if (doha_radio && strcmp(name, "wifi_irq") == 0) {
+		return 0;                       /* (doha: the copy engines' interrupts do not come; they are looked at) */
+	}
+	for (unsigned i = 0; whole && i < sizeof(stands_for) / sizeof(stands_for[0]); i++) {""")
+sub1(WIFI, """static bool wifi_hud;                   /* doha: what is said and told goes to the panel's Touch line too */
+""", """static bool wifi_hud;                   /* doha: what is said and told goes to the panel's Touch line too */
+static bool doha_radio;                 /* the radio is doha's: its firmware the modem's, its driver ath10k */
+""")
+
+# (doha's radio: the copy engines looked at once a millisecond reset the whole SoC every time -- with the driver started at
+# once, and with only the engines that have a ring -- and the run left nothing behind. Back to the interrupts' way, which
+# never reset it (the radio's interrupts do not come, but the driver looks at every engine itself while it waits for
+# HTC). What that run lacked: whether the SMMU refused the radio's requests while it should have answered. When the
+# driver's start has failed, the SMMU's fault registers for the radio's context are read and said)
+sub1(WIFI, """	if (doha_radio && strcmp(name, "wifi_irq") == 0) {
+		return 0;                       /* (doha: the copy engines' interrupts do not come; they are looked at) */
+	}
+""", "")
+sub1(WIFI, """		tell("wifi: THE RADIO DID NOT COME UP: the driver's start returns %d, %llu s in\\n", error, (now_us() - began) / 1000000);
+		say_kept();""", """		tell("wifi: THE RADIO DID NOT COME UP: the driver's start returns %d, %llu s in\\n", error, (now_us() - began) / 1000000);
+		if (radio_space.on) {
+			tell("wifi: the SMMU after it: context %u fsr %#x, sgfsr %#x; smr %#x s2cr %#x\\n", radio_space.context,
+			    rd(apps_smmu_context.base + SMMU_CB_FSR), rd(apps_smmu.base + SMMU_SGFSR),
+			    rd(apps_smmu.base + SMMU_SMR(radio_space.match)), rd(apps_smmu.base + SMMU_S2CR(radio_space.match)));
+		}
+		radio_space_faults();
+		say_kept();""")
+
+# (doha's radio, the kept log with the HTC lines: every step of the driver's own is there -- the firmware's features, HTC's
+# "Control" service on pipes 0 and 2, HTT's rings, "boot hif start" -- and the firmware never sends HTC's "ready". Whether it
+# took the copy engines' configuration and the mission mode is said in the QMI lines, further back. lastpanic=4 shows the
+# last 40 lines with "qmi", "mode" or "wlfw" in them)
+sub1(L, """		for (const char *c = pi.cmdline; *c; c++) {
+			if ((starts_with(c, "lastpanic=2") || starts_with(c, "lastpanic=3")) && (c == pi.cmdline || c[-1] == ' ')) {""",
+     """		for (const char *c = pi.cmdline; *c; c++) {
+			if (starts_with(c, "lastpanic=4") && (c == pi.cmdline || c[-1] == ' ')) {
+				const unsigned char *area = (const unsigned char *)(uintptr_t)(PANIC_LOG_BASE + 0x40000);
+				const unsigned char *ring = area + 16;
+				uint64_t size = 0x40000 - 16, magic = *(const uint32_t *)area, at = *(const uint32_t *)(area + 4);
+				uint64_t total = 0, seen = 0;
+				char line[120];
+
+				if (magic != 0x474f4c57 || at >= size) {
+					print("lastpanic=4: no Wi-Fi log in the panic log region (%x)\\n", magic);
+					BS->stall(5000000);
+					break;
+				}
+				/* two passes over the ring from its oldest byte: the matching lines counted, then the last 40 shown */
+				for (int pass = 0; pass < 2; pass++) {
+					uint64_t k = 0;
+
+					for (uint64_t j = 0; j <= size; j++) {
+						char ch = j < size ? (char)ring[(at + j) % size] : 10;
+						uint64_t hit = 0;
+
+						if (ch != 10 && k < sizeof(line) - 1) {
+							if (ch >= 32 && ch < 127) {
+								line[k++] = ch;
+							}
+							continue;
+						}
+						if (ch != 10) {
+							continue;               /* (the rest of a long line is left out) */
+						}
+						line[k] = 0;
+						for (uint64_t q = 0; q + 3 <= k && !hit; q++) {
+							hit = (line[q] == 'q' && line[q + 1] == 'm' && line[q + 2] == 'i') ||
+							    (line[q] == 'w' && line[q + 1] == 'l' && line[q + 2] == 'f') ||
+							    (q + 4 <= k && line[q] == 'm' && line[q + 1] == 'o' && line[q + 2] == 'd' && line[q + 3] == 'e');
+						}
+						if (hit) {
+							if (pass == 0) {
+								total++;
+							} else if (seen++ + 40 >= total) {
+								print("%s\\n", line);
+							}
+						}
+						k = 0;
+					}
+				}
+				print("lastpanic=4: the last %d of %d lines on QMI and the mode; 60 s to read this\\n", total < 40 ? total : 40,
+				    total);
+				BS->stall(60000000);
+				break;
+			}
+		}
+		for (const char *c = pi.cmdline; *c; c++) {
+			if ((starts_with(c, "lastpanic=2") || starts_with(c, "lastpanic=3")) && (c == pi.cmdline || c[-1] == ' ')) {""")
+
+# (doha's radio: the firmware takes the copy engines' configuration and the mission mode, the rings are in place, 63
+# buffers posted on HTC's control pipe -- and HTC's "ready" never comes; with the driver started at once the SoC resets
+# where it first touches the engines. The radio's RF supply was at 1.248 V, willow's guess: Android's icnss gives
+# vdd-1.3-rfa 1.304 V, which doha's dt says too for the same rail of the chip's Bluetooth half (bt-vdd-core, L17,
+# 1304000). At Android's now)
+sub1(MSS, """			{ "the radio's 1.3 V RF (vdd-1.3-rfa)", 17, 1248000 }, { "the radio's 3.3 V (vdd-3.3-ch0)", 23, 3000000 },""",
+     """			{ "the radio's 1.3 V RF (vdd-1.3-rfa)", 17, 1304000 }, { "the radio's 3.3 V (vdd-3.3-ch0)", 23, 3000000 },""")
+
+# (doha's radio: on HTC's control pipe in (CE2) the engine's read index went to 1 -- CE1, with buffers posted too, stayed at
+# 0 -- so the firmware began to send HTC's "ready": the descriptor read, the buffer to be written. Nothing ever came into
+# our memory, and the SMMU recorded no refused request in any run. Should the radio's requests not go through the SMMU
+# context written for its stream at all, it reads and writes the addresses it is given as they are -- 0xa0000000 on,
+# somebody else's memory. wifi_phys=1: the radio is given our memory's physical addresses instead, and the SMMU is left
+# alone)
+sub1(WIFI, """static bool
+radio_map(uint64_t physical, uint64_t size, uint64_t attributes, unsigned long long *address)
+{
+	size = (size + 4095) & ~4095ull;""", """static bool
+radio_map(uint64_t physical, uint64_t size, uint64_t attributes, unsigned long long *address)
+{
+	if (doha_radio && redwood_wifi_option("wifi_phys")) {
+		*address = physical;
+		tell("wifi: wifi_phys: the radio is given our %llu KB at their physical address %#llx; the SMMU is left alone\\n",
+		    size >> 10, physical);
+		return true;
+	}
+	size = (size + 4095) & ~4095ull;""")
+
+# (doha's radio: during HTC's wait the modem announced the Wi-Fi firmware's service anew ("a service: 69" on the panel) and
+# ath10k counted a recovery -- the Wi-Fi domain had gone down and come back, as it does when its firmware dies. What the
+# modem says of that domain -- its state changes, a domain's failure and its reason, the service announced again -- goes
+# into the Wi-Fi driver's kept log as well (lastpanic=2/3), where it can be read after the run)
+sub1(MSS, """		if ((at = strnstr(line, "DOMAIN IS NOW ", sizeof(line))) != NULL) {""", """		if (strnstr(line, "DOMAIN IS NOW ", sizeof(line)) != NULL || strnstr(line, "HAS FAILED", sizeof(line)) != NULL ||
+		    strnstr(line, "a service: 69 ", sizeof(line)) != NULL || strnstr(line, "has gone", sizeof(line)) != NULL) {
+			redwood_wifi_tell("%s\\n", line);
+		}
+		if ((at = strnstr(line, "DOMAIN IS NOW ", sizeof(line))) != NULL) {""")
+
+# (doha's radio: the firmware takes the copy engines' configuration and the mission mode and never sends HTC's "ready", and
+# does not go down. It is WLAN.HL.3.0.2 (wlanmdsp.mbn's QC_IMAGE_VERSION_STRING), of the WCN3990's older firmware, for
+# which Linux's ath10k has "qcom,snoc-host-cap-8bit-quirk": its host capabilities' daemon_support is one byte, not four.
+# The WLFW exchange sent four and never looked at the answer. Now one byte first (wlfw_hostcap8=0: four), four if that is
+# refused; and every answer of the exchange -- done or REFUSED, with its error -- goes into the Wi-Fi driver's kept log)
+sub1(MSS, """	at = wlfw2_u32(tlvs, 0x10, 0);                                  /* no daemon */
+	(void)wlfw2_ask("host capabilities", WLFW_HOST_CAP, tlvs, at);""", """	{
+		uint32_t eight = 1;
+		bool taken = false;
+
+		PE_parse_boot_argn("wlfw_hostcap8", &eight, sizeof(eight));
+		if (eight) {
+			at = wlfw2_u8(tlvs, 0x10, 0);                   /* no daemon, one byte (ath10k's 8-bit quirk) */
+			taken = wlfw2_ask("host capabilities, 8-bit", WLFW_HOST_CAP, tlvs, at);
+		}
+		if (!taken) {
+			at = wlfw2_u32(tlvs, 0x10, 0);                  /* no daemon, four bytes */
+			(void)wlfw2_ask("host capabilities", WLFW_HOST_CAP, tlvs, at);
+		}
+	}""")
+sub1(MSS, """		if (strnstr(line, "DOMAIN IS NOW ", sizeof(line)) != NULL || strnstr(line, "HAS FAILED", sizeof(line)) != NULL ||""",
+     """		if (strncmp(line, "mss: wlfw: ", 11) == 0 || strnstr(line, "DOMAIN IS NOW ", sizeof(line)) != NULL ||
+		    strnstr(line, "HAS FAILED", sizeof(line)) != NULL ||""")
+
+# (doha's radio: after "qmi wlan mode req completed: 0" ath10k's QMI client heard "service found" a second time, connected
+# again, heard the firmware ready again and counted a recovery -- in the middle of HTC's wait -- with no change of the Wi-Fi
+# domain's. The modem had said NEW_SERVER again for a server already known, at the same node and port, and every port
+# looking for it was told it had arrived anew. Now a NEW_SERVER of a server already there is noted and told nobody)
+sub1(MSS, """	case QRTR_NEW_SERVER:
+		lck_mtx_lock(&qrtr_lock);
+		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
+			if (qrtr_servers[i].there && qrtr_servers[i].node == control->words[2] && qrtr_servers[i].port == control->words[3]) {
+				found = (int)i;
+				break;
+			}""", """	case QRTR_NEW_SERVER:
+		lck_mtx_lock(&qrtr_lock);
+		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
+			if (qrtr_servers[i].there && qrtr_servers[i].node == control->words[2] && qrtr_servers[i].port == control->words[3]) {
+				found = (int)i;
+				if (qrtr_servers[i].service == control->words[0] && qrtr_servers[i].instance == control->words[1]) {
+					found = -2;             /* (already there, the same: said again, told nobody) */
+				}
+				break;
+			}""")
+sub1(MSS, """		if (found >= 0) {
+			qrtr_servers[found].there = true;""", """		if (found == -2) {
+			lck_mtx_unlock(&qrtr_lock);
+			printf("mss: qrtr: a service: %u again, at node %u port %u: already known, told nobody\\n", control->words[0], control->words[2],
+			    control->words[3]);
+			break;
+		}
+		if (found >= 0) {
+			qrtr_servers[found].there = true;""")
+
+# (doha's radio: after ath10k's mission mode the WLFW service was announced anew -- not the same announcement said twice --
+# and HTC's "ready" never came. Our own WLFW client, the one that brought the firmware to "ready", stayed connected to it
+# when ath10k's took over: two clients of the firmware's, where Linux has one. Now ours leaves (wlfw2_keep=1: it stays)
+# before ath10k's begins. And lastpanic=5: the last 40 lines on services, ports and the domain -- "serv", "port", "gone",
+# "DOMAIN", "FAIL")
+sub1(MSS, """		if (wlfw2_fw_ready && redwood_wifi_modem_firmware_ready()) {
+			printf("mss: wlfw: the firmware is the radio's driver's from here on (ath10k)\\n");
+			goto out;
+		}""", """		if (wlfw2_fw_ready && redwood_wifi_modem_firmware_ready()) {
+			uint32_t keep = 0;
+
+			PE_parse_boot_argn("wlfw2_keep", &keep, sizeof(keep));
+			if (!keep) {
+				struct redwood_qrtr_port *ours = wlfw2_port;
+
+				wlfw2_port = NULL;
+				qrtr_close(ours);
+			}
+			printf("mss: wlfw: the firmware is the radio's driver's from here on (ath10k); our client %s\\n",
+			    keep ? "stays (wlfw2_keep=1)" : "has left");
+			goto out;
+		}""")
+sub1(L, """			if (starts_with(c, "lastpanic=4") && (c == pi.cmdline || c[-1] == ' ')) {""",
+     """			if ((starts_with(c, "lastpanic=4") || starts_with(c, "lastpanic=5")) && (c == pi.cmdline || c[-1] == ' ')) {
+				int five = c[10] == '5';""")
+sub1(L, """							hit = (line[q] == 'q' && line[q + 1] == 'm' && line[q + 2] == 'i') ||
+							    (line[q] == 'w' && line[q + 1] == 'l' && line[q + 2] == 'f') ||
+							    (q + 4 <= k && line[q] == 'm' && line[q + 1] == 'o' && line[q + 2] == 'd' && line[q + 3] == 'e');""",
+     """							if (five) {
+								static const char *const words[] = { "serv", "port", "gone", "DOMAIN", "FAIL", "left" };
+
+								for (unsigned w = 0; w < sizeof(words) / sizeof(words[0]) && !hit; w++) {
+									uint64_t r = 0;
+
+									while (words[w][r] && q + r < k && line[q + r] == words[w][r]) {
+										r++;
+									}
+									hit = words[w][r] == 0;
+								}
+								continue;
+							}
+							hit = (line[q] == 'q' && line[q + 1] == 'm' && line[q + 2] == 'i') ||
+							    (line[q] == 'w' && line[q + 1] == 'l' && line[q + 2] == 'f') ||
+							    (q + 4 <= k && line[q] == 'm' && line[q + 1] == 'o' && line[q + 2] == 'd' && line[q + 3] == 'e');""")
+sub1(L, """				print("lastpanic=4: the last %d of %d lines on QMI and the mode; 60 s to read this\\n", total < 40 ? total : 40,
+				    total);""", """				print("lastpanic=%c: the last %d of %d lines on %s; 60 s to read this\\n", five ? '5' : '4',
+				    total < 40 ? total : 40, total, five ? "services, ports and the domain" : "QMI and the mode");""")
+sub1(MSS, """		if (strncmp(line, "mss: wlfw: ", 11) == 0 || strnstr(line, "DOMAIN IS NOW ", sizeof(line)) != NULL ||""",
+     """		if (strncmp(line, "mss: wlfw: ", 11) == 0 || strncmp(line, "mss: qrtr: ", 11) == 0 ||
+		    strnstr(line, "DOMAIN IS NOW ", sizeof(line)) != NULL ||""")
+
+# (doha's radio: with our WLFW client gone before ath10k's came, ath10k still counted a recovery -- the firmware's WLFW
+# server was announced to it a second time, and ath10k's QMI layer passes on only a server at a node and port it did not
+# have. The kept log does not outlive the button's reset, and the phone no longer resets by itself. So the Keys line, once
+# the modem is done, holds the history of the Wi-Fi firmware's service: +port when it comes, -port when it goes, =port
+# said again, D:state of the Wi-Fi domain, x when our client leaves)
+sub1(MSS, """			redwood_wifi_tell("%s\\n", line);
+		}
+		if ((at = strnstr(line, "DOMAIN IS NOW ", sizeof(line))) != NULL) {""", """			redwood_wifi_tell("%s\\n", line);
+		}
+		{
+			static char history[60];
+			char one[24] = "";
+			const char *port = strnstr(line, " port ", sizeof(line));
+
+			if (strnstr(line, "a service: 69 ", sizeof(line)) != NULL && port != NULL) {
+				snprintf(one, sizeof(one), "+%lu ", strtoul(port + 6, NULL, 10));
+			} else if (strnstr(line, "service 69 at", sizeof(line)) != NULL && strnstr(line, "has gone", sizeof(line)) != NULL &&
+			    port != NULL) {
+				snprintf(one, sizeof(one), "-%lu ", strtoul(port + 6, NULL, 10));
+			} else if (strnstr(line, "a service: 69 again", sizeof(line)) != NULL && port != NULL) {
+				snprintf(one, sizeof(one), "=%lu ", strtoul(port + 6, NULL, 10));
+			} else if ((at = strnstr(line, "DOMAIN IS NOW ", sizeof(line))) != NULL) {
+				snprintf(one, sizeof(one), "D:%.4s ", at + 14);
+			} else if (strnstr(line, "our client has left", sizeof(line)) != NULL) {
+				strlcpy(one, "x ", sizeof(one));
+			}
+			if (one[0] != 0) {
+				size_t have = strlen(history), more = strlen(one);
+
+				if (have + more >= sizeof(history)) {
+					memmove(history, history + (have + more - (sizeof(history) - 1)), sizeof(history) - (have + more - (sizeof(history) - 1)));
+				}
+				strlcat(history, one, sizeof(history));
+				redwood_status(REDWOOD_STATUS_KEYS, "69: %.54s", history);
+			}
+			if (strncmp(line, "mss: done", 9) == 0 && history[0] != 0) {
+				redwood_status(REDWOOD_STATUS_KEYS, "69: %.54s", history);
+			}
+		}
+		if ((at = strnstr(line, "DOMAIN IS NOW ", sizeof(line))) != NULL) {""")
+sub1(MSS, """			redwood_status(REDWOOD_STATUS_KEYS, "read: %.50s", mss_reads);""",
+     """			uint32_t radio = 0;
+
+			if (!PE_parse_boot_argn("wifi", &radio, sizeof(radio)) || radio == 0) {
+				redwood_status(REDWOOD_STATUS_KEYS, "read: %.50s", mss_reads);   /* (wifi=1: the Keys line is service 69's) */
+			}""")
+
+# (doha's radio, the Keys line's history: "D:UP +106 x D:DOWN D:UP +649" -- the WLFW server came at port 106, our client
+# left, and then the Wi-Fi domain itself went DOWN and came UP again, its server anew at port 649: the WLAN process in the
+# modem died after ath10k's mission mode and was restarted, and ath10k counted it as a recovery. Why it died the modem says
+# in its failure reason (SMEM's item 421), read now the moment the domain is said to be down: on the Storage line and in the
+# kept log)
+sub1(MSS, """		printf("mss: 11: SERVREG: THE WI-FI DOMAIN IS NOW %s (%#x, transaction %u): acknowledged: %d\\n", servreg_state(state), state,
+		    txn, servreg_request(SERVREG_SET_ACK, tlvs, n));""", """		if (state == 0x0fffffff || state == 0x2fffffff) {
+			uint32_t reason_size = 0, reason_at = smem_item(ITEM_CRASH_REASON, &reason_size);
+			char reason[161];
+			size_t r;
+
+			bzero(reason, sizeof(reason));
+			if (reason_at != 0) {
+				smem_peek(reason_at, reason, reason_size < sizeof(reason) - 1 ? reason_size : sizeof(reason) - 1);
+			}
+			for (r = 0; r < sizeof(reason) - 1 && reason[r] != 0; r++) {
+				if (reason[r] < 32 || reason[r] > 126) {
+					reason[r] = ' ';
+				}
+			}
+			reason[r] = 0;
+			printf("mss: wlfw: the Wi-Fi domain goes down (%#x); the modem's failure reason: \\"%s\\"\\n", state, reason);
+			redwood_status(REDWOOD_STATUS_STORAGE, "down: %.50s", r > 50 ? reason + r - 50 : reason);
+		}
+		printf("mss: 11: SERVREG: THE WI-FI DOMAIN IS NOW %s (%#x, transaction %u): acknowledged: %d\\n", servreg_state(state), state,
+		    txn, servreg_request(SERVREG_SET_ACK, tlvs, n));""")
+
+# (doha's radio: with WIFI off, our WLFW client's own configuration and mission mode, and nothing touching the copy
+# engines, the Wi-Fi domain stays up ("MISSION: 12 s on, the service is THERE", no D:DOWN); with ath10k it goes down. What
+# ath10k adds is the engines: their rings, and the radio's DMA into our memory through the apps SMMU. Whether the SMMU
+# took what was written -- the match register and its S2CR read back, any other valid match register that also catches
+# stream 0x80, the context's and the SMMU's fault status -- on the Storage line once the driver's start returns; the
+# modem's failure reason (only its "SFR Init" text) leaves that line)
+sub1(MSS, """			redwood_status(REDWOOD_STATUS_STORAGE, "down: %.50s", r > 50 ? reason + r - 50 : reason);
+""", "")
+sub1(WIFI, """	error = redwood_lx_start();
+	if (error == 0) {
+		tell("wifi: THE RADIO IS UP, %llu.%llu s after the firmware said it was ready\\n", (now_us() - began) / 1000000,""",
+     """	error = redwood_lx_start();
+	if (radio_space.on) {
+		uint32_t matches = rd(apps_smmu.base + SMMU_IDR0) & 0xff, others = 0, other = ~0u, other_s2cr = 0;
+
+		for (uint32_t n = 0; n < matches && SMMU_SMR(n) < 0xc00; n++) {
+			uint32_t smr = rd(apps_smmu.base + SMMU_SMR(n)), mask = smr >> 16 & 0x7fff;
+
+			if (n != radio_space.match && smr >> 31 && ((smr ^ RADIO_STREAM) & ~mask & 0x7fff) == 0) {
+				others++;
+				if (other == ~0u) {
+					other = n;
+					other_s2cr = rd(apps_smmu.base + SMMU_S2CR(n));
+				}
+			}
+		}
+		redwood_status(REDWOOD_STATUS_STORAGE, "smmu m%u %x/%x c%u sc%x fsr%x g%x o%u:%x/%x", radio_space.match,
+		    rd(apps_smmu.base + SMMU_SMR(radio_space.match)), rd(apps_smmu.base + SMMU_S2CR(radio_space.match)),
+		    radio_space.context, rd(apps_smmu_context.base + SMMU_CB_SCTLR), rd(apps_smmu_context.base + SMMU_CB_FSR),
+		    rd(apps_smmu.base + SMMU_SGFSR), others, other == ~0u ? 0 : rd(apps_smmu.base + SMMU_SMR(other)), other_s2cr);
+		tell("wifi: the SMMU after the driver's start: match %u smr %#x s2cr %#x; context %u sctlr %#x fsr %#x; sgfsr %#x; "
+		    "%u other match register(s) catch stream %#x (the first: %u, smr %#x s2cr %#x)\\n", radio_space.match,
+		    rd(apps_smmu.base + SMMU_SMR(radio_space.match)), rd(apps_smmu.base + SMMU_S2CR(radio_space.match)),
+		    radio_space.context, rd(apps_smmu_context.base + SMMU_CB_SCTLR), rd(apps_smmu_context.base + SMMU_CB_FSR),
+		    rd(apps_smmu.base + SMMU_SGFSR), others, RADIO_STREAM, other, other == ~0u ? 0 : rd(apps_smmu.base + SMMU_SMR(other)),
+		    other_s2cr);
+	} else {
+		redwood_status(REDWOOD_STATUS_STORAGE, "smmu: not ours (wifi_phys or not set up): sgfsr %x", rd(apps_smmu.base + SMMU_SGFSR));
+	}
+	if (error == 0) {
+		tell("wifi: THE RADIO IS UP, %llu.%llu s after the firmware said it was ready\\n", (now_us() - began) / 1000000,""")
+
+# (doha's radio: the driver's start does not return -- after HTC's failure ath10k's recovery ends in "device is wedged,
+# will not restart" -- so what came after it was never shown. The SMMU's summary now comes from a thread of its own, every
+# 5 s from the driver's start on)
+sub1(WIFI, """	error = redwood_lx_start();
+	if (radio_space.on) {""", """	{
+		thread_t watch;
+
+		if (kernel_thread_start(doha_smmu_watch, NULL, &watch) == KERN_SUCCESS) {
+			thread_deallocate(watch);
+		}
+	}
+	error = redwood_lx_start();
+	if (radio_space.on) {""")
+sub1(WIFI, """static void
+doha_thread(__unused void *parameter, __unused wait_result_t result)
+{""", """static void
+doha_smmu_show(void)
+{
+	uint32_t matches, others = 0, other = ~0u, other_s2cr = 0;
+
+	if (!radio_space.on) {
+		redwood_status(REDWOOD_STATUS_STORAGE, "smmu: not on (yet, or wifi_phys): sgfsr %x", rd(apps_smmu.base + SMMU_SGFSR));
+		return;
+	}
+	matches = rd(apps_smmu.base + SMMU_IDR0) & 0xff;
+	for (uint32_t n = 0; n < matches && SMMU_SMR(n) < 0xc00; n++) {
+		uint32_t smr = rd(apps_smmu.base + SMMU_SMR(n)), mask = smr >> 16 & 0x7fff;
+
+		if (n != radio_space.match && smr >> 31 && ((smr ^ RADIO_STREAM) & ~mask & 0x7fff) == 0) {
+			others++;
+			if (other == ~0u) {
+				other = n;
+				other_s2cr = rd(apps_smmu.base + SMMU_S2CR(n));
+			}
+		}
+	}
+	redwood_status(REDWOOD_STATUS_STORAGE, "smmu m%u %x/%x c%u sc%x fsr%x g%x o%u:%x/%x", radio_space.match,
+	    rd(apps_smmu.base + SMMU_SMR(radio_space.match)), rd(apps_smmu.base + SMMU_S2CR(radio_space.match)),
+	    radio_space.context, rd(apps_smmu_context.base + SMMU_CB_SCTLR), rd(apps_smmu_context.base + SMMU_CB_FSR),
+	    rd(apps_smmu.base + SMMU_SGFSR), others, other == ~0u ? 0 : rd(apps_smmu.base + SMMU_SMR(other)), other_s2cr);
+}
+
+static void
+doha_smmu_watch(__unused void *parameter, __unused wait_result_t result)
+{
+	for (unsigned i = 0; i < 120; i++) {
+		sleep_ms(5000);
+		doha_smmu_show();
+	}
+	thread_terminate(current_thread());
+}
+
+static void
+doha_thread(__unused void *parameter, __unused wait_result_t result)
+{""")
+
+# (doha's radio: the SMMU's summary showed the radio's stream matched, translated by our context, and nothing refused; the
+# Storage line is the copy engines' register writes' now (lx_snoc.c), and the SMMU's thread only with wifi_smmu_watch=1)
+sub1(WIFI, """		if (kernel_thread_start(doha_smmu_watch, NULL, &watch) == KERN_SUCCESS) {""",
+     """		if (redwood_wifi_option("wifi_smmu_watch") && kernel_thread_start(doha_smmu_watch, NULL, &watch) == KERN_SUCCESS) {""")
+
+# (doha's radio: the copy engines' register writes counted by region, shown by the bus (lx_snoc.c) on the panel's Storage
+# line: lx_os_status())
+sub1('xnu/files/bsd/dev/redwood_lx.c', """void
+lx_os_print(const char *text)
+{
+	say("%s", text);
+}
+""", """void
+lx_os_print(const char *text)
+{
+	say("%s", text);
+}
+
+void
+lx_os_status(const char *text)
+{
+	redwood_status(REDWOOD_STATUS_STORAGE, "%.56s", text);
+}
+""")
+
+# (doha's radio: the firmware's memory (MSA) was told as 1 MB, qcom,wlan-msa-memory's number; but doha's dt reserves 2 MB
+# there (wlan_msa_region@53300000: reg <0 0x53300000 0 0x200000>), Android's icnss tells the firmware the fixed region's own
+# size when there is one, and Linux's sm6125.dtsi has wlan_msa_mem at 0x53300000 of 2 MB as well. 2 MB now)
+sub1(MSS, """#define WLFW_MSA_SIZE           0x00100000u     /* doha: qcom,wlan-msa-memory */""",
+     """#define WLFW_MSA_SIZE           0x00200000u     /* doha: wlan_msa_region@53300000's size (qcom,wlan-msa-memory says 1 MB) */""")
+
+# (doha's radio: the Storage line after HTC's failure is the copy engines' error status now (lx_snoc.c); the SMMU's summary
+# after the driver's start, known to be clean, goes to the log alone)
+sub1(WIFI, """		redwood_status(REDWOOD_STATUS_STORAGE, "smmu m%u %x/%x c%u sc%x fsr%x g%x o%u:%x/%x", radio_space.match,
+		    rd(apps_smmu.base + SMMU_SMR(radio_space.match)), rd(apps_smmu.base + SMMU_S2CR(radio_space.match)),
+		    radio_space.context, rd(apps_smmu_context.base + SMMU_CB_SCTLR), rd(apps_smmu_context.base + SMMU_CB_FSR),
+		    rd(apps_smmu.base + SMMU_SGFSR), others, other == ~0u ? 0 : rd(apps_smmu.base + SMMU_SMR(other)), other_s2cr);
+		tell(""", """		tell(""")
+sub1(WIFI, """	} else {
+		redwood_status(REDWOOD_STATUS_STORAGE, "smmu: not ours (wifi_phys or not set up): sgfsr %x", rd(apps_smmu.base + SMMU_SGFSR));
+	}
+	if (error == 0) {""", """	}
+	if (error == 0) {""")
+
+# (doha's radio, after ginkgo-mainline-linux's account of the same SoC, chip and firmware (SM6125, WCN3990,
+# WLAN.HL.3.0.2) brought up with ath10k: (1) the MSA told as 2 MB crashes the firmware -- downstream icnss hands the WLAN
+# 1 MB -- so 1 MB again; (2) the firmware asks for its calibration (INITIATE_CAL_DOWNLOAD_IND) and must be answered, each
+# time, with an empty download (total_size 0, end 1), and only then given the calibration report: a report without the
+# answer gives a cold calibration and "SFR Init: wdog" a few ms later, the very failure seen here. So the indication is
+# registered for, the host capabilities say bdf_support 1, cal_filesys_support 1, cal_done 0 (wlfw_calfix=0: as before),
+# every cal_id asked for is answered, and the report goes 100 ms after)
+sub1(MSS, """#define WLFW_MSA_SIZE           0x00200000u     /* doha: wlan_msa_region@53300000's size (qcom,wlan-msa-memory says 1 MB) */""",
+     """#define WLFW_MSA_SIZE           0x00100000u     /* doha: qcom,wlan-msa-memory; 2 MB crashes the firmware (ginkgo) */
+#define WLFW_CAL_DOWNLOAD       0x0027
+#define WLFW_INITIATE_CAL_DOWNLOAD_IND 0x0028
+static volatile uint32_t wlfw2_cal_asked[8], wlfw2_cal_count, wlfw2_cal_done_count;""")
+sub1(MSS, """		} else if (message == WLFW_MSA_READY_IND) {
+			wlfw2_msa_ready = true;""", """		} else if (message == WLFW_INITIATE_CAL_DOWNLOAD_IND) {
+			uint32_t id = length >= 14 && m[7] == 0x01 ? (uint32_t)(m[10] | m[11] << 8 | m[12] << 16 | (uint32_t)m[13] << 24) : 0;
+
+			if (wlfw2_cal_count < 8) {
+				wlfw2_cal_asked[wlfw2_cal_count] = id;
+			}
+			__asm__ volatile ("dmb ish" ::: "memory");
+			wlfw2_cal_count++;
+			printf("mss: wlfw: the firmware asks for its calibration %u\\n", id);
+		} else if (message == WLFW_MSA_READY_IND) {
+			wlfw2_msa_ready = true;""")
+sub1(MSS, """	at += wlfw2_u8(tlvs + at, 0x10, 1);                             /* fw_ready_enable */
+	at += wlfw2_u8(tlvs + at, 0x13, 1);                             /* msa_ready_enable */""",
+     """	at += wlfw2_u8(tlvs + at, 0x10, 1);                             /* fw_ready_enable */
+	if (wlfw2_calfix()) {
+		at += wlfw2_u8(tlvs + at, 0x11, 1);                     /* initiate_cal_download_enable */
+	}
+	at += wlfw2_u8(tlvs + at, 0x13, 1);                             /* msa_ready_enable */""")
+sub1(MSS, """		if (eight) {
+			at = wlfw2_u8(tlvs, 0x10, 0);                   /* no daemon, one byte (ath10k's 8-bit quirk) */""",
+     """		if (eight) {
+			at = wlfw2_u8(tlvs, 0x10, 0);                   /* no daemon, one byte (ath10k's 8-bit quirk) */
+			if (wlfw2_calfix()) {
+				at += wlfw2_u8(tlvs + at, 0x14, 1);     /* bdf_support */
+				at += wlfw2_u8(tlvs + at, 0x18, 1);     /* cal_filesys_support */
+				at += wlfw2_u8(tlvs + at, 0x1a, 0);     /* cal_done: no -- the firmware asks for it */
+			}""")
+sub1(MSS, """	tlvs[0] = 0x01;
+	tlvs[1] = 1;
+	tlvs[2] = 0;
+	tlvs[3] = 0;
+	(void)wlfw2_ask("calibrations (none)", WLFW_CAL_REPORT, tlvs, 4);
+	for (unsigned ms = 0; ms < 15000 && !wlfw2_fw_ready; ms += 10) {
+		IOSleep(10);
+	}""", """	if (wlfw2_calfix()) {
+		for (unsigned ms = 0; ms < 1000 && wlfw2_cal_count == 0 && !wlfw2_fw_ready; ms += 10) {
+			IOSleep(10);
+		}
+		wlfw2_cal_answer();
+		IOSleep(100);
+	}
+	tlvs[0] = 0x01;
+	tlvs[1] = 1;
+	tlvs[2] = 0;
+	tlvs[3] = 0;
+	(void)wlfw2_ask("calibrations (none)", WLFW_CAL_REPORT, tlvs, 4);
+	for (unsigned ms = 0; ms < 15000 && !wlfw2_fw_ready; ms += 10) {
+		if (wlfw2_calfix()) {
+			wlfw2_cal_answer();
+		}
+		IOSleep(10);
+	}""")
+sub1(MSS, """static bool
+wlfw2_ask(const char *what, uint16_t message, const uint8_t *tlvs, uint32_t length)
+{""", """static bool wlfw2_ask(const char *what, uint16_t message, const uint8_t *tlvs, uint32_t length);
+static unsigned wlfw2_u8(uint8_t *at, uint8_t type, uint8_t value);
+static unsigned wlfw2_u32(uint8_t *at, uint8_t type, uint32_t value);
+
+static bool
+wlfw2_calfix(void)
+{
+	uint32_t on = 1;
+
+	PE_parse_boot_argn("wlfw_calfix", &on, sizeof(on));
+	return on != 0;
+}
+
+/* Each calibration the firmware has asked for, answered with an empty download (none kept here: it calibrates anew) */
+static void
+wlfw2_cal_answer(void)
+{
+	while (wlfw2_cal_done_count < wlfw2_cal_count) {
+		uint8_t t[40];
+		uint32_t at, id = wlfw2_cal_asked[wlfw2_cal_done_count < 8 ? wlfw2_cal_done_count : 7];
+
+		at = wlfw2_u8(t, 0x01, 1);                              /* valid */
+		at += wlfw2_u32(t + at, 0x10, id);                      /* file_id: the calibration asked for */
+		at += wlfw2_u32(t + at, 0x11, 0);                       /* total_size */
+		at += wlfw2_u32(t + at, 0x12, 0);                       /* seg_id */
+		t[at++] = 0x13;                                         /* data: none */
+		t[at++] = 2;
+		t[at++] = 0;
+		t[at++] = 0;
+		t[at++] = 0;
+		at += wlfw2_u8(t + at, 0x14, 1);                        /* end */
+		(void)wlfw2_ask("calibration download (empty)", WLFW_CAL_DOWNLOAD, t, at);
+		wlfw2_cal_done_count++;
+	}
+}
+
+static bool
+wlfw2_ask(const char *what, uint16_t message, const uint8_t *tlvs, uint32_t length)
+{""")
+
+# (doha's radio: CE2's misc status after HTC's wait is 0x300 -- AXI error and destination address error: the radio read
+# the descriptor (drri 1) and its write of HTC's "ready" into our buffer was refused on the bus, past the SMMU, which
+# recorded nothing. Where our memory for the radio is, physically, shown with it: lx_os_radio_physical())
+sub1(LXC, """	physical = kvtophys(cached);
+	bzero((void *)cached, size);""", """	physical = kvtophys(cached);
+	if (lx_radio_physical == 0) {
+		lx_radio_physical = physical;
+	}
+	bzero((void *)cached, size);""")
+sub1(LXC, """void *
+lx_os_radio_memory(unsigned long size, unsigned long long *address)
+{""", """static uint64_t lx_radio_physical;
+
+unsigned long long
+lx_os_radio_physical(void)
+{
+	return lx_radio_physical;
+}
+
+void *
+lx_os_radio_memory(unsigned long size, unsigned long long *address)
+{""")
+
+# (doha's radio: CE2's status 0x300 -- the radio read its descriptor ring and its write back into the same ring was refused
+# on the bus, past the SMMU (nothing recorded), with our tables (context 4) and without them (wifi_phys=1) alike: reads
+# pass, writes do not. The context's CBAR had VMID 0; Qualcomm's memory protection tells masters apart by VMID and HLOS is
+# 3. wifi_vmid=N: the context's VMID (default 3; wifi_vmid=0: as before))
+sub1(WIFI, """	put(&apps_smmu_second, "cbar", SMMU_CBAR(radio_space.context), SMMU_CBAR_STAGE_1);""",
+     """	{
+		uint32_t vmid = 3;
+
+		PE_parse_boot_argn("wifi_vmid", &vmid, sizeof(vmid));
+		put(&apps_smmu_second, "cbar", SMMU_CBAR(radio_space.context), SMMU_CBAR_STAGE_1 | (vmid & 0xff));
+	}""")
+
+# (doha's radio: the Keys line's history gets the calibration exchange too, to see whether the firmware asks for its
+# calibration at all and whether the host capabilities that say so were taken: H8 / H32 the host capabilities taken
+# (8-bit / 32-bit), h8 / h32 refused, C<id> the firmware asks for a calibration, E our empty download taken (e refused),
+# R the calibration report taken, Y the firmware ready)
+sub1(MSS, """			} else if (strnstr(line, "our client has left", sizeof(line)) != NULL) {
+				strlcpy(one, "x ", sizeof(one));
+			}""", """			} else if (strnstr(line, "our client has left", sizeof(line)) != NULL) {
+				strlcpy(one, "x ", sizeof(one));
+			} else if (strnstr(line, "host capabilities, 8-bit: ", sizeof(line)) != NULL) {
+				strlcpy(one, strnstr(line, ": done", sizeof(line)) != NULL ? "H8 " : "h8 ", sizeof(one));
+			} else if (strnstr(line, "host capabilities: ", sizeof(line)) != NULL) {
+				strlcpy(one, strnstr(line, ": done", sizeof(line)) != NULL ? "H32 " : "h32 ", sizeof(one));
+			} else if ((at = strnstr(line, "asks for its calibration ", sizeof(line))) != NULL) {
+				snprintf(one, sizeof(one), "C%lu ", strtoul(at + 25, NULL, 10));
+			} else if (strnstr(line, "calibration download (empty): ", sizeof(line)) != NULL) {
+				strlcpy(one, strnstr(line, ": done", sizeof(line)) != NULL ? "E " : "e ", sizeof(one));
+			} else if (strnstr(line, "calibrations (none): ", sizeof(line)) != NULL) {
+				strlcpy(one, strnstr(line, ": done", sizeof(line)) != NULL ? "R " : "r ", sizeof(one));
+			} else if (strnstr(line, "THE WI-FI FIRMWARE IS READY", sizeof(line)) != NULL) {
+				strlcpy(one, "Y ", sizeof(one));
+			}""")
+
+# (doha's radio: (1) with the firmware up (no D:DOWN) CE2 still reports 0x300 -- the copy engine's transfer fails on the
+# bus. Android's icnss gives the firmware's non-secure MSA regions to three VMs, MSS_MSA, WLAN and WLAN_CE (the copy
+# engines' own, 0x19), RW each (msa_perm_list[ICNSS_MSA_PERM_WLAN_HW_RW]); only secure ones to the first two. WLAN_CE was
+# left out here, and the engines read what they copy to us out of that memory. Now as icnss (wlfw_ce_vmid=0: as before).
+# (2) the history said "h8 H32": the firmware refuses the 8-bit host capabilities and takes the 32-bit ones, which had no
+# calibration fields; they have them now)
+sub1(MSS, """static bool
+wlfw2_assign(uint64_t address, uint32_t bytes)
+{""", """static bool
+wlfw2_assign(uint64_t address, uint32_t bytes, bool secure)
+{
+	uint32_t ce = 1;""")
+sub1(MSS, """		destination[6] = VMID_WLAN;
+		destination[7] = SCM_PERM_RW;
+		ext = (uint64_t *)(page + 256);
+		ext[0] = 4;
+		ext[1] = base + 128;
+		ext[2] = 2 * 24;
+		ext[3] = 0;
+	}""", """		destination[6] = VMID_WLAN;
+		destination[7] = SCM_PERM_RW;
+		PE_parse_boot_argn("wlfw_ce_vmid", &ce, sizeof(ce));
+		if (secure) {
+			ce = 0;                                         /* (icnss: secure regions to MSS_MSA and WLAN alone) */
+		}
+		destination[12] = VMID_WLAN_CE;
+		destination[13] = SCM_PERM_RW;
+		ext = (uint64_t *)(page + 256);
+		ext[0] = 4;
+		ext[1] = base + 128;
+		ext[2] = (ce ? 3 : 2) * 24;
+		ext[3] = 0;
+	}""")
+sub1(MSS, """				wlfw2_assign(address, wlfw2_le32(e + 8));""", """				wlfw2_assign(address, wlfw2_le32(e + 8), e[12] != 0);""")
+sub1(MSS, """		if (!taken) {
+			at = wlfw2_u32(tlvs, 0x10, 0);                  /* no daemon, four bytes */""", """		if (!taken) {
+			at = wlfw2_u32(tlvs, 0x10, 0);                  /* no daemon, four bytes */
+			if (wlfw2_calfix()) {
+				at += wlfw2_u8(tlvs + at, 0x14, 1);     /* bdf_support */
+				at += wlfw2_u8(tlvs + at, 0x18, 1);     /* cal_filesys_support */
+				at += wlfw2_u8(tlvs + at, 0x1a, 0);     /* cal_done: no -- the firmware asks for it */
+			}""")
