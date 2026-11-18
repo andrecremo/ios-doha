@@ -95,8 +95,19 @@ if [ "${NETWORK:-0}" = 1 ]; then
 fi
 # NETTEST=1: the job of the demo is rc.jobs.dohanet -- the network tried layer by layer, each result on the panel
 [ "${NETTEST:-0}" = 1 ] && DOHA_RC_JOBS=rc.jobs.dohanet && echo "NETTEST=1: net_test's results on the panel's Keys line"
-[ "${METALTEST:-0}" = 2 ] && DOHA_RC_JOBS=rc.jobs.dohamv && echo "METALTEST=2: Metal on Vulkan (m2v_test) on the panel and TCP port 7000"
 # METALTEST=1: the job is rc.jobs.dohametal -- hakios-metal's probe on the GPU, its results on the panel
+# METALCA=1: the window server through Metal -- hakios's plug-in for CoreAnimation over metal2vulkan and Turnip
+# (~/doha-xnu/m2v-out/RedwoodMetal), QuartzCore's default.metallib from ~/doha-xnu/ca-share (hakios's tools/ca-metallib.py);
+# metal=2 camtl=1 metal_m2v=1 tu_debug=noconform gpu_recover=1 metal_fps ca_metallib=/redwood/share/ca-share/QuartzCore-default.metallib
+if [ "${METALCA:-0}" = 1 ]; then
+	[ -f ~/doha-xnu/m2v-out/RedwoodMetal ] && [ -f ~/doha-xnu/ca-share/QuartzCore-default.metallib ] ||
+		{ echo "METALCA=1: ~/doha-xnu/m2v-out/RedwoodMetal or ~/doha-xnu/ca-share/QuartzCore-default.metallib is not there"; exit 1; }
+	export DOHA_METAL_CA=1 EXTRA_SHARE="$HOME/doha-xnu/ca-share ${EXTRA_SHARE:-}"
+	MOREARGS="metal=2 camtl=1 metal_m2v=1 tu_debug=noconform gpu_recover=1 metal_fps ca_metallib=/redwood/share/ca-share/QuartzCore-default.metallib ${MOREARGS:-}"
+	DOHA_RC_JOBS=${DOHA_RC_JOBS:-rc.jobs.dohaca}     # (its log, the kernel's and HakiosMetal's fps, on TCP port 7000)
+	echo "METALCA=1: the window server through Metal (metal2vulkan over Turnip)"
+fi
+[ "${METALTEST:-0}" = 2 ] && DOHA_RC_JOBS=rc.jobs.dohamv && echo "METALTEST=2: Metal on Vulkan (m2v_test) on the panel and TCP port 7000"
 [ "${METALTEST:-0}" = 1 ] && DOHA_RC_JOBS=rc.jobs.dohametal && echo "METALTEST=1: hakios-metal's probe on the panel's Keys line"
 FLASHBOOT=1 CRYPTEXES=flash REST=1 RC_JOBS=${DOHA_RC_JOBS:-rc.jobs.unlock} SHARE=1 bash userland/build.sh > ~/doha-xnu/ios-flash-build.log 2>&1 ||
 	{ tail -n 20 ~/doha-xnu/ios-flash-build.log; echo "build.sh failed: see ~/doha-xnu/ios-flash-build.log"; exit 1; }
@@ -128,10 +139,23 @@ case "${CHARGE:-2}" in 1|2) TOUCHARG="$TOUCHARG charge=${CHARGE:-2}" ;; esac
 # 745 MHz); FBGPU=1 too: fb_gpu=1, frames onto the panel by the GPU's 2D engine (with a GL=1 small image)
 GPUARG=; [ "${GPU:-0}" = 1 ] && GPUARG=" gpu=1"; [ "${FBGPU:-0}" = 1 ] && GPUARG="$GPUARG fb_gpu=1"
 # GL=1: the small image with Mesa (userland/build.sh builds it with tools/mk-mesa.sh the first time, a long while),
-# and the system drawing on the GPU: gpu=1 fb_gpu=1, frames of the panel's own size (willow's iosimg.sh line)
+# and the system drawing on the GPU: gpu=1 fb_gpu=1
 # glasync=1 (the GL flush without waiting for the frame, willow's) too, GLASYNC=0 leaves it out: the App Library went
 # from up to 1231 ms a frame to 37 ms with it (willow's SIGBUS with it was with /var on the disk; here /var is in RAM)
-[ "${GL:-0}" = 1 ] && GPUARG=" gpu=1 fb_gpu=1 fbwidth=1080 fbheight=2280 sb_statusbar=1"
+# FBSIZE: the screen iOS is told it has (MiniIOMobileFramebuffer's fbwidth/fbheight).
+#   iphone (default since 2026-11-17): none given, so the kernel's own 1125x2436, the iPhone X's, whose identity the
+#     system carries: 375 x 812 points at scale 3, and the frame scaled onto the 1080x2280 panel by the processors
+#     (fb_threads; as the iPhone 12 mini does in its display hardware). The status bar is UIKit's own (Split1125).
+#   panel: fbwidth=1080 fbheight=2280 sb_statusbar=1, frames of the panel's own size, unscaled (willow's iosimg.sh
+#     line): 360 x 760 points, a width no iPhone has. Faster (fb_flip and fb_gpu only take an unscaled frame), but the
+#     keyboard is cut on the right: iOS 16.5 has keyboard layouts for 320, 375 and 414 points only (the width table of
+#     TextInputUI's KBLayouts_iPhone.dat: iPhone-Portrait, -PortraitChoco, -PortraitTruffle), and the one drawn here is
+#     15 points (45 pixels) wider than the screen: the "p", delete and "go" keys partly off it.
+case "${FBSIZE:-iphone}" in
+iphone) [ "${GL:-0}" = 1 ] && GPUARG=" gpu=1 fb_gpu=1" ;;
+panel) [ "${GL:-0}" = 1 ] && GPUARG=" gpu=1 fb_gpu=1 fbwidth=1080 fbheight=2280 sb_statusbar=1" ;;
+*) echo "FBSIZE=$FBSIZE: iphone or panel"; exit 1 ;;
+esac
 [ "${GL:-0}" = 1 ] && [ "${GLASYNC:-1}" = 1 ] && GPUARG="$GPUARG glasync=1"
 # GPUMHZ=N (default 900): a610_mhz=N, the 3D core at a speed of gpucc-trinket.c's table (320 465 600 745 820 900 950;
 # the CX rail at that speed's level through the RPM). 900 over the driver's 745 (2026-11-10): scrolling Settings, the
@@ -179,6 +203,14 @@ GPUARG="$GPUARG rpm_bimc=${BIMC:-1804000}"
 # scroll 29-59 fps against 21-30, the longest gap 17-57 ms against 150-470, and no SpringBoard restart (the black
 # screen with the spinner) in any run; the HUD's Screen line says "flip, N late" while it is
 [ "${FLIP:-1}" = 1 ] && GPUARG="$GPUARG fb_flip=1"
+# FLIPSCALE=1: fb_flip_scale=1, with FBSIZE=iphone (1125x2436) the frame shown where drawn as well, scaled onto the
+# 1080x2280 panel by the display pipe's own scaler (VIG0's QSEED3-lite, bilinear) instead of by the processors. If the
+# pipe does not keep the registers, the panel's refresh stops or the DSI interface runs short of pixels, the kernel puts
+# the pipe back and copies as without it (the log says "fb_flip_scale=1: given up"); the HUD says "flip scaled"
+# Default since 2026-11-18 (FLIPSCALE=0 leaves it out): with the frames kept in memory of one piece (MiniIOSurface's
+# frame pool), OpenGL at 1125x2436 went from about 10 frames a second (55 ms a frame copied and scaled by the
+# processors) to 20-36 while moving, 10 ms a frame in the driver, the GPU 2-4 ms
+[ "${FLIP:-1}" = 1 ] && [ "${FLIPSCALE:-1}" = 1 ] && GPUARG="$GPUARG fb_flip_scale=1"
 # GOV=1: cpu_gov=1, the cores' clocks follow the load (bsd/dev/redwood_osm.c): the top row only while a core is busy,
 # down to 300 MHz at rest; the HUD's CPU line says the clock, the load and how much of the time was at the top.
 # GOVMIN=N: cpu_gov_min=N, the lowest row (0: 300 MHz, 1: 614, 2: 864 ...)

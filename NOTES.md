@@ -981,3 +981,43 @@ A testar:
 - **avg +168 mA às 16:55** (a foto 189 confirma que não há sinal de menos), com a corrente do momento em −166. A média é dos 30 s anteriores, quando a bateria estava cedendo corrente. A explicação mais provável é que o Wi-Fi estava subindo nessa hora (o HUD mostra "wlfw: MISSION MODE; the radio is read in 2 s"): o rádio e o modem consumiram mais do que os ~500 mA que o cabo fornece. Às 17:06 a média já era −173. O valor quase simétrico (168 contra −166) parece coincidência. Se voltar a aparecer, vale olhar o anel de amostras.
 - O ícone do iOS mostrava 62 com o `cc` em 63,0. A diferença é de arredondamento ou do intervalo de atualização do iOS.
 - Resta a corrente de carga baixa, ~170 mA. O próximo passo é ler o ICL efetivo (DCDC 0x07) e o resultado do APSD (tipo de carregador detectado).
+
+## fb_flip com escala no próprio pipe (`FLIPSCALE=1`, 2026-11-17)
+
+Com `FBSIZE=iphone` os quadros têm 1125 x 2436, e o `fb_flip` só aceitava quadros de 1080 x 2280; cada quadro voltou a
+ser escalado pela CPU. O VIG0 tem escalador próprio: `trinket-sde.dtsi` diz `qcom,sde-qseed-type = "qseedv3lite"`,
+`qcom,sde-vig-qseed-off = <0xa00>` (tamanho 0xa0) e `qcom,sde-sspp-linewidth = <0x870>` (2160, lido do `doha.dtb` de
+fábrica). Registradores tirados do driver sde do msm-4.14 (`sde_hw_util.c`, `sde_hw_sspp.c`, `sde_plane.c`):
+- SSPP: `SRC_SIZE` +0x00 = 2436<<16 | 1125, `SRC_XY` +0x08 = 0, `OUT_SIZE` +0x0c = 2280<<16 | 1080, `OUT_XY` +0x10 = 0,
+  `SRC_OP_MODE` +0x38 com o bit 31 (extensão de pixel pelos registradores), `SW_PIX_EXT_*_REQ_PIXELS` +0x108/+0x118/+0x128
+  = tamanho de origem, LR/TB = 0.
+- Escalador (VIG0 + 0xa00): passos de fase +0x10..+0x1c = (origem << 21) / destino (0x215555 e 0x22308f), preload
+  +0x20 = 0x03040304, `SRC_SIZE_Y_RGB_A`/`UV` +0x40/+0x44, `DST_SIZE` +0x48, fase inicial +0x90..+0x9c = 0, e por último
+  `OP_MODE` +0x04 = ativo, filtro Y/RGB bilinear (3 << 16), alfa ligado e bilinear, não-10-bit, blend separável. Bilinear
+  não usa as tabelas (LUT): é o padrão do próprio driver quando o plano é escalado sem configuração do usuário.
+- Esticado (x 0,96, y 0,936), igual à cópia pela CPU e ao mapeamento do toque; sem letterbox.
+- Tudo vai no mesmo flush do CTL0 (bit 0). O `flipBack` devolve os valores que a UEFI deixou.
+- Volta segura: no primeiro quadro escalado, depois de tomado, o kernel relê os registradores, confere se o contador de
+  quadros da INTF1 andou e se o underrun da INTF1 (`INTR_STATUS` 0x1014, bit 26) não subiu nas três varreduras seguintes
+  (antes mede se esse bit já sobe sem nada mudado; se subir, o teste de underrun não vale). Qualquer falha, ou 30
+  underruns depois, põe o pipe de volta e copia como antes ("fb_flip_scale=1: given up" no log). HUD: "flip scaled".
+- Boot-arg `fb_flip_scale=1` (com `fb_flip=1`), `FLIPSCALE=1` no `run-ios-flash.sh`. Kernel compilado às 21:54, ainda
+  não testado no aparelho. Se o escalador não servir, a alternativa é escalar no motor 2D da A610 (`RedwoodGPUBlitToPanel`).
+- HUD piscando com `FBSIZE=iphone` (relato do usuário, imagem das 21:4x): no caminho da CPU o quadro é escrito direto
+  na memória que o painel varre, e o HUD só depois do quadro inteiro; com a escala bilinear isso leva o bastante para o
+  painel pegar a faixa do HUD sem ele. Agora cada linha do quadro que cruza o HUD recebe a linha do HUD logo depois de
+  escrita (`hudRow` em `drawRows`). Com `FLIPSCALE=1` o HUD já vai desenhado na superfície antes do flip. Kernel 21:57.
+- **No aparelho (2026-11-18): funciona, e é o padrão** (`FLIPSCALE=0` desliga). Três ajustes foram precisos:
+  - A releitura dos registradores (`scaleKept`) não confere com o escrito em alguns deles (VIG0 versão `0x2004`): bits
+    reservados ou que leem o valor em uso. O primeiro quadro escalado foi tomado e não houve underrun, mas o kernel
+    desistia só por isso ("VIG0 did not keep what was written"). Agora a releitura só é dita; desiste-se só se a
+    varredura parar ou a INTF1 ficar sem pixels.
+  - O `fb_flip` exige o quadro em memória de uma peça abaixo de 4 GB. Depois de alguns minutos de uso não sobra peça
+    de 11 MB, e os quadros novos vinham espalhados ("one piece of 16384"), recusados e copiados pela CPU. Agora o
+    `MiniIOSurface` guarda as quatro primeiras peças contíguas do tamanho de um quadro (a reserva de quadros) e as
+    passa de superfície em superfície, sem devolvê-las ao sistema. O limite para pedir peça contígua caiu de 8 para 4 MB.
+  - Cada recusa do `fb_flip` passou a dizer o motivo (as 4 primeiras, e depois uma a cada 50).
+  - Resultado, OpenGL em 1125x2436 deslizando entre páginas: o driver de vídeo foi de ~55 ms por quadro a ~10 ms, a
+    GPU 2-4 ms, e a tela de ~10 a 20-36 quadros por segundo (metade dos intervalos abaixo de 17 ms). Ainda há
+    travões de 85-90 ms, de 4 a 15 a cada 5 s.
+  - `fbscale=2` (750x1624) foi testado e descartado: o papel de parede some ou pisca e Ajustes > Acessibilidade fecha.

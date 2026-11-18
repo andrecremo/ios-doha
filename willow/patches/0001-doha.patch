@@ -1,6 +1,6 @@
-From 60c77d65de5ab654900d89537d68808790207fa4 Mon Sep 17 00:00:00 2001
+From f495ec162e41939c03441a84f37ac3973734747c Mon Sep 17 00:00:00 2001
 From: andrecremo <andreljsantos@gmail.com>
-Date: Wed, 18 Nov 2026 11:27:51 -0300
+Date: Wed, 18 Nov 2026 20:09:58 -0300
 Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
 
 ---
@@ -65,15 +65,15 @@ Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
  xnu/files/bsd/dev/redwood_wifi.c              |  296 +++-
  xnu/files/bsd/sys/redwood_input.h             |    3 +
  xnu/files/bsd/sys/redwood_lx.h                |    6 +
- .../iokit/Kernel/MiniIOMobileFramebuffer.cpp  |  440 +++++-
- xnu/files/iokit/Kernel/MiniIOSurface.cpp      |   31 +
+ .../iokit/Kernel/MiniIOMobileFramebuffer.cpp  |  657 ++++++++-
+ xnu/files/iokit/Kernel/MiniIOSurface.cpp      |  141 ++
  xnu/files/iokit/Kernel/MiniIOSurface.h        |    2 +
- xnu/files/iokit/Kernel/RedwoodGPU.cpp         |  154 ++-
+ xnu/files/iokit/Kernel/RedwoodGPU.cpp         |  155 ++-
  xnu/files/osfmk/arm64/gic_v3_irq.c            |   12 +-
  xnu/redwood.patch                             |    9 +-
  xnuloader/build.sh                            |    3 +-
  xnuloader/loader.c                            |  565 +++++++-
- 69 files changed, 6175 insertions(+), 89 deletions(-)
+ 69 files changed, 6503 insertions(+), 89 deletions(-)
  create mode 100755 tools/mk-ath10k.sh
  create mode 100755 wifi/lx/include/linux/acpi.h
  create mode 100755 wifi/lx/include/linux/clk.h
@@ -6229,7 +6229,7 @@ index ef79d87..922cd85 100644
  /* ---- the station: scanning and joining, for whoever asks the kernel (redwood_sta.h) ---- */
  void	 lx_os_station(const struct redwood_sta_ops *ops);	/* here it is, to be asked; NULL: no longer (returns when no call is under way) */
 diff --git a/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
-index 65a99ee..8795f70 100644
+index 65a99ee..134914c 100644
 --- a/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
 +++ b/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
 @@ -25,6 +25,7 @@
@@ -6240,7 +6240,7 @@ index 65a99ee..8795f70 100644
  #include <kern/thread.h>
  #include <kern/clock.h>
  #include <pexpert/pexpert.h>
-@@ -174,12 +175,32 @@ static TUNABLE(uint32_t, gHud, "fb_hud", 0);
+@@ -174,12 +175,64 @@ static TUNABLE(uint32_t, gHud, "fb_hud", 0);
   * (RedwoodGPUBlitToPanel), not row by row by the processors; anything else is copied as before.
   */
  static TUNABLE(uint32_t, gFBGPU, "fb_gpu", 0);
@@ -6256,6 +6256,38 @@ index 65a99ee..8795f70 100644
 +#define VIG0_STRIDE             ((0x5000 + 0x24) / 4)   /* SSPP_SRC_YSTRIDE0 */
 +#define CTL0_FLUSH              ((0x2000 + 0x18) / 4)   /* bit 0: VIG0 */
 +#define INTF1_FRAMES            ((0x6B800 + 0xac) / 4)  /* the DSI interface's INTF_FRAME_COUNT */
++/*
++ * Boot-arg fb_flip_scale=1 (doha, with fb_flip=1): a frame of the screen iOS is told it has when that is not the
++ * panel's size (FBSIZE=iphone: 1125 x 2436) shown where drawn as well, scaled onto the panel by VIG0's own scaler
++ * (QSEED3-lite, bilinear) instead of by the processors. The pipe's registers it writes are read back, and the DSI
++ * interface's underrun watched; if the scaler does not take them, it is left off for the rest of the run.
++ */
++static TUNABLE(uint32_t, gFlipScale, "fb_flip_scale", 0);
++static const char * gScaleWhy;         /* doha: why the scaler was given up, for the refusals */
++#define VIG0_REG(off)           ((0x5000 + (off)) / 4)
++#define VIG0_SRC_OP_MODE        0x38                    /* SSPP_SRC_OP_MODE; bit 31: the pixel extension as set below */
++#define VIG0_QSEED              0xa00                   /* qcom,sde-vig-qseed-off */
++#define QSEED_OP_MODE           (VIG0_QSEED + 0x04)
++#define MDP_INTR_STATUS         ((0x1000 + 0x14) / 4)   /* MDP_SSPP_TOP0 + INTR_STATUS (sde_hwio.h) */
++#define MDP_INTR_CLEAR          ((0x1000 + 0x18) / 4)
++#define INTF1_UNDERRUN          (1u << 26)              /* SDE_INTR_INTF_1_UNDERRUN */
++/* VIG0's registers scaling changes, from its base: what the UEFI left in them is put back when it ends */
++static const uint16_t kScaleRegs[] = {
++	0x000, 0x008, 0x00c, 0x010,             /* SSPP_SRC_SIZE, SRC_XY, OUT_SIZE, OUT_XY */
++	VIG0_SRC_OP_MODE,
++	0x100, 0x104, 0x108,                    /* SSPP_SW_PIX_EXT_C0_LR, _TB, _REQ_PIXELS */
++	0x110, 0x114, 0x118,                    /* ... C1C2 */
++	0x120, 0x124, 0x128,                    /* ... C3 */
++	VIG0_QSEED + 0x10, VIG0_QSEED + 0x14,   /* QSEED3_PHASE_STEP_Y_H, _Y_V */
++	VIG0_QSEED + 0x18, VIG0_QSEED + 0x1c,   /* ... UV_H, UV_V */
++	VIG0_QSEED + 0x20,                      /* QSEED3_PRELOAD */
++	VIG0_QSEED + 0x40, VIG0_QSEED + 0x44,   /* QSEED3_SRC_SIZE_Y_RGB_A, _UV */
++	VIG0_QSEED + 0x48,                      /* QSEED3_DST_SIZE */
++	VIG0_QSEED + 0x90, VIG0_QSEED + 0x94,   /* QSEED3_PHASE_INIT_Y_H, _Y_V */
++	VIG0_QSEED + 0x98, VIG0_QSEED + 0x9c,   /* ... UV_H, UV_V */
++	QSEED_OP_MODE,                          /* last: the scaler on (or off) once the rest is set */
++};
++#define SCALE_REGS              (sizeof(kScaleRegs) / sizeof(kScaleRegs[0]))
 +extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern "C" void flush_dcache(vm_offset_t addr, unsigned count, int phys);
 +extern "C" volatile uint32_t redwood_frames;    /* bsd/dev/redwood_osm.c (cpu_gov): frames handed to the panel */
@@ -6273,7 +6305,7 @@ index 65a99ee..8795f70 100644
  #define SWAP_QUEUE              2                       /* frames that may wait for the panel at most (fb_queue) */
  static TUNABLE(uint32_t, gQueue, "fb_queue", 2);
  static inline unsigned
-@@ -323,9 +344,17 @@ public:
+@@ -323,10 +376,31 @@ public:
  	void reportFrameTimes(void);
  	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
  	void drawHud(uint64_t began);
@@ -6284,14 +6316,28 @@ index 65a99ee..8795f70 100644
 +	volatile uint32_t * fMdss;
 +	uint32_t        fFlipHomeAddr, fFlipHomeStride, fFlipFrames, fFlipMisses;
 +	bool            fFlipTried;
++	/* fb_flip_scale=1: VIG0's registers as the UEFI left them and as they scale the screen onto the panel */
++	void            scaleSet(bool on);
++	bool            scaleKept(void);
++	void            scaleGiveUp(const char * why);
++	uint32_t        fScaleHome[SCALE_REGS], fScaleOn[SCALE_REGS];
++	bool            fScaleReady, fScaleBroken, fFlipScaled, fScaleProbed, fUnderrunAlways;
++	uint32_t        fScaleUnderruns;
  	uint64_t        fHudLast;               /* drawHud(): when the frame before was shown */
  	uint64_t        fHudSecond;             /* ... the second being counted, and its frames */
  	uint32_t        fHudFrames, fHudFps, fHudIntervalUs, fHudDriverUs;
 +	uint32_t        fHudWorstUs, fHudWorstShownUs;  /* the longest gap of the second being counted, and of the last */
  	uint32_t *      fHudPixels;             /* ... the panel as last drawn, copied into every frame */
++	uint32_t        fHudLeft, fHudTop, fHudWidth, fHudHeight;   /* ... where on the panel (fHudWidth 0: not yet drawn) */
++	inline void     hudRow(uint32_t * to, int32_t y) {      /* ... put back over row y of the panel, just written */
++		if (fHudWidth != 0 && (uint32_t) y - fHudTop < fHudHeight) {
++			memcpy(to + fHudLeft, fHudPixels + (size_t) ((uint32_t) y - fHudTop) * fHudWidth, (size_t) fHudWidth * 4);
++		}
++	}
  	uint32_t        fGPUFrames;             /* fb_gpu=1: frames the GPU copied onto the panel (in the 5-second line) */
  	uint64_t        fHudDrawn;              /* ... when it was drawn: twice a second */
-@@ -500,6 +529,7 @@ IOMobileFramebuffer::start(IOService * provider)
+ 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
+@@ -500,6 +574,7 @@ IOMobileFramebuffer::start(IOService * provider)
  		}
  	}
  
@@ -6299,7 +6345,23 @@ index 65a99ee..8795f70 100644
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
  	/* for who draws with the GPU (userland/src/eagl.c): a frame need not be waited for before it is handed over */
  	setProperty("RedwoodWaitsForGPU", kOSBooleanTrue);
-@@ -758,17 +788,27 @@ IOMobileFramebuffer::drawHud(uint64_t began)
+@@ -644,6 +719,7 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
+ 		if (job->unscaled) {
+ 			/* not scaled at all */
+ 			memcpy(to + px0, pixels + (size_t) (sy + y - py0) * stride + (size_t) sx * 4, (size_t) sw * 4);
++			hudRow(to, y);
+ 			continue;
+ 		}
+ 		if (filter) {
+@@ -698,6 +774,7 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
+ 				to[x] = from[fColumn[x]];
+ 			}
+ 		}
++		hudRow(to, y);
+ 	}
+ }
+ 
+@@ -758,17 +835,27 @@ IOMobileFramebuffer::drawHud(uint64_t began)
  	if (fHudLast != 0) {
  		absolutetime_to_nanoseconds(now - fHudLast, &ns);
  		fHudIntervalUs = (uint32_t) (ns / 1000);
@@ -6320,8 +6382,8 @@ index 65a99ee..8795f70 100644
 -	redwood_status(kStatusScreen, "%u fps; %u ms a frame, %u ms of it showing it", fHudFps, fHudIntervalUs / 1000,
 -	    fHudDriverUs / 1000);
 +	if (fFlipped != NULL) {
-+		redwood_status(kStatusScreen, "%u fps; longest gap %u ms; flip, %u late", fHudFps, fHudWorstShownUs / 1000,
-+		    fFlipMisses);
++		redwood_status(kStatusScreen, "%u fps; longest gap %u ms; flip%s, %u late%s", fHudFps, fHudWorstShownUs / 1000,
++		    fFlipScaled ? " scaled" : "", fFlipMisses, fScaleUnderruns ? ", underruns" : "");
 +	} else {
 +		redwood_status(kStatusScreen, "%u fps; longest gap %u ms; %u ms showing it", fHudFps, fHudWorstShownUs / 1000,
 +		    fHudDriverUs / 1000);
@@ -6329,7 +6391,25 @@ index 65a99ee..8795f70 100644
  	if (left + width > fPanelWidth || top + height > fPanelHeight) {
  		return;
  	}
-@@ -968,6 +1008,7 @@ IOMobileFramebuffer::reportFrameTimes(void)
+@@ -779,6 +866,9 @@ IOMobileFramebuffer::drawHud(uint64_t began)
+ 		}
+ 		fHudDrawn = 0;
+ 	}
++	fHudLeft = left;
++	fHudTop = top;
++	fHudHeight = height;
+ 	absolutetime_to_nanoseconds(now - fHudDrawn, &ns);
+ 	if (fHudDrawn != 0 && ns < NSEC_PER_SEC / 2) {
+ 		goto copy;
+@@ -808,6 +898,7 @@ IOMobileFramebuffer::drawHud(uint64_t began)
+ 		}
+ 	}
+ copy:
++	fHudWidth = width;                      /* (from the first time it has been drawn whole) */
+ 	for (uint32_t y = 0; y < height; y++) {
+ 		memcpy(fBase + (size_t) (top + y) * fRowBytes + left * 4, fHudPixels + (size_t) y * width, width * 4);
+ 	}
+@@ -968,6 +1059,7 @@ IOMobileFramebuffer::reportFrameTimes(void)
  void
  IOMobileFramebuffer::present(const uint8_t * swap)
  {
@@ -6337,7 +6417,7 @@ index 65a99ee..8795f70 100644
  	AbsoluteTime deadline;
  
  	uint64_t now = mach_absolute_time(), period, pause;
-@@ -1034,6 +1075,376 @@ IOMobileFramebuffer::presenter(void)
+@@ -1034,6 +1126,526 @@ IOMobileFramebuffer::presenter(void)
  	}
  }
  
@@ -6647,11 +6727,69 @@ index 65a99ee..8795f70 100644
 +		fFlipHomeStride = fMdss[VIG0_STRIDE];
 +		IOLog("MiniIOMobileFramebuffer: fb_flip=1: VIG0 shows %#x (stride %u); frames will be shown where drawn\n",
 +		    fFlipHomeAddr, fFlipHomeStride);
++		if (gFlipScale && (fWidth != fPanelWidth || fHeight != fPanelHeight)) {
++			uint32_t src = fHeight << 16 | fWidth, out = fPanelHeight << 16 | fPanelWidth;
++			uint32_t stepX = (uint32_t) (((uint64_t) fWidth << 21) / fPanelWidth);
++			uint32_t stepY = (uint32_t) (((uint64_t) fHeight << 21) / fPanelHeight);
++			uint32_t version = fMdss[VIG0_REG(VIG0_QSEED)], status;
++
++			for (unsigned i = 0; i < SCALE_REGS; i++) {
++				fScaleHome[i] = fMdss[VIG0_REG(kScaleRegs[i])];
++				fScaleOn[i] = 0;
++			}
++			fScaleOn[0] = src;                              /* the whole surface fetched */
++			fScaleOn[2] = out;                              /* ... put out the panel's size */
++			fScaleOn[3] = 0;
++			fScaleOn[4] = fScaleHome[4] | (1u << 31);       /* the pixel extension from the registers */
++			fScaleOn[7] = fScaleOn[10] = fScaleOn[13] = src;   /* REQ_PIXELS, no extension at the edges */
++			fScaleOn[14] = fScaleOn[16] = stepX;            /* phase steps, 21 fraction bits */
++			fScaleOn[15] = fScaleOn[17] = stepY;
++			fScaleOn[18] = 4 | 3 << 8 | 4 << 16 | 3 << 24;  /* QSEED3_DEFAULT_PRELOAD_H/V, for Y and UV */
++			fScaleOn[19] = fScaleOn[20] = src;
++			fScaleOn[21] = out;
++			/* enable, Y/RGB filter bilinear (3), alpha on and bilinear, not 10-bit, separable blend */
++			fScaleOn[SCALE_REGS - 1] = 1u << 0 | 3u << 16 | 1u << 10 | 1u << 29 | 1u << 14 | 1u << 31;
++			/* the underrun bit as it is with nothing changed: if it comes up anyway, it says nothing of the scaler */
++			fMdss[MDP_INTR_CLEAR] = INTF1_UNDERRUN;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			IOSleep(50);
++			status = fMdss[MDP_INTR_STATUS];
++			fUnderrunAlways = (status & INTF1_UNDERRUN) != 0;
++			fScaleReady = fWidth <= 2160 && version != 0 && version != 0xffffffff;  /* qcom,sde-sspp-linewidth */
++			IOLog("MiniIOMobileFramebuffer: fb_flip_scale=1: %ux%u onto %ux%u by VIG0's scaler (version %#x)%s; "
++			    "steps %#x %#x; VIG0 as the UEFI left it: size %#x xy %#x out %#x at %#x, op %#x, pixel extension "
++			    "%#x %#x %#x, scaler op %#x; underrun %s with nothing changed (status %#x)\n", fWidth, fHeight,
++			    fPanelWidth, fPanelHeight, version, fScaleReady ? "" : ": NOT used", stepX, stepY, fScaleHome[0],
++			    fScaleHome[1], fScaleHome[2], fScaleHome[3], fScaleHome[4], fScaleHome[5], fScaleHome[6], fScaleHome[7],
++			    fScaleHome[SCALE_REGS - 1], fUnderrunAlways ? "COMES UP" : "does not come up", status);
++		}
++	}
++	bool scaled = fWidth != fPanelWidth || fHeight != fPanelHeight;
++	{
++		static uint32_t refusals;
++		const char * why = s == NULL ? "no surface" : s->client != NULL ? "the surface has a client" :
++		    s->memory == NULL ? "no memory" : s->info.bytesPerElement != 4 || s->info.planeCount != 0 ? "not 4 bytes, 0 planes" :
++		    s->info.width != fWidth || s->info.height != fHeight ? "not the screen's size" :
++		    scaled && (!fScaleReady || fScaleBroken) ? "the scaler is not ready" :
++		    !(src[2] <= 0 || src[3] <= 0 || (src[0] == 0 && src[1] == 0 && src[2] == (int32_t) fWidth &&
++		    src[3] == (int32_t) fHeight)) ? "a part of the surface" :
++		    !(dst[2] <= 0 || dst[3] <= 0 || (dst[0] == 0 && dst[1] == 0 && dst[2] == (int32_t) fWidth &&
++		    dst[3] == (int32_t) fHeight)) ? "to a part of the screen" :
++		    (s->info.bytesPerRow & 63) != 0 || s->info.bytesPerRow > 0xffff ? "rows not of 64 bytes" : NULL;
++
++		if (why != NULL && (refusals++ < 4 || refusals % 50 == 0)) {
++			IOLog("MiniIOMobileFramebuffer: fb_flip: frame not flipped (%u so far): %s; surface %u %ux%u, %u bytes a row, "
++			    "client %p, from %d,%d %dx%d to %d,%d %dx%d; screen %ux%u; scaler ready %d, given up %d (%s), "
++			    "version %#x\n", refusals, why, s ? s->sid : 0,
++			    s ? s->info.width : 0, s ? s->info.height : 0, s ? s->info.bytesPerRow : 0, s ? (void *) s->client : NULL,
++			    src[0], src[1], src[2], src[3], dst[0], dst[1], dst[2], dst[3], fWidth, fHeight, fScaleReady, fScaleBroken,
++			    gScaleWhy != NULL ? gScaleWhy : "-", fMdss != NULL ? fMdss[VIG0_REG(VIG0_QSEED)] : 0);
++		}
 +	}
 +	if (s == NULL || s->client != NULL || s->memory == NULL || s->info.bytesPerElement != 4 || s->info.planeCount != 0 ||
-+	    s->info.width != fPanelWidth || s->info.height != fPanelHeight || fWidth != fPanelWidth || fHeight != fPanelHeight ||
-+	    !(src[2] <= 0 || src[3] <= 0 || (src[0] == 0 && src[1] == 0 && src[2] == (int32_t) fPanelWidth &&
-+	    src[3] == (int32_t) fPanelHeight)) ||
++	    s->info.width != fWidth || s->info.height != fHeight || (scaled && (!fScaleReady || fScaleBroken)) ||
++	    !(src[2] <= 0 || src[3] <= 0 || (src[0] == 0 && src[1] == 0 && src[2] == (int32_t) fWidth &&
++	    src[3] == (int32_t) fHeight)) ||
 +	    !(dst[2] <= 0 || dst[3] <= 0 || (dst[0] == 0 && dst[1] == 0 && dst[2] == (int32_t) fWidth && dst[3] == (int32_t) fHeight)) ||
 +	    (s->info.bytesPerRow & 63) != 0 || s->info.bytesPerRow > 0xffff) {
 +		return false;
@@ -6659,6 +6797,10 @@ index 65a99ee..8795f70 100644
 +	bytes = (uint64_t) s->info.bytesPerRow * s->info.height;
 +	phys = s->memory->getPhysicalSegment((IOByteCount) (s->pixels() - s->kbase), &length, kIOMemoryMapperNone);
 +	if (phys == 0 || length < bytes || phys + bytes > 0x100000000ull) {
++		if (fFlipMisses < 4 || fFlipMisses % 50 == 0) {
++			IOLog("MiniIOMobileFramebuffer: fb_flip: frame not flipped (%u for its memory): surface %u, %llu bytes, one piece "
++			    "of %llu at %#llx\n", fFlipMisses + 1, s->sid, bytes, (uint64_t) length, phys);
++		}
 +		fFlipMisses++;
 +		return false;
 +	}
@@ -6676,13 +6818,25 @@ index 65a99ee..8795f70 100644
 +	if ((held = MiniIOSurfaceCopy(s->sid)) == NULL) {
 +		return false;
 +	}
++	if (scaled != fFlipScaled) {
++		scaleSet(scaled);
++	}
++	if (scaled) {
++		if (!fScaleProbed) {
++			fMdss[MDP_INTR_CLEAR] = INTF1_UNDERRUN;
++		} else if (fMdss[MDP_INTR_STATUS] & INTF1_UNDERRUN) {
++			fMdss[MDP_INTR_CLEAR] = INTF1_UNDERRUN;
++			fScaleUnderruns++;
++		}
++	}
 +	MiniIOSurfaceDisplayUse(held, 1);
 +	fMdss[VIG0_STRIDE] = s->info.bytesPerRow;
 +	fMdss[VIG0_ADDR] = (uint32_t) phys;
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +	fMdss[CTL0_FLUSH] = 1;
 +	__asm__ volatile ("dsb sy" ::: "memory");
-+	flipLatched();
++	bool latched = flipLatched();
++	fFlipScaled = scaled;
 +	if (fFlipped != NULL) {
 +		MiniIOSurfaceDisplayUse(fFlipped, -1);
 +		MiniIOSurfaceDrop(fFlipped);
@@ -6690,7 +6844,79 @@ index 65a99ee..8795f70 100644
 +	fFlipped = held;
 +	fFlipFrames++;
 +	gShownSurface = s->sid;
++	if (scaled && !fScaleProbed) {
++		/* the first scaled frame: the panel still scanning, and no underrun in the three refreshes after it */
++		uint32_t status;
++
++		IOSleep(50);
++		status = fMdss[MDP_INTR_STATUS];
++		fScaleProbed = true;
++		bool kept = scaleKept();
++		IOLog("MiniIOMobileFramebuffer: fb_flip_scale=1: first scaled frame (surface %u, stride %u): %s, registers %s, "
++		    "underrun status %#x\n", s->sid, s->info.bytesPerRow, latched ? "taken" : "NOT taken in 25 ms",
++		    kept ? "as written" : "NOT as written", status);
++		if (!latched || ((status & INTF1_UNDERRUN) && !fUnderrunAlways)) {
++			scaleGiveUp(!latched ? "the panel's refresh did not move on" : "the DSI interface ran short of pixels");
++			return false;
++		}
++	}
++	if (scaled && fScaleUnderruns >= 30 && !fUnderrunAlways) {
++		scaleGiveUp("the DSI interface ran short of pixels 30 times");
++		return false;
++	}
 +	return true;
++}
++
++/* fb_flip_scale=1: VIG0's registers set to scale the screen onto the panel (on) or as the UEFI left them; not flushed */
++void
++IOMobileFramebuffer::scaleSet(bool on)
++{
++	const uint32_t * values = on ? fScaleOn : fScaleHome;
++
++	if (!fScaleReady) {
++		return;
++	}
++	for (unsigned i = 0; i < SCALE_REGS; i++) {
++		fMdss[VIG0_REG(kScaleRegs[i])] = values[i];
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
++ * fb_flip_scale=1, the first scaled frame once taken: whether VIG0 reads back what scaleSet(true) wrote (read after the
++ * flush has been taken, so that it holds whether its registers read back as written or as in use)
++ */
++bool
++IOMobileFramebuffer::scaleKept(void)
++{
++	bool kept = true;
++
++	for (unsigned i = 0; i < SCALE_REGS; i++) {
++		uint32_t got = fMdss[VIG0_REG(kScaleRegs[i])];
++
++		if (got != fScaleOn[i]) {
++			IOLog("MiniIOMobileFramebuffer: fb_flip_scale=1: VIG0 +%#x reads %#x, %#x written\n", kScaleRegs[i], got,
++			    fScaleOn[i]);
++			kept = false;
++		}
++	}
++	return kept;
++}
++
++/* fb_flip_scale=1: the scaler off for the rest of the run, the pipe back on the panel's memory, the frames copied */
++void
++IOMobileFramebuffer::scaleGiveUp(const char * why)
++{
++	gScaleWhy = why;
++	fScaleBroken = true;
++	IOLog("MiniIOMobileFramebuffer: fb_flip_scale=1: given up after %u frames: %s; frames copied from now on\n",
++	    fFlipFrames, why);
++	if (fFlipped != NULL) {
++		flipBack();
++	} else if (fFlipScaled) {
++		scaleSet(false);
++		fFlipScaled = false;
++	}
 +}
 +
 +/* fb_flip=1: the pipe back on the panel's memory (a frame has just been copied there) */
@@ -6699,6 +6925,10 @@ index 65a99ee..8795f70 100644
 +{
 +	if (fFlipped == NULL || fMdss == NULL) {
 +		return;
++	}
++	if (fFlipScaled) {
++		scaleSet(false);
++		fFlipScaled = false;
 +	}
 +	fMdss[VIG0_STRIDE] = fFlipHomeStride;
 +	fMdss[VIG0_ADDR] = fFlipHomeAddr;
@@ -6714,7 +6944,7 @@ index 65a99ee..8795f70 100644
  /* A swap's surfaces onto the panel, once the GPU is done with them. */
  void
  IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
-@@ -1101,6 +1512,26 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+@@ -1101,6 +1713,35 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
  		    swapWord(swap, SWAP_ID), fSwapsShown, swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)),
  		    swapWord(swap, SWAP_SURFACE(2)), swapWord(swap, SWAP_SURFACE(3)), set, swapWord(swap, SWAP_LAYERS_CLEARED));
  	}
@@ -6725,6 +6955,15 @@ index 65a99ee..8795f70 100644
 +
 +		for (unsigned layer = 1; layer < SWAP_LAYERS; layer++) {
 +			alone = alone && swapWord(swap, SWAP_SURFACE(layer)) == 0;
++		}
++		if (!alone) {                   /* doha: why a frame is not flipped, said now and then */
++			static uint32_t layered;
++
++			if (layered++ < 4 || layered % 50 == 0) {
++				IOLog("MiniIOMobileFramebuffer: fb_flip: frame not flipped (%u so far): layers %u %u %u %u%s\n", layered,
++				    swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)), swapWord(swap, SWAP_SURFACE(2)),
++				    swapWord(swap, SWAP_SURFACE(3)), surfaces[0] == NULL ? ", the bottom one not found" : "");
++			}
 +		}
 +		if (alone) {
 +			int32_t src[4], dst[4];
@@ -6741,7 +6980,7 @@ index 65a99ee..8795f70 100644
  	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
  		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
  		int32_t src[4], dst[4];
-@@ -1146,12 +1577,17 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+@@ -1146,12 +1787,17 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
  			drawLayer(s, src, dst);
  			if (layer == 0) {
  				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
@@ -6759,11 +6998,145 @@ index 65a99ee..8795f70 100644
  	drawn = mach_absolute_time();
  	if (recorded != NULL) {
  		record(recorded);
+@@ -1711,6 +2357,13 @@ publishAccelerator(IOService * provider)
+ 	gAcceleratorTakesProperties = PE_parse_boot_argn("metal", &metal, sizeof(metal)) && metal != 0;
+ 	if (accelerator != NULL && accelerator->init() && accelerator->attach(provider)) {
+ 		accelerator->setName("sgx");
++		if (metal == 2) {               /* doha: the plug-in named here, before any process asks Metal */
++			/* (Metal opens "/System/Library/Extensions/" + this + ".bundle": iOS's volume on the flash has no
++			   link there, so the name leads to the small image's /redwood/lib itself) */
++			accelerator->setProperty(kAcceleratorPluginNameKey, "../../../redwood/lib/RedwoodMetal");
++			accelerator->setProperty(kAcceleratorPluginClassNameKey, "HakiosMetalDevice");
++			IOLog("IOAcceleratorES: metal=2: the accelerator names RedwoodMetal (HakiosMetalDevice) as its Metal plug-in\n");
++		}
+ 		accelerator->registerService();
+ 		/* the first line to look for in the log of such a boot: the gate is open, nothing is set yet */
+ 		if (gAcceleratorTakesProperties) {
 diff --git a/xnu/files/iokit/Kernel/MiniIOSurface.cpp b/xnu/files/iokit/Kernel/MiniIOSurface.cpp
-index 579ea6c..944219c 100644
+index 579ea6c..01afc8e 100644
 --- a/xnu/files/iokit/Kernel/MiniIOSurface.cpp
 +++ b/xnu/files/iokit/Kernel/MiniIOSurface.cpp
-@@ -208,6 +208,22 @@ surfaceMemory(vm_size_t bytes)
+@@ -182,6 +182,108 @@ surfaceMemoryClear(thread_call_param_t unused0 __unused, thread_call_param_t unu
+ 	MiniIOSurfaceClearKept();
+ }
+ 
++/*
++ * doha, fb_flip=1: memory of one piece below 4 GB for frames, kept from surface to surface for the whole run (the first
++ * FRAME_POOL frame-sized pieces made; later ones may find no such piece in a fragmented machine)
++ */
++#define FRAME_POOL              4
++static IOBufferMemoryDescriptor * gFramePool[FRAME_POOL];
++static bool                     gFrameUsed[FRAME_POOL];
++static uint32_t                 gFramePoolTaken, gFramePoolDropped;
++
++static bool
++framePoolWanted(vm_size_t bytes)
++{
++	static int flip = -1;
++	uint32_t value = 0;
++
++	if (flip < 0) {
++		flip = PE_parse_boot_argn("fb_flip", &value, sizeof(value)) && value != 0;
++	}
++	return flip && bytes >= (4u << 20) && gSurfaceKeptLock != NULL;
++}
++
++static IOBufferMemoryDescriptor *
++framePoolTake(vm_size_t bytes)
++{
++	IOBufferMemoryDescriptor * memory = NULL;
++	int empty = -1;
++
++	if (!framePoolWanted(bytes)) {
++		return NULL;
++	}
++	IOLockLock(gSurfaceKeptLock);
++	for (unsigned i = 0; i < FRAME_POOL && memory == NULL; i++) {
++		if (gFramePool[i] != NULL && !gFrameUsed[i] && gFramePool[i]->getCapacity() == bytes) {
++			gFrameUsed[i] = true;
++			memory = gFramePool[i];
++			memory->retain();               /* (the surface's; the pool keeps its own) */
++			gFramePoolTaken++;
++		} else if (gFramePool[i] == NULL && empty < 0) {
++			empty = (int) i;
++		}
++	}
++	IOLockUnlock(gSurfaceKeptLock);
++	if (memory != NULL) {
++		if (gSurfaceClear) {
++			bzero(memory->getBytesNoCopy(), bytes);
++		}
++		return memory;
++	}
++	if (empty < 0) {
++		return NULL;
++	}
++	memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
++	    kIOMemoryPhysicallyContiguous, bytes, 0xfffff000ull);
++	if (memory == NULL) {
++		return NULL;
++	}
++	IOLockLock(gSurfaceKeptLock);
++	if (gFramePool[empty] == NULL) {
++		gFramePool[empty] = memory;
++		gFrameUsed[empty] = true;
++		memory->retain();
++		IOLog("MiniIOSurface: fb_flip: a frame's memory of one piece (%lu bytes) kept for frames, %d of %d\n",
++		    (unsigned long) bytes, empty + 1, FRAME_POOL);
++	}
++	IOLockUnlock(gSurfaceKeptLock);
++	return memory;
++}
++
++/* a surface's memory back: a piece of the pool is free again (true), unless somebody else still has it */
++static bool
++framePoolGive(IOBufferMemoryDescriptor * memory)
++{
++	bool ours = false, drop = false;
++
++	if (gSurfaceKeptLock == NULL) {
++		return false;
++	}
++	IOLockLock(gSurfaceKeptLock);
++	for (unsigned i = 0; i < FRAME_POOL; i++) {
++		if (gFramePool[i] == memory) {
++			ours = true;
++			if (memory->getRetainCount() == 2) {
++				gFrameUsed[i] = false;
++			} else {
++				gFramePool[i] = NULL;   /* someone else still has it: not given out again, not kept */
++				gFrameUsed[i] = false;
++				drop = true;
++				gFramePoolDropped++;
++			}
++			break;
++		}
++	}
++	IOLockUnlock(gSurfaceKeptLock);
++	if (ours) {
++		memory->release();              /* the surface's */
++		if (drop) {
++			memory->release();      /* the pool's */
++		}
++	}
++	return ours;
++}
++
+ /* Memory for a surface: the state page and `bytes` after it, all zeroes. */
+ static IOBufferMemoryDescriptor *
+ surfaceMemory(vm_size_t bytes)
+@@ -189,6 +291,10 @@ surfaceMemory(vm_size_t bytes)
+ 	IOBufferMemoryDescriptor * memory = NULL;
+ 	bool clear = false;
+ 
++	if ((memory = framePoolTake(bytes)) != NULL) {
++		return memory;
++	}
++
+ 	if (bytes >= SURFACE_KEEP_FROM && gSurfaceKeptLock != NULL) {
+ 		IOLockLock(gSurfaceKeptLock);
+ 		for (int pass = 0; pass < 2 && memory == NULL; pass++) {
+@@ -208,6 +314,22 @@ surfaceMemory(vm_size_t bytes)
  			bzero(memory->getBytesNoCopy(), gSurfaceClear ? bytes : PAGE_SIZE);
  		}
  	}
@@ -6778,7 +7151,7 @@ index 579ea6c..944219c 100644
 +		if (flip < 0) {
 +			flip = PE_parse_boot_argn("fb_flip", &value, sizeof(value)) && value != 0;
 +		}
-+		if (memory == NULL && flip && bytes >= (8u << 20)) {
++		if (memory == NULL && flip && bytes >= (4u << 20)) {
 +			memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut |
 +			    kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, bytes, 0xfffff000ull);
 +		}
@@ -6786,7 +7159,18 @@ index 579ea6c..944219c 100644
  	if (memory == NULL) {
  		memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, bytes,
  		    PAGE_SIZE);
-@@ -764,6 +780,21 @@ MiniIOSurfaceDrop(MiniIOSurface * s)
+@@ -226,6 +348,10 @@ surfaceMemoryBack(IOBufferMemoryDescriptor * memory)
+ {
+ 	IOBufferMemoryDescriptor * evicted = NULL;
+ 
++	if (framePoolGive(memory)) {
++		return;
++	}
++
+ 	if (memory->getCapacity() >= SURFACE_KEEP_FROM && memory->getRetainCount() != 1) {
+ 		OSIncrementAtomic(&gSurfacesNotKept[0]);
+ 	}
+@@ -764,6 +890,21 @@ MiniIOSurfaceDrop(MiniIOSurface * s)
  	IOLockUnlock(gSurfaceLock);
  }
  
@@ -6822,7 +7206,7 @@ index 79216b3..f2aa6df 100644
  mach_port_name_t MiniIOSurfaceMakeSendRight(task_t task, MiniIOSurface * surface);
  
 diff --git a/xnu/files/iokit/Kernel/RedwoodGPU.cpp b/xnu/files/iokit/Kernel/RedwoodGPU.cpp
-index 851cf43..985c99d 100644
+index 851cf43..1dd69a8 100644
 --- a/xnu/files/iokit/Kernel/RedwoodGPU.cpp
 +++ b/xnu/files/iokit/Kernel/RedwoodGPU.cpp
 @@ -65,6 +65,8 @@ extern uint32_t gpu_log;
@@ -6947,7 +7331,7 @@ index 851cf43..985c99d 100644
  	fBufferCount++;
  	fBufferBytes += size;
  	return b;
-@@ -1155,6 +1190,89 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+@@ -1155,6 +1190,90 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
  	return kIOReturnSuccess;
  }
  
@@ -6976,7 +7360,7 @@ index 851cf43..985c99d 100644
 +		return kIOReturnBadArgument;
 +	}
 +	/* pages the client may only read (a window server's view of another program's backing store): the GPU reads them only */
-+	for (int pass = 0; pass < 2 && prepared != kIOReturnSuccess; pass++) {
++	for (int pass = 0; pass < 1 && prepared != kIOReturnSuccess; pass++) {   /* (doha: read-only pages refused) */
 +		memory = IOMemoryDescriptor::withAddressRange(request->address, request->size,
 +		    pass == 0 ? kIODirectionInOut : kIODirectionOut, fTask);
 +		if (memory == NULL) {
@@ -6999,7 +7383,8 @@ index 851cf43..985c99d 100644
 +		}
 +		return kIOReturnVMError;
 +	}
-+	map = memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere);
++	map = memory->createMappingInTask(kernel_task, 0,
++	    kIOMapAnywhere | ((request->flags & MSM_BO_GPU_READONLY) ? kIOMapReadOnly : 0));
 +	if (map == NULL) {
 +		memory->complete();
 +		memory->release();
@@ -7037,7 +7422,7 @@ index 851cf43..985c99d 100644
  IOReturn
  RedwoodGPUUserClient::gemInfo(struct msm_gem_info * request)
  {
-@@ -1246,6 +1364,13 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+@@ -1246,6 +1365,13 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
  		if (b == NULL) {
  			continue;
  		}
@@ -7051,7 +7436,7 @@ index 851cf43..985c99d 100644
  		if (b->surface != NULL) {
  			uint32_t seed = b->surface->shared()->seed, gpuBumps = b->surface->gpuBumps;
  			bool drawn = b->surface->drawn != 0 && !gGPUPushAll;
-@@ -1381,6 +1506,26 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+@@ -1381,6 +1507,26 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
  			bzero(&gAnnounced, sizeof(gAnnounced));
  		}
  		absolutetime_to_nanoseconds(gGPUStat.prepWaiting, &prepWaiting);
@@ -7078,7 +7463,7 @@ index 851cf43..985c99d 100644
  		IOLog("RedwoodGPU: cpu-prep: %u asked, %u waited for the GPU, %llu us each\n", gGPUStat.preps, gGPUStat.prepsWaited,
  		    gGPUStat.prepsWaited ? prepWaiting / NSEC_PER_USEC / gGPUStat.prepsWaited : 0);
  		IOLog("RedwoodGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
-@@ -1483,6 +1628,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+@@ -1483,6 +1629,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
  		struct msm_submitqueue_query query;
  		struct drm_gem_close close;
  		struct redwood_surface surface;
@@ -7086,7 +7471,7 @@ index 851cf43..985c99d 100644
  		struct redwood_show show;
  		struct redwood_worked worked;
  	} r;
-@@ -1560,6 +1706,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+@@ -1560,6 +1707,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
  			}
  		}
  		IOLockUnlock(gGPULock);
@@ -7094,7 +7479,7 @@ index 851cf43..985c99d 100644
  		slowWait("fence", waitBegan);
  		break;
  	case kMsmGemMadvise:
-@@ -1601,6 +1748,9 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+@@ -1601,6 +1749,9 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
  	case kRedwoodSurface:
  		ret = surfaceBuffer(&r.surface);
  		break;

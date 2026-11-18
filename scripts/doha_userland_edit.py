@@ -483,3 +483,731 @@ else:
 /redwood/bin/hud_test serve 7000 wait 20 env TU_DEBUG=startup,noconform say m2v-test-begins probe /redwood/bin/m2v_test wait 1800
 """)
 print('userland/rc.jobs.dohamv: written')
+
+# doha: the window server through Metal (hakios-xnu-kernel's HakiosMetalCA.m over metal2vulkan and Turnip, as
+# /redwood/lib/RedwoodMetal.bundle; kernel metal=2). CoreAnimation's Metal renderer asserts that QuartzCore has a
+# default.metallib, which this iPhone X image has not got: hakios's tools/ca-metallib.py makes one (from this
+# QuartzCore's pipeline library and a later CoreAnimation's) and its inject.c answers the window server's lookup of it
+# with boot-arg ca_metallib=PATH. The same here, in backboardd before anything else of the window server's; with
+# camtl=1 (inject.c's own switch) the window server keeps the Metal device. And the plug-in, its Info.plist and Turnip
+# go into the small image from ~/doha-xnu/m2v-out when RedwoodMetal is built there (never in this repository).
+ij = tree / 'userland/src/inject.c'
+i = ij.open(encoding='utf-8', newline='').read()
+iold = """static void
+window_server_fixes(void)
+{
+	window_server_keeps_opengl_es();"""
+inew = """/*
+ * doha (as hakios's inject.c): CoreAnimation's Metal renderer asks QuartzCore's bundle for default.metallib and asserts
+ * it is there; boot-arg ca_metallib=PATH answers that lookup, when it finds nothing, with PATH (tools/ca-metallib.py of
+ * hakios-xnu-kernel makes the file). Every lookup of a metallib or pipelinelib in the window server is said, 40 at most.
+ */
+static id (*orig_url_for)(id self, SEL selector, id name, id extension);
+static id (*orig_url_for_in)(id self, SEL selector, id name, id extension, id subdirectory);
+static const char *ca_metallib;
+static unsigned metallib_lookups_said;
+
+static const char *
+objc_utf8(id string)
+{
+	return string != NULL ? ((const char *(*)(id, SEL))objc_msgSend)(string, sel_registerName("UTF8String")) : "(nil)";
+}
+
+static id
+metallib_answer(id self, id name, id extension, id found)
+{
+	const char *ext = extension != NULL ? objc_utf8(extension) : "";
+
+	if (strstr(ext, "metallib") == NULL && strstr(ext, "pipelinelib") == NULL) {
+		return found;
+	}
+	if (metallib_lookups_said++ < 40) {
+		id path = found != NULL ? ((id (*)(id, SEL))objc_msgSend)(found, sel_registerName("path")) : NULL;
+
+		say("redwood: %s asks bundle %s for %s.%s: %s\\n", getprogname(),
+		    objc_utf8(((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("bundlePath"))), objc_utf8(name), ext,
+		    found != NULL ? objc_utf8(path) : "nothing");
+	}
+	if (found == NULL && ca_metallib != NULL && name != NULL && strcmp(objc_utf8(name), "default") == 0 &&
+	    strcmp(ext, "metallib") == 0) {
+		id text = ((id (*)(Class, SEL, const char *))objc_msgSend)(objc_getClass("NSString"),
+		    sel_registerName("stringWithUTF8String:"), ca_metallib);
+
+		return ((id (*)(Class, SEL, id))objc_msgSend)(objc_getClass("NSURL"), sel_registerName("fileURLWithPath:"), text);
+	}
+	return found;
+}
+
+static id
+my_url_for(id self, SEL selector, id name, id extension)
+{
+	return metallib_answer(self, name, extension, orig_url_for(self, selector, name, extension));
+}
+
+static id
+my_url_for_in(id self, SEL selector, id name, id extension, id subdirectory)
+{
+	return metallib_answer(self, name, extension, orig_url_for_in(self, selector, name, extension, subdirectory));
+}
+
+static void
+watch_metallib_lookups(void)
+{
+	static char path[256];
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+	const char *at;
+	Class bundle = objc_getClass("NSBundle");
+	Method two, three;
+
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0 || (at = strstr(arguments, "ca_metallib=")) == NULL) {
+		return;                 /* (only a boot that names the library watches for it) */
+	}
+	size = strcspn(at + 12, " ");
+	if (size < sizeof(path)) {
+		memcpy(path, at + 12, size);
+		ca_metallib = path;
+	}
+	if (bundle == NULL) {
+		return;
+	}
+	if ((two = class_getInstanceMethod(bundle, sel_registerName("URLForResource:withExtension:"))) != NULL) {
+		orig_url_for = (id (*)(id, SEL, id, id))method_setImplementation(two, (IMP)my_url_for);
+	}
+	if ((three = class_getInstanceMethod(bundle, sel_registerName("URLForResource:withExtension:subdirectory:"))) != NULL) {
+		orig_url_for_in = (id (*)(id, SEL, id, id, id))method_setImplementation(three, (IMP)my_url_for_in);
+	}
+	say("redwood: metallib lookups in %s are said; default.metallib is %s\\n", getprogname(), ca_metallib);
+}
+
+static void
+window_server_fixes(void)
+{
+	watch_metallib_lookups();
+	window_server_keeps_opengl_es();"""
+if 'watch_metallib_lookups' in i:
+    print('userland/src/inject.c: has the metallib lookups already')
+elif i.count(iold) != 1:
+    raise SystemExit('userland/src/inject.c: window_server_fixes is not where expected')
+else:
+    ij.open('w', encoding='utf-8', newline='').write(i.replace(iold, inew))
+    print('userland/src/inject.c: ca_metallib= answers default.metallib (doha)')
+rb = (tree / 'userland/build.sh').open(encoding='utf-8', newline='').read()
+r_old = """		echo "build.sh: m2v_test and Turnip (Metal on Vulkan) in the image"
+	fi
+"""
+r_new = r_old + """	if [ -f $HOME/doha-xnu/m2v-out/RedwoodMetal ] && [ -f $HOME/doha-xnu/m2v-out/libvulkan_freedreno.dylib ] && [ -n "${DOHA_METAL_CA:-}" ]; then
+		mkdir -p root/lib/RedwoodMetal.bundle
+		cp $HOME/doha-xnu/m2v-out/RedwoodMetal root/lib/RedwoodMetal.bundle/RedwoodMetal
+		cp $HOME/doha-xnu/m2v-out/libvulkan_freedreno.dylib root/lib/
+		rm -f root/bin/m2v_test
+		cat > root/lib/RedwoodMetal.bundle/Info.plist <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.redwood.metal</string>
+	<key>CFBundleName</key>
+	<string>RedwoodMetal</string>
+	<key>CFBundleExecutable</key>
+	<string>RedwoodMetal</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>iPhoneOS</string>
+	</array>
+	<key>NSPrincipalClass</key>
+	<string>HakiosMetalDevice</string>
+</dict>
+</plist>
+PLIST
+		echo "build.sh: RedwoodMetal.bundle (hakios's plug-in for CoreAnimation over metal2vulkan) and Turnip in the image"
+	fi
+"""
+if 'RedwoodMetal.bundle/RedwoodMetal' in rb:
+    print('userland/build.sh: has the CoreAnimation plug-in already')
+elif rb.count(r_old) != 1:
+    raise SystemExit('userland/build.sh: the m2v_test lines are not where expected')
+else:
+    (tree / 'userland/build.sh').open('w', encoding='utf-8', newline='').write(rb.replace(r_old, r_new))
+    print('userland/build.sh: RedwoodMetal.bundle when DOHA_METAL_CA is set')
+
+# doha: with DOHA_METAL_CA (METALCA=1) the bundle is hakios's plug-in, put there above; willow's own RedwoodMetal
+# (src/redwoodmetal.m, compute and a triangle) is built under the same name and was copied over it after
+rw = (tree / 'userland/build.sh').open(encoding='utf-8', newline='').read()
+w_old = """	if [ -f obj/RedwoodMetal ]; then
+		mkdir -p root/lib/RedwoodMetal.bundle
+		cp obj/RedwoodMetal root/lib/RedwoodMetal.bundle/"""
+w_new = """	if [ -f obj/RedwoodMetal ] && [ -z "${DOHA_METAL_CA:-}" ]; then
+		mkdir -p root/lib/RedwoodMetal.bundle
+		cp obj/RedwoodMetal root/lib/RedwoodMetal.bundle/"""
+if w_new in rw:
+    print("userland/build.sh: willow's RedwoodMetal stays out with DOHA_METAL_CA already")
+elif rw.count(w_old) != 1:
+    raise SystemExit("userland/build.sh: willow's RedwoodMetal copy is not where expected")
+else:
+    (tree / 'userland/build.sh').open('w', encoding='utf-8', newline='').write(rw.replace(w_old, w_new))
+    print("userland/build.sh: willow's RedwoodMetal stays out with DOHA_METAL_CA")
+
+# doha: a boot through Metal whose log can be read (run-ios-flash.sh METALCA=1). The window server's standard error --
+# where inject.c's lines, HakiosMetal's (hm_print) and Turnip's go -- is the console, which the picture covers; with
+# ca_metallib= it is the file /private/var/tmp/redwood-ws.log instead, and rc.jobs.dohaca has hud_test send that file
+# and the kernel's log over TCP port 7000 (hud_test watch), the lock screen swiped away as rc.jobs.unlock does
+ij = tree / 'userland/src/inject.c'
+i = ij.open(encoding='utf-8', newline='').read()
+iold = """	if (size < sizeof(path)) {
+		memcpy(path, at + 12, size);
+		ca_metallib = path;
+	}
+"""
+inew = iold + """	/* the window server's standard error into a file hud_test reads (watch), not the console the picture covers */
+	mkdir("/private/var/tmp", 0777);
+	{
+		int log = open("/private/var/tmp/redwood-ws.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+
+		if (log >= 0) {
+			dup2(log, 2);
+			close(log);
+		}
+	}
+"""
+if 'redwood-ws.log' in i:
+    print('userland/src/inject.c: the window server says into redwood-ws.log already')
+elif i.count(iold) != 1:
+    raise SystemExit('userland/src/inject.c: ca_metallib= is not where expected')
+else:
+    if '#include <sys/stat.h>' not in i:
+        i = i.replace('#include <sys/sysctl.h>\n', '#include <sys/stat.h>\n#include <sys/sysctl.h>\n', 1)
+    ij.open('w', encoding='utf-8', newline='').write(i.replace(iold, inew))
+    print('userland/src/inject.c: with ca_metallib= the window server says into /private/var/tmp/redwood-ws.log')
+(tree / 'userland/rc.jobs.dohaca').open('w', encoding='utf-8', newline='\n').write("""# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# doha (RC_JOBS=rc.jobs.dohaca, run-ios-flash.sh METALCA=1): the window server through Metal; the lock screen swiped
+# away, then its log (inject.c, HakiosMetal, Turnip: /private/var/tmp/redwood-ws.log) and the kernel's on TCP port 7000
+/redwood/bin/rwtouch wait 32 swipe 0.5 0.985 0.5 0.3 250 &
+/redwood/bin/net_test waitaddr en0 180
+/redwood/bin/hud_test serve 7000 wait 5 ps backboardd watch 240 /private/var/tmp/redwood-ws.log crashes ps backboardd watch 3000 /private/var/tmp/redwood-ws.log
+""")
+print('userland/rc.jobs.dohaca: written')
+
+# doha: with camtl=1 CoreAnimation still took OpenGL ES and HakiosMetal said nothing at all (its bundle never loaded,
+# or never got as far as a line). Each step Metal takes on the way to the plug-in, said once in the window server
+# before CoreAnimation asks: the accelerator's MetalPluginName, the bundle, its loading (and NSError), its principal
+# class, and MTLCreateSystemDefaultDevice() -- which is what CoreAnimation's next call would do anyway
+ij = tree / 'userland/src/inject.c'
+i = ij.open(encoding='utf-8', newline='').read()
+dold = """static void
+watch_metallib_lookups(void)
+{"""
+dnew = """static const char *
+objc_describe(id object)
+{
+	return object != NULL ? objc_utf8(((id (*)(id, SEL))objc_msgSend)(object, sel_registerName("description"))) : "nil";
+}
+
+/* doha: each step of Metal's way to our plug-in in this process, said (camtl=1 boots only) */
+static void
+metal_diagnose(void)
+{
+	io_service_t accelerator = IOServiceGetMatchingService(0, IOServiceMatching("IOAcceleratorES"));
+	char name[128] = "(none)", klass[128] = "(none)";
+	id path, bundle, error = NULL;
+	BOOL loaded;
+	Class principal;
+	id (*create)(void);
+	id device;
+
+	if (accelerator != 0) {
+		CFTypeRef n = IORegistryEntryCreateCFProperty(accelerator, CFSTR("MetalPluginName"), kCFAllocatorDefault, 0);
+		CFTypeRef c = IORegistryEntryCreateCFProperty(accelerator, CFSTR("MetalPluginClassName"), kCFAllocatorDefault, 0);
+
+		if (n != NULL && CFGetTypeID(n) == CFStringGetTypeID()) {
+			CFStringGetCString((CFStringRef)n, name, sizeof(name), kCFStringEncodingUTF8);
+		}
+		if (c != NULL && CFGetTypeID(c) == CFStringGetTypeID()) {
+			CFStringGetCString((CFStringRef)c, klass, sizeof(klass), kCFStringEncodingUTF8);
+		}
+		if (n != NULL) {
+			CFRelease(n);
+		}
+		if (c != NULL) {
+			CFRelease(c);
+		}
+		IOObjectRelease(accelerator);
+	}
+	say("redwood: metal-diag: IOAcceleratorES %s; MetalPluginName %s, MetalPluginClassName %s\\n",
+	    accelerator != 0 ? "found" : "NOT FOUND", name, klass);
+	path = ((id (*)(Class, SEL, const char *))objc_msgSend)(objc_getClass("NSString"),
+	    sel_registerName("stringWithUTF8String:"), "/System/Library/Extensions/RedwoodMetal.bundle");
+	bundle = ((id (*)(Class, SEL, id))objc_msgSend)(objc_getClass("NSBundle"), sel_registerName("bundleWithPath:"), path);
+	say("redwood: metal-diag: bundle %s, executable %s, access %d\\n", objc_describe(bundle),
+	    bundle != NULL ? objc_describe(((id (*)(id, SEL))objc_msgSend)(bundle, sel_registerName("executablePath"))) : "-",
+	    access("/System/Library/Extensions/RedwoodMetal.bundle/RedwoodMetal", R_OK));
+	if (bundle != NULL) {
+		loaded = ((BOOL (*)(id, SEL, id *))objc_msgSend)(bundle, sel_registerName("loadAndReturnError:"), &error);
+		principal = ((Class (*)(id, SEL))objc_msgSend)(bundle, sel_registerName("principalClass"));
+		say("redwood: metal-diag: loaded %d, error %s, principal class %s\\n", (int)loaded, objc_describe(error),
+		    principal != NULL ? class_getName(principal) : "nil");
+		if (!loaded) {
+			void *h = dlopen("/System/Library/Extensions/RedwoodMetal.bundle/RedwoodMetal", RTLD_NOW);
+
+			say("redwood: metal-diag: dlopen %s\\n", h != NULL ? "worked" : dlerror());
+		}
+	}
+	create = (id (*)(void))dlsym(RTLD_DEFAULT, "MTLCreateSystemDefaultDevice");
+	device = create != NULL ? create() : NULL;
+	say("redwood: metal-diag: MTLCreateSystemDefaultDevice() = %s (%s)\\n", device != NULL ? object_getClassName(device) : "nil",
+	    create != NULL ? "Metal is linked" : "Metal is NOT in this process");
+}
+
+static void
+watch_metallib_lookups(void)
+{"""
+cold = """	say("redwood: metallib lookups in %s are said; default.metallib is %s\\n", getprogname(), ca_metallib);
+"""
+cnew = cold + """	metal_diagnose();
+"""
+if 'metal_diagnose' in i:
+    print('userland/src/inject.c: has metal_diagnose already')
+elif i.count(dold) != 1 or i.count(cold) != 1:
+    raise SystemExit('userland/src/inject.c: watch_metallib_lookups is not where expected')
+else:
+    ij.open('w', encoding='utf-8', newline='').write(i.replace(dold, dnew).replace(cold, cnew))
+    print('userland/src/inject.c: metal_diagnose in the window server (doha)')
+
+# doha: metal-diag opens the bundle as Metal does: "/System/Library/Extensions/" + MetalPluginName + ".bundle"
+ij = tree / 'userland/src/inject.c'
+i = ij.open(encoding='utf-8', newline='').read()
+pold = """	path = ((id (*)(Class, SEL, const char *))objc_msgSend)(objc_getClass("NSString"),
+	    sel_registerName("stringWithUTF8String:"), "/System/Library/Extensions/RedwoodMetal.bundle");"""
+pnew = """	{
+		char where[256];
+
+		snprintf(where, sizeof(where), "/System/Library/Extensions/%s.bundle", name);
+		path = ((id (*)(Class, SEL, const char *))objc_msgSend)(objc_getClass("NSString"),
+		    sel_registerName("stringWithUTF8String:"), where);
+	}"""
+aold = """	    access("/System/Library/Extensions/RedwoodMetal.bundle/RedwoodMetal", R_OK));"""
+anew = """	    access("/redwood/lib/RedwoodMetal.bundle/RedwoodMetal", R_OK));"""
+dlold = """dlopen("/System/Library/Extensions/RedwoodMetal.bundle/RedwoodMetal", RTLD_NOW)"""
+dlnew = """dlopen("/redwood/lib/RedwoodMetal.bundle/RedwoodMetal", RTLD_NOW)"""
+if 'Extensions/%s.bundle' in i:
+    print('userland/src/inject.c: metal-diag opens the bundle by its name already')
+elif i.count(pold) != 1 or i.count(aold) != 1 or i.count(dlold) != 1:
+    raise SystemExit('userland/src/inject.c: metal_diagnose is not what was expected')
+else:
+    ij.open('w', encoding='utf-8', newline='').write(i.replace(pold, pnew).replace(aold, anew).replace(dlold, dlnew))
+    print('userland/src/inject.c: metal-diag opens the bundle by MetalPluginName')
+
+# doha: where the window server's threads spend their time (boot-arg ws_prof=MICROSECONDS): every thread of it stopped
+# that often, its program counter, link register and frame chain read, and every 400 looks the commonest stacks said
+# with their images and symbols (as hakios's ca_prof, which only its own Metal path starts). Through Metal on Vulkan the
+# window server makes a pipeline in bursts some 75 s apart and commits nothing: this says where it waits
+ij = tree / 'userland/src/inject.c'
+i = ij.open(encoding='utf-8', newline='').read()
+sold = """/* doha: each step of Metal's way to our plug-in in this process, said (camtl=1 boots only) */"""
+snew = """#define WS_PROF_DEPTH   12
+#define WS_PROF_SLOTS   512
+#define WS_PROF_DUMP    400
+
+static struct ws_prof_slot {
+	uint64_t        stack[WS_PROF_DEPTH];
+	char            name[32];
+	unsigned        count;
+} ws_prof_table[WS_PROF_SLOTS];
+static unsigned ws_prof_us;
+
+static int
+ws_prof_order(const void *a, const void *b)
+{
+	const struct ws_prof_slot *x = a, *y = b;
+
+	return x->count < y->count ? 1 : x->count > y->count ? -1 : 0;
+}
+
+static void *
+ws_prof_main(void *unused)
+{
+	thread_t self = mach_thread_self();
+	unsigned looks = 0;
+
+	(void)unused;
+	pthread_setname_np("redwood-ws-prof");
+	for (;;) {
+		thread_act_array_t threads;
+		mach_msg_type_number_t n = 0;
+
+		usleep(ws_prof_us);
+		if (task_threads(mach_task_self(), &threads, &n) != KERN_SUCCESS) {
+			continue;
+		}
+		looks++;
+		for (mach_msg_type_number_t t = 0; t < n; t++) {
+			thread_extended_info_data_t ext;
+			mach_msg_type_number_t count = THREAD_EXTENDED_INFO_COUNT;
+			arm_thread_state64_t state;
+			mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
+			uint64_t stack[WS_PROF_DEPTH] = { 0 }, hash = 0;
+			kern_return_t got;
+
+			if (threads[t] == self || thread_info(threads[t], THREAD_EXTENDED_INFO, (thread_info_t)&ext, &count) != KERN_SUCCESS ||
+			    thread_suspend(threads[t]) != KERN_SUCCESS) {
+				mach_port_deallocate(mach_task_self(), threads[t]);
+				continue;
+			}
+			got = thread_get_state(threads[t], ARM_THREAD_STATE64, (thread_state_t)&state, &state_count);
+			if (got == KERN_SUCCESS) {
+				uint64_t sp = arm_thread_state64_get_sp(state), fp = arm_thread_state64_get_fp(state), top = 0;
+				pthread_t pt = pthread_from_mach_thread_np(threads[t]);
+
+				/* the frame chain followed only within the thread's own stack */
+				if (pt != NULL) {
+					top = (uint64_t)(uintptr_t)pthread_get_stackaddr_np(pt);
+				}
+				stack[0] = arm_thread_state64_get_pc(state);
+				stack[1] = arm_thread_state64_get_lr(state) & 0x0000000fffffffffull;
+				for (unsigned d = 2; d < WS_PROF_DEPTH && top != 0 && fp >= sp && fp + 16 <= top && (fp & 15) == 0; d++) {
+					const uint64_t *record = (const uint64_t *)(uintptr_t)fp;
+
+					stack[d] = record[1] & 0x0000000fffffffffull;
+					if (record[0] <= fp) {
+						break;
+					}
+					fp = record[0];
+				}
+			}
+			thread_resume(threads[t]);
+			mach_port_deallocate(mach_task_self(), threads[t]);
+			if (got != KERN_SUCCESS) {
+				continue;
+			}
+			for (unsigned d = 0; d < WS_PROF_DEPTH; d++) {
+				hash = (hash ^ stack[d]) * 0x9e3779b97f4a7c15ull;
+			}
+			for (unsigned i = (unsigned)(hash >> 32) % WS_PROF_SLOTS, probes = 0; probes < WS_PROF_SLOTS;
+			    i = (i + 1) % WS_PROF_SLOTS, probes++) {
+				if (ws_prof_table[i].count == 0 || memcmp(ws_prof_table[i].stack, stack, sizeof(stack)) == 0) {
+					memcpy(ws_prof_table[i].stack, stack, sizeof(stack));
+					strlcpy(ws_prof_table[i].name, ext.pth_name[0] ? ext.pth_name : "(unnamed)", sizeof(ws_prof_table[i].name));
+					ws_prof_table[i].count++;
+					break;
+				}
+			}
+		}
+		vm_deallocate(mach_task_self(), (vm_address_t)threads, n * sizeof(thread_t));
+		if (looks < WS_PROF_DUMP) {
+			continue;
+		}
+		qsort(ws_prof_table, WS_PROF_SLOTS, sizeof(ws_prof_table[0]), ws_prof_order);
+		say("redwood: ws-prof: %u looks at every thread\\n", looks);
+		for (unsigned i = 0; i < 14 && ws_prof_table[i].count != 0; i++) {
+			char line[1800];
+			int at = snprintf(line, sizeof(line), "redwood: ws-prof: %s %.0f%%:", ws_prof_table[i].name,
+			    100.0 * ws_prof_table[i].count / looks);
+
+			for (unsigned d = 0; d < WS_PROF_DEPTH && ws_prof_table[i].stack[d] != 0 && at < (int)sizeof(line) - 120; d++) {
+				Dl_info where = { 0 };
+				const char *image = "?", *slash;
+				uint64_t offset = ws_prof_table[i].stack[d];
+
+				if (dladdr((void *)(uintptr_t)offset, &where) != 0 && where.dli_fname != NULL) {
+					image = (slash = strrchr(where.dli_fname, '/')) != NULL ? slash + 1 : where.dli_fname;
+					offset -= (uint64_t)(uintptr_t)where.dli_fbase;
+				}
+				at += snprintf(line + at, sizeof(line) - (size_t)at, " %s+0x%llx(%s)", image, (unsigned long long)offset,
+				    where.dli_sname != NULL ? where.dli_sname : "?");
+			}
+			say("%s\\n", line);
+		}
+		memset(ws_prof_table, 0, sizeof(ws_prof_table));
+		looks = 0;
+	}
+	return NULL;
+}
+
+static void
+ws_prof_start(const char *arguments)
+{
+	const char *at = strstr(arguments, "ws_prof=");
+	pthread_t sampler;
+
+	if (at == NULL || (ws_prof_us = (unsigned)atoi(at + 8)) == 0) {
+		return;
+	}
+	if (pthread_create(&sampler, NULL, ws_prof_main, NULL) == 0) {
+		pthread_detach(sampler);
+		say("redwood: ws-prof: every thread of %s looked at every %u us\\n", getprogname(), ws_prof_us);
+	}
+}
+
+/* doha: each step of Metal's way to our plug-in in this process, said (camtl=1 boots only) */"""
+cold = """	metal_diagnose();
+"""
+cnew = """	metal_diagnose();
+	ws_prof_start(arguments);
+"""
+if 'ws_prof_start' in i:
+    print('userland/src/inject.c: has ws_prof already')
+elif i.count(sold) != 1 or i.count(cold) != 1:
+    raise SystemExit('userland/src/inject.c: metal_diagnose is not where expected')
+else:
+    ij.open('w', encoding='utf-8', newline='').write(i.replace(sold, snew).replace(cold, cnew))
+    print('userland/src/inject.c: ws_prof= samples the window server (doha)')
+
+# doha: rc.jobs.dohaca samples the window server from outside (hud_test sample: task_for_pid, every 20 ms), through the
+# minutes in which, on Metal over Vulkan, it makes its first pipelines and draws nothing
+(tree / 'userland/rc.jobs.dohaca').open('w', encoding='utf-8', newline='\n').write("""# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# doha (RC_JOBS=rc.jobs.dohaca, run-ios-flash.sh METALCA=1): the window server through Metal; the lock screen swiped
+# away, then its log (inject.c, HakiosMetal, Turnip: /private/var/tmp/redwood-ws.log) and the kernel's on TCP port 7000,
+# and where its threads spend the first minutes (hud_test sample)
+/redwood/bin/rwtouch wait 32 swipe 0.5 0.985 0.5 0.3 250 &
+/redwood/bin/net_test waitaddr en0 180
+/redwood/bin/hud_test serve 7000 wait 5 ps backboardd watch 15 /private/var/tmp/redwood-ws.log sample backboardd 480 crashes watch 3000 /private/var/tmp/redwood-ws.log
+""")
+print('userland/rc.jobs.dohaca: hud_test samples backboardd')
+
+# doha: ws_prof said that it started and then nothing: pthread_from_mach_thread_np() takes libpthread's list lock, and
+# with a thread stopped that holds it, the sampler waits for ever (and that thread is never let go). While a thread is
+# stopped only the kernel is called now: its state, and the frame chain read with vm_read_overwrite (no lock, no fault).
+# And from outside it cannot be done: hud_test's task_for_pid answers, but backboardd's threads are not listed for it
+ij = tree / 'userland/src/inject.c'
+i = ij.open(encoding='utf-8', newline='').read()
+old = """			got = thread_get_state(threads[t], ARM_THREAD_STATE64, (thread_state_t)&state, &state_count);
+			if (got == KERN_SUCCESS) {
+				uint64_t sp = arm_thread_state64_get_sp(state), fp = arm_thread_state64_get_fp(state), top = 0;
+				pthread_t pt = pthread_from_mach_thread_np(threads[t]);
+
+				/* the frame chain followed only within the thread's own stack */
+				if (pt != NULL) {
+					top = (uint64_t)(uintptr_t)pthread_get_stackaddr_np(pt);
+				}
+				stack[0] = arm_thread_state64_get_pc(state);
+				stack[1] = arm_thread_state64_get_lr(state) & 0x0000000fffffffffull;
+				for (unsigned d = 2; d < WS_PROF_DEPTH && top != 0 && fp >= sp && fp + 16 <= top && (fp & 15) == 0; d++) {
+					const uint64_t *record = (const uint64_t *)(uintptr_t)fp;
+
+					stack[d] = record[1] & 0x0000000fffffffffull;
+					if (record[0] <= fp) {
+						break;
+					}
+					fp = record[0];
+				}
+			}"""
+new = """			got = thread_get_state(threads[t], ARM_THREAD_STATE64, (thread_state_t)&state, &state_count);
+			if (got == KERN_SUCCESS) {
+				uint64_t sp = arm_thread_state64_get_sp(state), fp = arm_thread_state64_get_fp(state);
+
+				/* (nothing that takes a lock while the thread is stopped: the kernel alone reads its frames) */
+				stack[0] = arm_thread_state64_get_pc(state) & 0x0000000fffffffffull;
+				stack[1] = arm_thread_state64_get_lr(state) & 0x0000000fffffffffull;
+				for (unsigned d = 2; d < WS_PROF_DEPTH && fp >= sp && fp - sp < (16u << 20) && (fp & 15) == 0; d++) {
+					uint64_t record[2];
+					vm_size_t read = 0;
+
+					if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, sizeof(record), (vm_address_t)record,
+					    &read) != KERN_SUCCESS || read != sizeof(record)) {
+						break;
+					}
+					stack[d] = record[1] & 0x0000000fffffffffull;
+					if (record[0] <= fp) {
+						break;
+					}
+					fp = record[0];
+				}
+			}"""
+if 'the kernel alone reads its frames' in i:
+    print('userland/src/inject.c: ws_prof takes no lock already')
+elif i.count(old) != 1:
+    raise SystemExit('userland/src/inject.c: ws_prof is not what was expected')
+else:
+    ij.open('w', encoding='utf-8', newline='').write(i.replace(old, new))
+    print('userland/src/inject.c: ws_prof takes no lock with a thread stopped')
+(tree / 'userland/rc.jobs.dohaca').open('w', encoding='utf-8', newline='\n').write("""# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# doha (RC_JOBS=rc.jobs.dohaca, run-ios-flash.sh METALCA=1): the window server through Metal; the lock screen swiped
+# away, then its log (inject.c, HakiosMetal, Turnip, ws_prof: /private/var/tmp/redwood-ws.log) and the kernel's on TCP
+# port 7000
+/redwood/bin/rwtouch wait 32 swipe 0.5 0.985 0.5 0.3 250 &
+/redwood/bin/net_test waitaddr en0 180
+/redwood/bin/hud_test serve 7000 wait 5 ps backboardd watch 240 /private/var/tmp/redwood-ws.log crashes watch 3000 /private/var/tmp/redwood-ws.log
+""")
+print('userland/rc.jobs.dohaca: the log alone again')
+
+# doha: ws_prof still said nothing after it started. Not a lock this time: thread_get_state() waits for the thread to come
+# out of the kernel, and a thread in an uninterruptible wait there keeps the sampler waiting with it. So a thread whose
+# state is TH_STATE_UNINTERRUPTIBLE is not stopped at all: it is counted by its name, as "in the kernel", and every dump
+# says those counts first -- which threads of the window server sit in the kernel, and for what share of the time
+ij = tree / 'userland/src/inject.c'
+i = ij.open(encoding='utf-8', newline='').read()
+o1 = """			if (threads[t] == self || thread_info(threads[t], THREAD_EXTENDED_INFO, (thread_info_t)&ext, &count) != KERN_SUCCESS ||
+			    thread_suspend(threads[t]) != KERN_SUCCESS) {
+				mach_port_deallocate(mach_task_self(), threads[t]);
+				continue;
+			}"""
+n1 = """			if (threads[t] == self || thread_info(threads[t], THREAD_EXTENDED_INFO, (thread_info_t)&ext, &count) != KERN_SUCCESS) {
+				mach_port_deallocate(mach_task_self(), threads[t]);
+				continue;
+			}
+			if (ext.pth_run_state == TH_STATE_UNINTERRUPTIBLE) {
+				/* (stopping it would mean waiting for it: counted by name instead) */
+				ws_prof_kernel(ext.pth_name[0] ? ext.pth_name : "(unnamed)");
+				mach_port_deallocate(mach_task_self(), threads[t]);
+				continue;
+			}
+			if (thread_suspend(threads[t]) != KERN_SUCCESS) {
+				mach_port_deallocate(mach_task_self(), threads[t]);
+				continue;
+			}"""
+o2 = """static int
+ws_prof_order(const void *a, const void *b)"""
+n2 = """/* threads found in an uninterruptible wait in the kernel, by name, since the last dump */
+static struct {
+	char            name[32];
+	unsigned        count;
+} ws_prof_in_kernel[32];
+
+static void
+ws_prof_kernel(const char *name)
+{
+	for (unsigned k = 0; k < 32; k++) {
+		if (ws_prof_in_kernel[k].count == 0 || strcmp(ws_prof_in_kernel[k].name, name) == 0) {
+			strlcpy(ws_prof_in_kernel[k].name, name, sizeof(ws_prof_in_kernel[k].name));
+			ws_prof_in_kernel[k].count++;
+			return;
+		}
+	}
+}
+
+static int
+ws_prof_order(const void *a, const void *b)"""
+o3 = """		say("redwood: ws-prof: %u looks at every thread\\n", looks);
+"""
+n3 = """		say("redwood: ws-prof: %u looks at every thread\\n", looks);
+		for (unsigned k = 0; k < 32 && ws_prof_in_kernel[k].count != 0; k++) {
+			say("redwood: ws-prof: in the kernel, not to be interrupted: %s %.0f%%\\n", ws_prof_in_kernel[k].name,
+			    100.0 * ws_prof_in_kernel[k].count / looks);
+		}
+		memset(ws_prof_in_kernel, 0, sizeof(ws_prof_in_kernel));
+"""
+if 'ws_prof_kernel' in i:
+    print('userland/src/inject.c: ws_prof passes over threads in the kernel already')
+elif i.count(o1) != 1 or i.count(o2) != 1 or i.count(o3) != 1:
+    raise SystemExit('userland/src/inject.c: ws_prof is not what was expected')
+else:
+    ij.open('w', encoding='utf-8', newline='').write(i.replace(o1, n1).replace(o2, n2).replace(o3, n3))
+    print('userland/src/inject.c: ws_prof counts threads in the kernel instead of stopping them')
+
+# doha: ws_prof, inside the window server, never said a word in three boots; hud_test's threads step reads every thread's
+# processor time and state from outside (proc_pidinfo) every 5 s instead, beside the log
+(tree / 'userland/rc.jobs.dohaca').open('w', encoding='utf-8', newline='\n').write("""# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# doha (RC_JOBS=rc.jobs.dohaca, run-ios-flash.sh METALCA=1): the window server through Metal; the lock screen swiped
+# away, then its log (inject.c, HakiosMetal, Turnip: /private/var/tmp/redwood-ws.log), the kernel's and, every 5 s, the
+# processor time and state of the window server's threads (hud_test threads) on TCP port 7000
+/redwood/bin/rwtouch wait 32 swipe 0.5 0.985 0.5 0.3 250 &
+/redwood/bin/net_test waitaddr en0 180
+/redwood/bin/hud_test serve 7000 wait 5 ps backboardd threads backboardd watch 240 /private/var/tmp/redwood-ws.log crashes watch 3000 /private/var/tmp/redwood-ws.log
+""")
+print('userland/rc.jobs.dohaca: hud_test threads backboardd')
+
+# doha: metal2vulkan's own table of where the processor's time goes (pipelines, libraries, functions, compiles, the
+# shader cache: native_bridge_metal_telemetry, in the plug-in) written every 20 s straight into redwood-ws.log with
+# boot-arg ws_timing=1. Its NATIVE_METAL_TIMING=1 writes it to standard error, and HakiosMetal passes on only the first 40
+# lines of that (backboardd's own fill them), so it never reached the log
+ij = tree / 'userland/src/inject.c'
+i = ij.open(encoding='utf-8', newline='').read()
+o1 = """		if (log >= 0) {
+			dup2(log, 2);
+			close(log);
+		}"""
+n1 = """		if (log >= 0) {
+			dup2(log, 2);
+			ws_log_fd = log;        /* (kept: the plug-in puts a pipe of its own on 2 later) */
+		}"""
+o2 = """/* doha: each step of Metal's way to our plug-in in this process, said (camtl=1 boots only) */"""
+n2 = """static int ws_log_fd = -1;
+
+/* doha (ws_timing=1): metal2vulkan's telemetry table, every 20 s, into the window server's log file itself */
+static void *
+ws_timing_main(void *unused)
+{
+	static char table[8192];
+	size_t (*telemetry)(char *, size_t) = NULL;
+
+	(void)unused;
+	pthread_setname_np("redwood-ws-timing");
+	for (;;) {
+		sleep(20);
+		if (telemetry == NULL) {
+			telemetry = (size_t (*)(char *, size_t))dlsym(RTLD_DEFAULT, "native_bridge_metal_telemetry");
+		}
+		if (telemetry != NULL && ws_log_fd >= 0) {
+			size_t n = telemetry(table, sizeof(table) - 1);
+			const char *title = "redwood: ws-timing: metal2vulkan's table:\\n";
+
+			if (n >= sizeof(table)) {
+				n = sizeof(table) - 1;
+			}
+			(void)!write(ws_log_fd, title, strlen(title));
+			(void)!write(ws_log_fd, table, n);
+			if (n > 0 && table[n - 1] != '\\n') {
+				(void)!write(ws_log_fd, "\\n", 1);
+			}
+		}
+	}
+	return NULL;
+}
+
+/* doha: each step of Metal's way to our plug-in in this process, said (camtl=1 boots only) */"""
+o3 = """	ws_prof_start(arguments);
+"""
+n3 = """	ws_prof_start(arguments);
+	if (strstr(arguments, "ws_timing=1") != NULL) {
+		pthread_t timing;
+
+		if (pthread_create(&timing, NULL, ws_timing_main, NULL) == 0) {
+			pthread_detach(timing);
+			say("redwood: ws-timing: metal2vulkan's table every 20 s\\n");
+		}
+	}
+"""
+if 'ws_timing_main' in i:
+    print('userland/src/inject.c: has ws_timing already')
+elif i.count(o1) != 1 or i.count(o2) != 1 or i.count(o3) != 1:
+    raise SystemExit('userland/src/inject.c: the window server log is not where expected')
+else:
+    ij.open('w', encoding='utf-8', newline='').write(i.replace(o1, n1).replace(o2, n2).replace(o3, n3))
+    print('userland/src/inject.c: ws_timing=1 writes metal2vulkan\'s telemetry into the log')
+
+# doha: metal2vulkan's shader cache (/private/var/db/m2v, which var_store should keep) never hits at the next boot:
+# rc.jobs.dohaca says first what is in it and what the store holds, before the window server has written anything
+(tree / 'userland/rc.jobs.dohaca').open('w', encoding='utf-8', newline='\n').write("""# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# doha (RC_JOBS=rc.jobs.dohaca, run-ios-flash.sh METALCA=1): the window server through Metal; the lock screen swiped
+# away, then on TCP port 7000: what the shader caches and var_store's store hold, the window server's log (inject.c,
+# HakiosMetal, Turnip: /private/var/tmp/redwood-ws.log), the kernel's and its threads' processor time every 5 s
+/redwood/bin/rwtouch wait 32 swipe 0.5 0.985 0.5 0.3 250 &
+/redwood/bin/net_test waitaddr en0 180
+/redwood/bin/hud_test serve 7000 wait 5 du /private/var/db/m2v du /private/var/root/Library/Caches run /redwood/bin/var_store,show ps backboardd threads backboardd watch 240 /private/var/tmp/redwood-ws.log crashes du /private/var/db/m2v watch 3000 /private/var/tmp/redwood-ws.log
+""")
+print('userland/rc.jobs.dohaca: the caches and the store said first')
+
+# doha: metal2vulkan's shader cache never outlived a boot. HakiosMetal gives it /private/var/db/m2v (var_store keeps
+# /private/var/db) if it can write there, /private/var/tmp/m2v otherwise (var_store leaves tmp out); backboardd runs as
+# mobile and cannot make a directory in root's /private/var/db, so every boot compiled the window server's pipelines
+# again (minutes: 79 s for one). init makes the directory, mobile's, from the image's var.skel
+bs = (tree / 'userland/build.sh').open(encoding='utf-8', newline='').read()
+v_old = """	cp $IOS/var.skel root/etc/var.skel              # the directories init creates in /private/var
+"""
+v_new = v_old + """	# doha: metal2vulkan's shader cache, where the window server (mobile) can write it and var_store keeps it
+	printf 'd\t700\t501\t501\t/private/var/db/m2v\n' >> root/etc/var.skel
+"""
+if '/private/var/db/m2v' in bs:
+    print('userland/build.sh: var.skel has /private/var/db/m2v already')
+elif bs.count(v_old) != 1:
+    raise SystemExit('userland/build.sh: the var.skel line is not where expected')
+else:
+    (tree / 'userland/build.sh').open('w', encoding='utf-8', newline='').write(bs.replace(v_old, v_new))
+    print('userland/build.sh: /private/var/db/m2v, mobile\'s, in var.skel')
