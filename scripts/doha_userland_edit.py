@@ -1211,3 +1211,97 @@ elif bs.count(v_old) != 1:
 else:
     (tree / 'userland/build.sh').open('w', encoding='utf-8', newline='').write(bs.replace(v_old, v_new))
     print('userland/build.sh: /private/var/db/m2v, mobile\'s, in var.skel')
+
+# doha: the HUD's level climbs while charging but the status bar's icon stays where it was, locking and unlocking
+# included: UIDevice's notifications every 5 s do not make iOS 16's status bar ask again, and _UIBatteryView redraws only
+# when somebody calls setChargePercent:. So when the kernel's level changes, every _UIBatteryView in SpringBoard's windows
+# (internal ones too: the status bars are not in -[UIApplication windows]) is given it, and laid out again
+ij = tree / 'userland/src/inject_sb.c'
+i = ij.open(encoding='utf-8', newline='').read()
+a_old = """/* Keep SpringBoard's normal battery observers awake while the XNU cache changes. */
+static void
+battery_post_notifications(void)
+{"""
+a_new = """/* doha: every _UIBatteryView under VIEW given the kernel's level (setChargePercent: goes through the hook above) */
+static unsigned
+battery_views_under(id view, Class battery_view, double level, unsigned depth)
+{
+	unsigned found = 0;
+	id subviews;
+	unsigned long count;
+
+	if (view == nil || depth > 40) {
+		return 0;
+	}
+	if (((BOOL (*)(id, SEL, Class))objc_msgSend)(view, sel_registerName("isKindOfClass:"), battery_view)) {
+		((void (*)(id, SEL, double))objc_msgSend)(view, sel_registerName("setChargePercent:"), level);
+		((void (*)(id, SEL))objc_msgSend)(view, sel_registerName("setNeedsLayout"));
+		((void (*)(id, SEL))objc_msgSend)(view, sel_registerName("setNeedsDisplay"));
+		found++;
+	}
+	subviews = ((id (*)(id, SEL))objc_msgSend)(view, sel_registerName("subviews"));
+	count = subviews != nil ? ((unsigned long (*)(id, SEL))objc_msgSend)(subviews, sel_registerName("count")) : 0;
+	for (unsigned long k = 0; k < count; k++) {
+		found += battery_views_under(((id (*)(id, SEL, unsigned long))objc_msgSend)(subviews, sel_registerName("objectAtIndex:"), k),
+		    battery_view, level, depth + 1);
+	}
+	return found;
+}
+
+/* doha: the status bar's battery views told when the kernel's level has changed (main queue) */
+static void
+battery_views_refresh(void)
+{
+	static int shown = -1;
+	static unsigned said;
+	int soc = sysctl_int("kern.redwood.battery_soc");
+	Class window_class = objc_getClass("UIWindow"), battery_view = objc_getClass("_UIBatteryView");
+	SEL all = sel_registerName("allWindowsIncludingInternalWindows:onlyVisibleWindows:");
+	id windows = nil;
+	unsigned long count;
+	unsigned found = 0;
+
+	if (soc < 0 || soc > 100 || soc == shown || battery_power_source() || window_class == Nil || battery_view == Nil) {
+		return;
+	}
+	if (class_getClassMethod(window_class, all) != NULL) {
+		windows = ((id (*)(Class, SEL, BOOL, BOOL))objc_msgSend)(window_class, all, YES, NO);
+	}
+	if (windows == nil) {
+		id application = ((id (*)(Class, SEL))objc_msgSend)(objc_getClass("UIApplication"), sel_registerName("sharedApplication"));
+
+		windows = application != nil ? ((id (*)(id, SEL))objc_msgSend)(application, sel_registerName("windows")) : nil;
+	}
+	count = windows != nil ? ((unsigned long (*)(id, SEL))objc_msgSend)(windows, sel_registerName("count")) : 0;
+	for (unsigned long k = 0; k < count; k++) {
+		found += battery_views_under(((id (*)(id, SEL, unsigned long))objc_msgSend)(windows, sel_registerName("objectAtIndex:"), k),
+		    battery_view, (double)soc / 100.0, 0);
+	}
+	if (found != 0) {
+		shown = soc;
+	}
+	if (said++ < 6 || found == 0) {
+		if (said < 40) {
+			say("redwood: battery UI: level %d%% given to %u battery views in %lu windows\\n", soc, found, count);
+		}
+	}
+}
+
+/* Keep SpringBoard's normal battery observers awake while the XNU cache changes. */
+static void
+battery_post_notifications(void)
+{"""
+b_old = """	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+		battery_post_notifications();
+	});"""
+b_new = """	battery_views_refresh();
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+		battery_post_notifications();
+	});"""
+if 'battery_views_refresh' in i:
+    print('userland/src/inject_sb.c: the battery views are refreshed already')
+elif i.count(a_old) != 1 or i.count(b_old) != 1:
+    raise SystemExit('userland/src/inject_sb.c: battery_post_notifications is not where expected')
+else:
+    ij.open('w', encoding='utf-8', newline='').write(i.replace(a_old, a_new).replace(b_old, b_new))
+    print('userland/src/inject_sb.c: the battery views of the status bar given the level when it changes (doha)')

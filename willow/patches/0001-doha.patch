@@ -1,6 +1,6 @@
-From f495ec162e41939c03441a84f37ac3973734747c Mon Sep 17 00:00:00 2001
+From 8073b226e0d02e2e8a699452a0dca059dccecace Mon Sep 17 00:00:00 2001
 From: andrecremo <andreljsantos@gmail.com>
-Date: Wed, 18 Nov 2026 20:09:58 -0300
+Date: Wed, 18 Nov 2026 20:51:05 -0300
 Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
 
 ---
@@ -52,8 +52,8 @@ Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
  xnu-build.sh                                  |    3 +-
  xnu/files/bsd/dev/redwood_a610.c              |   32 +-
  xnu/files/bsd/dev/redwood_adreno.c            |    5 +-
- xnu/files/bsd/dev/redwood_battery.c           |   24 +
- xnu/files/bsd/dev/redwood_buttons.c           |  415 ++++++
+ xnu/files/bsd/dev/redwood_battery.c           |   48 +
+ xnu/files/bsd/dev/redwood_buttons.c           |  451 +++++++
  xnu/files/bsd/dev/redwood_focaltech.c         |  943 +++++++++++++
  xnu/files/bsd/dev/redwood_input.c             |    4 +
  xnu/files/bsd/dev/redwood_lx.c                |   91 +-
@@ -73,7 +73,7 @@ Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
  xnu/redwood.patch                             |    9 +-
  xnuloader/build.sh                            |    3 +-
  xnuloader/loader.c                            |  565 +++++++-
- 69 files changed, 6503 insertions(+), 89 deletions(-)
+ 69 files changed, 6563 insertions(+), 89 deletions(-)
  create mode 100755 tools/mk-ath10k.sh
  create mode 100755 wifi/lx/include/linux/acpi.h
  create mode 100755 wifi/lx/include/linux/clk.h
@@ -2485,10 +2485,10 @@ index 65d7cbd..7d248a0 100644
  	if (pe_arm_get_soc_base_phys() != REDWOOD_SOC_BASE) {
  		printf("adreno: THE GPU IS NOT STARTED: gpu=1 is for the phone, and this is not it\n");
 diff --git a/xnu/files/bsd/dev/redwood_battery.c b/xnu/files/bsd/dev/redwood_battery.c
-index 6e80b4d..6bf0b72 100644
+index 6e80b4d..d9c88ce 100644
 --- a/xnu/files/bsd/dev/redwood_battery.c
 +++ b/xnu/files/bsd/dev/redwood_battery.c
-@@ -42,6 +42,25 @@ static int battery_soc_percent = -1, battery_voltage_mv = -1, battery_current_ma
+@@ -42,6 +42,49 @@ static int battery_soc_percent = -1, battery_voltage_mv = -1, battery_current_ma
  static int battery_temperature_c = -273, battery_present, battery_charger_present;
  static int battery_charging, battery_soc_estimated, battery_charger_action = -1;
  static uint64_t battery_updates, battery_failures;
@@ -2498,10 +2498,34 @@ index 6e80b4d..6bf0b72 100644
 + * doha (bsd/dev/redwood_buttons.c, battery=1): what the PMI632 says, read on the SPMI bus -- the cell's voltage from
 + * its gauge, the level estimated from it, a cable at USB in, the charger's state -- in place of the loader's cache.
 + */
-+void redwood_battery_direct(int soc, int voltage_mv, int plugged, int charging, int android_soc);
++void redwood_battery_direct(int soc, int voltage_mv, int plugged, int charging, int android_soc, int into_battery_ma);
++extern void RedwoodBatteryReport(const void *state, unsigned size);     /* iokit/Kernel/RedwoodBattery.cpp */
 +void
-+redwood_battery_direct(int soc, int voltage_mv, int plugged, int charging, int android_soc)
++redwood_battery_direct(int soc, int voltage_mv, int plugged, int charging, int android_soc, int into_battery_ma)
 +{
++	static int said_soc = -1, said_plugged = -1, said_charging = -1;
++	static uint32_t looks;
++
++	if (soc >= 0 && soc <= 100 && (soc != said_soc || plugged != said_plugged || charging != said_charging || looks++ % 20 == 0)) {
++		struct redwood_battery_state b = {
++			.size = sizeof(b),
++			.percent_hundredths = soc * 100,
++			.voltage_uv = voltage_mv * 1000,
++			.current_ua = into_battery_ma * 1000,
++			.temperature_hundredths = battery_temperature_c > -273 ? battery_temperature_c * 100 : 2500,
++			.present = 1,
++			.external = plugged != 0,
++			.status = plugged ? (soc >= 100 ? 4 : charging ? 1 : 3) : 2,
++			.charge_uah = soc * 40000,
++			.full_uah = 4000000,            /* the KD40, 4000 mAh */
++			.design_uah = 4000000,
++		};
++
++		said_soc = soc;
++		said_plugged = plugged;
++		said_charging = charging;
++		RedwoodBatteryReport(&b, sizeof(b));
++	}
 +	battery_soc_percent = soc;
 +	battery_voltage_mv = voltage_mv;
 +	battery_present = 1;
@@ -2514,7 +2538,7 @@ index 6e80b4d..6bf0b72 100644
  
  /* for others in the kernel (the flashlight's thermal guard): -273 while it is not known */
  int
-@@ -161,6 +180,9 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
+@@ -161,6 +204,9 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
  {
  	for (unsigned tick = 0;; tick++) {
  		battery_poll();
@@ -2524,7 +2548,7 @@ index 6e80b4d..6bf0b72 100644
  		if (tick % 12 == 0) {
  			printf("battery: SOC=%d%%%s, V=%d mV, I=%d mA, T=%d C, battery=%d charger=%d charging=%d "
  			    "action=%d (%llu reads, %llu failed)\n", battery_soc_percent,
-@@ -183,6 +205,7 @@ redwood_battery_init(void)
+@@ -183,6 +229,7 @@ redwood_battery_init(void)
  	if (!PE_parse_boot_argn("battery", &enabled, sizeof(enabled)) || !enabled) return;
  	if (!PE_parse_boot_argn("battery_shared_pa", &shared_pa, sizeof(shared_pa)) || shared_pa == 0) {
  		printf("battery: xnuloader did not provide battery_shared_pa\n");
@@ -2532,7 +2556,7 @@ index 6e80b4d..6bf0b72 100644
  		return;
  	}
  	page = ml_io_map((vm_offset_t)(shared_pa & ~(LOADER_PAGE_SIZE - 1)), LOADER_PAGE_SIZE);
-@@ -191,6 +214,7 @@ redwood_battery_init(void)
+@@ -191,6 +238,7 @@ redwood_battery_init(void)
  	    shared_battery->size < sizeof(struct loader_battery)) {
  		printf("battery: bad xnuloader cache at %#llx (magic %#llx version %u size %u)\n", shared_pa,
  		    shared_battery->magic, shared_battery->version, shared_battery->size);
@@ -2541,7 +2565,7 @@ index 6e80b4d..6bf0b72 100644
  	}
  	printf("battery: Qualcomm UEFI cache at pa %#llx; polling every 5 seconds\n", shared_pa);
 diff --git a/xnu/files/bsd/dev/redwood_buttons.c b/xnu/files/bsd/dev/redwood_buttons.c
-index 593ed6e..196d6f7 100644
+index 593ed6e..d2b82f3 100644
 --- a/xnu/files/bsd/dev/redwood_buttons.c
 +++ b/xnu/files/bsd/dev/redwood_buttons.c
 @@ -148,6 +148,259 @@ struct peripheral {
@@ -2553,7 +2577,7 @@ index 593ed6e..196d6f7 100644
 + * and its charger (qcom,qpnp-smb5: usb@1300, chgr@1000) and the gauge's SDAM (qg-sdam@b100) -- read and never written
 + */
 +static struct peripheral qg, usbin, chgr, qgsdam;
-+static struct peripheral dcdc, misc;    /* the charger's DCDC (0x1100) and MISC (0x1600) blocks: read for the panel only */
++static struct peripheral dcdc, misc, typec;    /* the charger's DCDC (0x1100) and MISC (0x1600) blocks: read for the panel only */
 +/*
 + * charge=1 (doha): the charger's watchdog petted (BARK_BITE_WDOG_PET, MISC 0x43 bit 0) while a cable is in, through
 + * the arbiter's write channel for the PMI632's MISC block ("chnls" at 0x1E00000 in doha's spmi@1c40000, 0x10000 a
@@ -2814,7 +2838,7 @@ index 593ed6e..196d6f7 100644
  };
  static const struct board *board = &boards[0];
  
-@@ -470,6 +726,124 @@ say_summary(void)
+@@ -470,6 +726,158 @@ say_summary(void)
  	    bus.reads ? bus.total_ns / bus.reads / 1000 : 0, bus.longest_ns / 1000, bus.failed);
  }
  
@@ -2825,7 +2849,7 @@ index 593ed6e..196d6f7 100644
 + * Android's gauge driver last kept in the SDAM (offset 0x47, valid at 0x46). The level from the voltage, as the
 + * loader's soc_from_voltage(): a cable lifts the voltage, so it reads high while charging.
 + */
-+extern void redwood_battery_direct(int soc, int voltage_mv, int plugged, int charging, int android_soc);
++extern void redwood_battery_direct(int soc, int voltage_mv, int plugged, int charging, int android_soc, int into_battery_ma);
 +
 +static void
 +battery_look(void)
@@ -2906,7 +2930,7 @@ index 593ed6e..196d6f7 100644
 +		pet();
 +		charge_enable();
 +	}
-+	redwood_battery_direct(soc, mv, (usb & 0x10) != 0, state >= 1 && state <= 4, android);
++	redwood_battery_direct(soc, mv, (usb & 0x10) != 0, state >= 1 && state <= 4, android, -current_now());   /* (negative: charging) */
 +	{
 +		uint8_t st[2] = { 0, 0 }, en = 0, cfg2 = 0, il = 0, icl = 0, pp = 0, wd[3] = { 0, 0, 0 }, sub = 0, ia[2] = { 0, 0 };
 +		int64_t ma;
@@ -2929,6 +2953,40 @@ index 593ed6e..196d6f7 100644
 +		(void)icl;
 +		(void)pp;
 +		(void)ma;
++		{
++			static uint32_t looks;
++
++			if ((usb & 0x10) != 0 && looks++ % 15 == 0) {
++				uint8_t in[3] = { 0, 0, 0 }, cmd[3] = { 0, 0, 0 }, opt = 0, lim = 0, aicl = 0, d[6] = { 0, 0, 0, 0, 0, 0 };
++
++				spmi_read(&usbin, 0x06, in, 3);
++				spmi_read(&usbin, 0x40, cmd, 3);
++				spmi_read(&usbin, 0x66, &opt, 1);
++				{
++					uint8_t load = 0, snk = 0;
++
++					spmi_read(&usbin, 0x65, &load, 1);
++					if (typec.found) {
++						spmi_read(&typec, 0x06, &snk, 1);
++					}
++					printf("battery: input: USBIN load cfg %02x (ICL after APSD from 0x70: %s); Type-C sink status %02x (%s)\n",
++					    load, load & 0x10 ? "yes" : "no", snk, !typec.found ? "block not found" : snk & 0x02 ? "Rp 3 A" :
++					    snk & 0x04 ? "Rp 1.5 A" : snk & 0x08 ? "Rp default" : "no Rp");
++				}
++				spmi_read(&usbin, 0x70, &lim, 1);
++				spmi_read(&usbin, 0x80, &aicl, 1);
++				if (dcdc.found) {
++					spmi_read(&dcdc, 0x06, d, 6);
++				}
++				printf("battery: input: USBIN status %02x, APSD %02x result %02x (%s%s%s%s%s%s%s); commands IL %02x APSD %02x "
++				    "override %02x; ICL options %02x, limit %02x (%u mA), AICL options %02x; "
++				    "DCDC 06-0b %02x %02x %02x %02x %02x %02x (ICL max %u, in force %u, AICL %u mA); battery %d mA\n", in[0], in[1], in[2],
++				    in[2] & 0x01 ? "SDP " : "", in[2] & 0x02 ? "OCP " : "", in[2] & 0x04 ? "CDP " : "", in[2] & 0x08 ? "DCP " : "",
++				    in[2] & 0x10 ? "float " : "", in[2] & 0x20 ? "QC2 " : "", in[2] & 0x40 ? "QC3 " : "",
++				    cmd[0], cmd[1], cmd[2], opt, lim, lim * 50u, aicl, d[0], d[1], d[2], d[3], d[4], d[5],
++				    d[0] * 50u, d[1] * 50u, d[2] * 50u, current_now());
++			}
++		}
 +		redwood_status(REDWOOD_STATUS_WIFI, "chg%s%s S%02x E%02x T%02x I%d avg%dmA ocv%d=%d%% cc%lld.%lld%%",
 +		    pet_stopped ? "!" : pets != 0 ? "+" : "", enable_stopped ? "x" : enables != 0 ? "e" : "", st[0], en,
 +		    gauge_subtype, current_now(), current_average(), level_ocv, level_est,
@@ -2939,7 +2997,7 @@ index 593ed6e..196d6f7 100644
  static void
  buttons_thread(void *parameter, __unused wait_result_t result)
  {
-@@ -498,6 +872,28 @@ buttons_thread(void *parameter, __unused wait_result_t result)
+@@ -498,6 +906,29 @@ buttons_thread(void *parameter, __unused wait_result_t result)
  	printf("buttons: step 2: look through the arbiter's table for the channels of the two peripherals\n");
  	find_channel(&pon, channels);
  	find_channel(&pin, channels);
@@ -2950,6 +3008,7 @@ index 593ed6e..196d6f7 100644
 +		find_channel(&qgsdam, channels);
 +		find_channel(&dcdc, channels);
 +		find_channel(&misc, channels);
++		find_channel(&typec, channels);
 +		{
 +			uint32_t charge = 0;
 +
@@ -2968,7 +3027,7 @@ index 593ed6e..196d6f7 100644
  	if (steps < 3) {
  		goto out;
  	}
-@@ -540,6 +936,12 @@ buttons_thread(void *parameter, __unused wait_result_t result)
+@@ -540,6 +971,12 @@ buttons_thread(void *parameter, __unused wait_result_t result)
  	    volume_up.usable ? " volume-up" : "", volume_down.usable ? " volume-down" : "", POLL_MS);
  	for (unsigned tick = 1;; tick++) {
  		buttons_poll();
@@ -2981,7 +3040,7 @@ index 593ed6e..196d6f7 100644
  		/* once early on as well: a short run is to say what the reads cost too */
  		if (tick % MINUTE_TICKS == 0 || tick == 10 * 1000 / POLL_MS) {
  			say_summary();
-@@ -595,6 +997,19 @@ redwood_buttons_init(void)
+@@ -595,6 +1032,20 @@ redwood_buttons_init(void)
  		}
  	}
  	pon = (struct peripheral){ .name = board->pon_name, .id = board->pon_id };
@@ -2996,6 +3055,7 @@ index 593ed6e..196d6f7 100644
 +			qgsdam = (struct peripheral){ .name = "the PMI632's gauge SDAM", .id = 0x2b1 };
 +			dcdc = (struct peripheral){ .name = "the PMI632's charger DCDC", .id = 0x211 };
 +			misc = (struct peripheral){ .name = "the PMI632's charger MISC", .id = 0x216 };
++			typec = (struct peripheral){ .name = "the PMI632's Type-C port", .id = 0x215 };
 +		}
 +	}
  	pin = (struct peripheral){ .name = board->pin_name, .id = board->pin_id };

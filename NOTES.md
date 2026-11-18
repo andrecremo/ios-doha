@@ -1021,3 +1021,31 @@ fábrica). Registradores tirados do driver sde do msm-4.14 (`sde_hw_util.c`, `sd
     GPU 2-4 ms, e a tela de ~10 a 20-36 quadros por segundo (metade dos intervalos abaixo de 17 ms). Ainda há
     travões de 85-90 ms, de 4 a 15 a cada 5 s.
   - `fbscale=2` (750x1624) foi testado e descartado: o papel de parede some ou pisca e Ajustes > Acessibilidade fecha.
+
+## Corrente de carga: os ~170 mA eram a porta do PC (2026-11-18)
+
+Leitura do "battery step 5" (só printf, sem escrita), com carregador de parede e o iOS rodando:
+`USBIN status 01, APSD 43 result 28 (DCP QC2); commands IL 00 APSD 00 override 00; ICL options 02, limit 1e (1500 mA); AICL options 54; DCDC 06-0b 3c 31 31 31 41 95; battery -1870 mA`
+
+- APSD detectou DCP e QC2 (0x08 = 0x28). Não há override (0x42 = 0), então o limite fica no automático do hardware.
+- DCDC 0x06 = 0x3c: ICL máximo de 3000 mA. 0x07 = 0x31: ICL em vigor de 2450 mA. 0x08 = 0x31: resultado do AICL, também 2450 mA (passo de 50 mA). 0x0B = 0x95: USBIN em uso, entrada válida.
+- A bateria recebe ~1,87 A, o que dá ~47 %/h em 4000 mAh. O nível contado acompanha.
+- Os ~170 mA dos testes anteriores eram com o cabo na porta USB do PC: SDP, com limite automático de 500 mA, e parte disso vai para o sistema.
+- Conclusão: com carregador de parede não é preciso escrever nada no ICL. Elevar o limite em SDP não seria seguro, porque uma porta USB 2.0 só garante 500 mA.
+- Ainda não foi testada a leitura do USBIN 0x65 e do Type-C (0x1506).
+
+## O ícone de bateria do iOS acompanha o nível (2026-11-18)
+
+O HUD subia carregando e o ícone ficava parado, mesmo bloqueando e desbloqueando: o caminho direto só preenchia os
+sysctls que os hooks do `libredwood-sb` devolvem ao UIKit, e a barra de status do iOS 16 não volta a perguntar.
+- Agora o caminho direto também alimenta o `RedwoodBattery` (o `IOPMPowerSource` que o `powerd` lê como a bateria de
+  um iPhone, o mesmo do caminho `adsp=1`): `redwood_battery_direct` recebe a corrente (positiva carregando) e chama
+  `RedwoodBatteryReport` quando nível, cabo ou carga mudam e a cada 20 leituras (nível, tensão, corrente, cabo, estado
+  1/2/3/4, 4000 mAh). Os hooks saem do caminho quando o serviço existe. **No aparelho: o ícone acompanha o HUD.**
+- De reserva, no `inject_sb.c`: `battery_views_refresh` entrega o nível a cada `_UIBatteryView` quando ele muda (só
+  sem o serviço).
+- A melhorar: mandar os centésimos do nível contado (`level_u`) em vez do inteiro, para a estimativa de tempo restante.
+- A ver depois (relato do usuário): a bateria parece gasta desde o Android, e o nível pula de vinte e poucos para
+  cinquenta e poucos por cento. Suspeitas: capacidade real bem abaixo dos 4000 mAh nominais (a contagem e a curva OCV
+  supõem 4000) e a resistência interna maior que os 150 mΩ (a tensão sob carga cai mais, o nível pela curva oscila).
+  Para medir: a capacidade aprendida pelo QG do Android (no SDAM do gauge) e um ciclo de descarga contado.

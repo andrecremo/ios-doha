@@ -5972,3 +5972,110 @@ sub1('xnu/files/iokit/Kernel/MiniIOSurface.cpp', """surfaceMemoryBack(IOBufferMe
 		return;
 	}
 """)
+
+# (doha, battery step 5, read only: the charge current in iOS stays near 170 mA, probably the USB default input limit
+# (about 500 mA, no charger type detected). Every 15 s while a cable is in, the charger's input side is said in the
+# kernel's log: USBIN 0x06-0x08 (input status, APSD status, APSD result: bit 0 SDP, 1 OCP, 2 CDP, 3 DCP, 4 float,
+# 5 QC2, 6 QC3), 0x40-0x42 (the IL, APSD and ICL override commands), 0x66 (ICL options: USB51 / high-current mode),
+# 0x70 (the configured input current limit), 0x80 (AICL options), and DCDC 0x06-0x0b (ICL status, AICL). Nothing written)
+sub1('xnu/files/bsd/dev/redwood_buttons.c', """		(void)cfg2;
+		(void)icl;
+		(void)pp;
+		(void)ma;""", """		(void)cfg2;
+		(void)icl;
+		(void)pp;
+		(void)ma;
+		{
+			static uint32_t looks;
+
+			if ((usb & 0x10) != 0 && looks++ % 15 == 0) {
+				uint8_t in[3] = { 0, 0, 0 }, cmd[3] = { 0, 0, 0 }, opt = 0, lim = 0, aicl = 0, d[6] = { 0, 0, 0, 0, 0, 0 };
+
+				spmi_read(&usbin, 0x06, in, 3);
+				spmi_read(&usbin, 0x40, cmd, 3);
+				spmi_read(&usbin, 0x66, &opt, 1);
+				spmi_read(&usbin, 0x70, &lim, 1);
+				spmi_read(&usbin, 0x80, &aicl, 1);
+				if (dcdc.found) {
+					spmi_read(&dcdc, 0x06, d, 6);
+				}
+				printf("battery: input: USBIN status %02x, APSD %02x result %02x (%s%s%s%s%s%s%s); commands IL %02x APSD %02x "
+				    "override %02x; ICL options %02x, limit %02x (%u mA at 50 a step, %u at 25), AICL options %02x; "
+				    "DCDC 06-0b %02x %02x %02x %02x %02x %02x; battery %d mA\\n", in[0], in[1], in[2],
+				    in[2] & 0x01 ? "SDP " : "", in[2] & 0x02 ? "OCP " : "", in[2] & 0x04 ? "CDP " : "", in[2] & 0x08 ? "DCP " : "",
+				    in[2] & 0x10 ? "float " : "", in[2] & 0x20 ? "QC2 " : "", in[2] & 0x40 ? "QC3 " : "",
+				    cmd[0], cmd[1], cmd[2], opt, lim, lim * 50u, lim * 25u, aicl, d[0], d[1], d[2], d[3], d[4], d[5],
+				    current_now());
+			}
+		}""")
+
+# (doha, battery step 5, read only, with the battery session's notes from qpnp-smb5.c/smb5-reg.h: USBIN 0x65
+# (USBIN_LOAD_CFG, bit 4 ICL_OVERRIDE_AFTER_APSD: 0x70 rules after APSD) and the Type-C block's SNK status (0x215, reg
+# 0x06: bit 3 default Rp, bit 2 Rp 1.5 A, bit 1 Rp 3 A) said too; the ICL registers are 50 mA a step)
+sub1('xnu/files/bsd/dev/redwood_buttons.c', "static struct peripheral dcdc, misc;", "static struct peripheral dcdc, misc, typec;")
+sub1('xnu/files/bsd/dev/redwood_buttons.c', """			misc = (struct peripheral){ .name = "the PMI632's charger MISC", .id = 0x216 };""",
+     """			misc = (struct peripheral){ .name = "the PMI632's charger MISC", .id = 0x216 };
+			typec = (struct peripheral){ .name = "the PMI632's Type-C port", .id = 0x215 };""")
+sub1('xnu/files/bsd/dev/redwood_buttons.c', """		find_channel(&dcdc, channels);
+		find_channel(&misc, channels);""", """		find_channel(&dcdc, channels);
+		find_channel(&misc, channels);
+		find_channel(&typec, channels);""")
+sub1('xnu/files/bsd/dev/redwood_buttons.c', """				spmi_read(&usbin, 0x66, &opt, 1);""", """				spmi_read(&usbin, 0x66, &opt, 1);
+				{
+					uint8_t load = 0, snk = 0;
+
+					spmi_read(&usbin, 0x65, &load, 1);
+					if (typec.found) {
+						spmi_read(&typec, 0x06, &snk, 1);
+					}
+					printf("battery: input: USBIN load cfg %02x (ICL after APSD from 0x70: %s); Type-C sink status %02x (%s)\\n",
+					    load, load & 0x10 ? "yes" : "no", snk, !typec.found ? "block not found" : snk & 0x02 ? "Rp 3 A" :
+					    snk & 0x04 ? "Rp 1.5 A" : snk & 0x08 ? "Rp default" : "no Rp");
+				}""")
+sub1('xnu/files/bsd/dev/redwood_buttons.c', "limit %02x (%u mA at 50 a step, %u at 25), AICL options %02x; ", "limit %02x (%u mA), AICL options %02x; ")
+sub1('xnu/files/bsd/dev/redwood_buttons.c', "cmd[0], cmd[1], cmd[2], opt, lim, lim * 50u, lim * 25u, aicl,", "cmd[0], cmd[1], cmd[2], opt, lim, lim * 50u, aicl,")
+sub1('xnu/files/bsd/dev/redwood_buttons.c', """"DCDC 06-0b %02x %02x %02x %02x %02x %02x; battery %d mA\\n", in[0], in[1], in[2],""",
+     """"DCDC 06-0b %02x %02x %02x %02x %02x %02x (ICL max %u, in force %u, AICL %u mA); battery %d mA\\n", in[0], in[1], in[2],""")
+sub1('xnu/files/bsd/dev/redwood_buttons.c', "d[0], d[1], d[2], d[3], d[4], d[5],\n\t\t\t\t    current_now());",
+     "d[0], d[1], d[2], d[3], d[4], d[5],\n\t\t\t\t    d[0] * 50u, d[1] * 50u, d[2] * 50u, current_now());")
+
+# (doha, battery: the status bar's icon stood still while the level the kernel counts went up: the direct path filled only
+# the sysctls that libredwood-sb's hooks hand to UIKit, and iOS 16's status bar does not ask them again. The direct path
+# now also feeds RedwoodBattery, the IOPMPowerSource that powerd reads as an iPhone's own battery (as the audio DSP's
+# battery manager does with adsp=1): the icon, the bolt, the lock screen's "Charging", Settings > Battery follow by
+# themselves, and the hooks step aside once that service is there. Reported when something changed, every 20 looks besides)
+sub1('xnu/files/bsd/dev/redwood_battery.c', """void redwood_battery_direct(int soc, int voltage_mv, int plugged, int charging, int android_soc);
+void
+redwood_battery_direct(int soc, int voltage_mv, int plugged, int charging, int android_soc)
+{""", """void redwood_battery_direct(int soc, int voltage_mv, int plugged, int charging, int android_soc, int into_battery_ma);
+extern void RedwoodBatteryReport(const void *state, unsigned size);     /* iokit/Kernel/RedwoodBattery.cpp */
+void
+redwood_battery_direct(int soc, int voltage_mv, int plugged, int charging, int android_soc, int into_battery_ma)
+{
+	static int said_soc = -1, said_plugged = -1, said_charging = -1;
+	static uint32_t looks;
+
+	if (soc >= 0 && soc <= 100 && (soc != said_soc || plugged != said_plugged || charging != said_charging || looks++ % 20 == 0)) {
+		struct redwood_battery_state b = {
+			.size = sizeof(b),
+			.percent_hundredths = soc * 100,
+			.voltage_uv = voltage_mv * 1000,
+			.current_ua = into_battery_ma * 1000,
+			.temperature_hundredths = battery_temperature_c > -273 ? battery_temperature_c * 100 : 2500,
+			.present = 1,
+			.external = plugged != 0,
+			.status = plugged ? (soc >= 100 ? 4 : charging ? 1 : 3) : 2,
+			.charge_uah = soc * 40000,
+			.full_uah = 4000000,            /* the KD40, 4000 mAh */
+			.design_uah = 4000000,
+		};
+
+		said_soc = soc;
+		said_plugged = plugged;
+		said_charging = charging;
+		RedwoodBatteryReport(&b, sizeof(b));
+	}""")
+sub1('xnu/files/bsd/dev/redwood_buttons.c', "extern void redwood_battery_direct(int soc, int voltage_mv, int plugged, int charging, int android_soc);",
+     "extern void redwood_battery_direct(int soc, int voltage_mv, int plugged, int charging, int android_soc, int into_battery_ma);")
+sub1('xnu/files/bsd/dev/redwood_buttons.c', "	redwood_battery_direct(soc, mv, (usb & 0x10) != 0, state >= 1 && state <= 4, android);",
+     "	redwood_battery_direct(soc, mv, (usb & 0x10) != 0, state >= 1 && state <= 4, android, -current_now());   /* (negative: charging) */")
