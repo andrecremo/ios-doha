@@ -93,7 +93,9 @@ if [ "${NETWORK:-0}" = 1 ]; then
 	mkdir -p $W/fw-wifi && install -m 0600 "$NWF" $W/fw-wifi/network && export DOHA_NETWORK=1
 	echo "NETWORK=1: the network file goes into the image (not shown here)"
 fi
-FLASHBOOT=1 CRYPTEXES=flash REST=1 RC_JOBS=rc.jobs.unlock SHARE=1 bash userland/build.sh > ~/doha-xnu/ios-flash-build.log 2>&1 ||
+# NETTEST=1: the job of the demo is rc.jobs.dohanet -- the network tried layer by layer, each result on the panel
+[ "${NETTEST:-0}" = 1 ] && DOHA_RC_JOBS=rc.jobs.dohanet && echo "NETTEST=1: net_test's results on the panel's Keys line"
+FLASHBOOT=1 CRYPTEXES=flash REST=1 RC_JOBS=${DOHA_RC_JOBS:-rc.jobs.unlock} SHARE=1 bash userland/build.sh > ~/doha-xnu/ios-flash-build.log 2>&1 ||
 	{ tail -n 20 ~/doha-xnu/ios-flash-build.log; echo "build.sh failed: see ~/doha-xnu/ios-flash-build.log"; exit 1; }
 grep -E 'flashboot.apfs|root.apfs:' ~/doha-xnu/ios-flash-build.log | tail -3
 ls -l userland/root.apfs userland/flashboot.apfs

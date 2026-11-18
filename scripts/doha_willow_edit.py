@@ -5184,3 +5184,35 @@ sub1(WIFI, """	error = redwood_sta_ask_join_standing(&what);
 		}
 	}
 	bzero(&what, sizeof(what));""")
+
+# (doha's radio joins and frames pass both ways -- sent and acknowledged, received for us and for all -- yet iOS says it is
+# not on the Internet. Which layer fails is what net_test says (address, names, TCP, HTTPS, reachability), and its
+# output went where nobody can read it on the phone. kern.redwood_note: a line from user space (root) onto the panel's
+# Keys line; net_test's "hud" puts its results there)
+sub1('xnu/files/bsd/dev/redwood_status.c', """#define STATUS_TEXT             56
+""", """#define STATUS_TEXT             56
+
+#include <sys/sysctl.h>
+
+/* a line for the panel from user space (net_test hud): kern.redwood_note, written by root, shown on the Keys line */
+static int
+redwood_note_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	char text[STATUS_TEXT + 1];
+	size_t n;
+	int error;
+
+	if (req->newptr == USER_ADDR_NULL) {
+		return 0;
+	}
+	n = req->newlen < STATUS_TEXT ? req->newlen : STATUS_TEXT;
+	if ((error = SYSCTL_IN(req, text, n)) != 0) {
+		return error;
+	}
+	text[n] = 0;
+	redwood_status(REDWOOD_STATUS_KEYS, "%s", text);
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, redwood_note, CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_LOCKED, 0, 0, redwood_note_sysctl, "A",
+    "a line for the panel's Keys line");
+""")

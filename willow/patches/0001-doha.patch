@@ -1,6 +1,6 @@
-From f1d762b32eecbe7a65de287387e122e1f4aeea65 Mon Sep 17 00:00:00 2001
+From 5acd153accfd77c3076482445a66245d3de7d1e8 Mon Sep 17 00:00:00 2001
 From: andrecremo <andreljsantos@gmail.com>
-Date: Tue, 17 Nov 2026 21:02:01 -0300
+Date: Tue, 17 Nov 2026 21:29:59 -0300
 Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
 
 ---
@@ -43,7 +43,7 @@ Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
  wifi/lx/patches/include-net-mac80211.h.patch  |    0
  .../lx/patches10/0001-wcn3990-chainmask.patch |   15 +
  wifi/lx/src/lx.h                              |    0
- wifi/lx/src/lx_80211.c                        |  187 ++-
+ wifi/lx/src/lx_80211.c                        |  214 ++-
  wifi/lx/src/lx_base.c                         |  114 +-
  wifi/lx/src/lx_bus.c                          |    4 +-
  wifi/lx/src/lx_wpa.c                          |   21 +-
@@ -60,6 +60,7 @@ Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
  xnu/files/bsd/dev/redwood_mss.c               | 1191 ++++++++++++++++-
  xnu/files/bsd/dev/redwood_osm.c               |  154 ++-
  xnu/files/bsd/dev/redwood_rpm.c               |   11 +-
+ xnu/files/bsd/dev/redwood_status.c            |   24 +
  xnu/files/bsd/dev/redwood_ufs.c               |    5 +
  xnu/files/bsd/dev/redwood_wifi.c              |  296 +++-
  xnu/files/bsd/sys/redwood_input.h             |    3 +
@@ -72,7 +73,7 @@ Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
  xnu/redwood.patch                             |    9 +-
  xnuloader/build.sh                            |    3 +-
  xnuloader/loader.c                            |  565 +++++++-
- 68 files changed, 6012 insertions(+), 88 deletions(-)
+ 69 files changed, 6063 insertions(+), 88 deletions(-)
  create mode 100755 tools/mk-ath10k.sh
  create mode 100755 wifi/lx/include/linux/acpi.h
  create mode 100755 wifi/lx/include/linux/clk.h
@@ -935,7 +936,7 @@ new mode 100755
 diff --git a/wifi/lx/src/lx_80211.c b/wifi/lx/src/lx_80211.c
 old mode 100644
 new mode 100755
-index ea753f2..81eb912
+index ea753f2..d5bfa78
 --- a/wifi/lx/src/lx_80211.c
 +++ b/wifi/lx/src/lx_80211.c
 @@ -19,7 +19,7 @@
@@ -970,7 +971,7 @@ index ea753f2..81eb912
  /* IEEE 802.11-2020, Annex E: a channel's centre, in MHz */
  uint32_t
  linuxkpi_ieee80211_channel_to_frequency(uint32_t channel, enum nl80211_band band)
-@@ -480,6 +489,78 @@ linuxkpi_ieee80211_handle_wake_tx_queue(struct ieee80211_hw *hw, struct ieee8021
+@@ -480,15 +489,97 @@ linuxkpi_ieee80211_handle_wake_tx_queue(struct ieee80211_hw *hw, struct ieee8021
  {
  }
  
@@ -1049,7 +1050,26 @@ index ea753f2..81eb912
  void
  linuxkpi_ieee80211_tx_status(struct ieee80211_hw *hw, struct sk_buff *skb)
  {
-@@ -564,7 +645,12 @@ heard(struct lx_radio *radio, const uint8_t *frame, unsigned length, unsigned fr
++	extern unsigned lx_tx_status_seen;
++
++	lx_tx_status_seen += IEEE80211_SKB_CB(skb)->flags & IEEE80211_TX_STAT_ACK ? 1 : 0x10000;
+ 	dev_kfree_skb_any(skb);
+ }
++unsigned lx_tx_status_seen;		/* doha: acknowledged (low 16 bits) and not (high), by the other report */
++
++/* doha: the data path's answers counted -- frames the access point acknowledged, and not -- for the panel (net_show()) */
++static unsigned lx_tx_acked, lx_tx_unacked;
+ 
+ void
+ linuxkpi_ieee80211_tx_status_ext(struct ieee80211_hw *hw, struct ieee80211_tx_status *status)
+ {
++	if (status->info != NULL) {
++		*(status->info->flags & IEEE80211_TX_STAT_ACK ? &lx_tx_acked : &lx_tx_unacked) += 1;
++	}
+ 	if (status->skb != NULL) {
+ 		dev_kfree_skb_any(status->skb);
+ 	}
+@@ -564,7 +655,12 @@ heard(struct lx_radio *radio, const uint8_t *frame, unsigned length, unsigned fr
  	lx_os_lock();
  	if (name != NULL && radio->want_length != 0 && name[1] == radio->want_length &&
  	    memcmp(name + 2, radio->want, radio->want_length) == 0 && (!radio->target.found || signal > radio->target.signal) &&
@@ -1063,7 +1083,7 @@ index ea753f2..81eb912
  		radio->target.found = true;
  		memcpy(radio->target.address, frame + 16, ETH_ALEN);
  		radio->target.frequency = (uint16_t)frequency;
-@@ -639,7 +725,7 @@ say_heard(struct lx_radio *radio)
+@@ -639,7 +735,7 @@ say_heard(struct lx_radio *radio)
  
  	for (unsigned n = 0; n < radio->heard_count; n++) {
  		const struct lx_heard *network = NULL;
@@ -1072,7 +1092,7 @@ index ea753f2..81eb912
  		unsigned which = 0, channel;
  		bool wanted;
  
-@@ -666,10 +752,12 @@ say_heard(struct lx_radio *radio)
+@@ -666,10 +762,12 @@ say_heard(struct lx_radio *radio)
  		/* (the network that is wanted is the user's own: its name is not said even here) */
  		wanted = radio->want_length != 0 && network->name_length == radio->want_length &&
  		    memcmp(network->name, radio->want, radio->want_length) == 0;
@@ -1089,7 +1109,7 @@ index ea753f2..81eb912
  	}
  	for (unsigned channel = 0; channel < nitems(on_channel); channel++) {
  		if (on_channel[channel] != 0) {
-@@ -805,9 +893,16 @@ handshake_message(struct lx_radio *radio, const uint8_t *frame, unsigned length)
+@@ -805,9 +903,16 @@ handshake_message(struct lx_radio *radio, const uint8_t *frame, unsigned length)
  		queue_work(radio->work, &radio->group_work);
  	}
  	if (said != LX_WPA_NOTHING) {
@@ -1108,7 +1128,31 @@ index ea753f2..81eb912
  		lx_os_wakeup(&radio->handshake);
  		lx_os_unlock();
  	}
-@@ -1029,6 +1124,17 @@ station_scan(struct lx_radio *radio, const uint8_t *name, unsigned name_length,
+@@ -903,6 +1008,23 @@ linuxkpi_ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb, struct ieee8
+ 	const struct ieee80211_rx_status *status = IEEE80211_SKB_RXCB(skb);
+ 
+ 	radio->frames++;
++	{
++		/* doha: every 2 s while joined, what passes: sent (lost), received for us and for all, acknowledged (not) */
++		static unsigned long long shown;
++		unsigned long long now = lx_os_nanoseconds();
++
++		if (radio->joined && now - shown > 2000000000ull) {
++			char line[64];
++			extern unsigned lx_tx_status_seen;
++			void lx_os_status(const char *text);
++
++			shown = now;
++			snprintf(line, sizeof(line), "net s%u/%u r%u g%u ack%u/%u %u/%u f%u", radio->sent, radio->sent_lost,
++			    radio->received, radio->received_group, lx_tx_acked, lx_tx_unacked, lx_tx_status_seen & 0xffff,
++			    lx_tx_status_seen >> 16, radio->frames);
++			lx_os_status(line);
++		}
++	}
+ 	if (status->flag & RX_FLAG_8023) {
+ 		ethernet_received(radio, skb);
+ 	} else if (skb->len >= 36 && (skb->data[0] == 0x80 || skb->data[0] == 0x50)) {	/* a beacon, an answer to a probe */
+@@ -1029,6 +1151,17 @@ station_scan(struct lx_radio *radio, const uint8_t *name, unsigned name_length,
  		}
  	}
  	if (request->req.n_channels == 0) {
@@ -1126,7 +1170,7 @@ index ea753f2..81eb912
  		kfree(request);
  		return (EINVAL);
  	}
-@@ -1418,12 +1524,24 @@ static void
+@@ -1418,12 +1551,24 @@ static void
  group_rekey(struct work_struct *work)
  {
  	struct lx_radio *radio = __containerof(work, struct lx_radio, group_work);
@@ -1153,7 +1197,7 @@ index ea753f2..81eb912
  	key_drop(radio, &old, false);
  }
  
-@@ -1600,7 +1718,12 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
+@@ -1600,7 +1745,12 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
  	bzero(radio->ba, sizeof(radio->ba));
  	memcpy(radio->want, name, name_length);
  	radio->want_length = (uint8_t)name_length;
@@ -1166,7 +1210,7 @@ index ea753f2..81eb912
  	if ((ret = station_up(radio)) != 0) {
  		return (ret);
  	}
-@@ -1626,6 +1749,10 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
+@@ -1626,6 +1776,10 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
  	for (unsigned attempt = 0; attempt < 3 && !target->found; attempt++) {
  		station_scan(radio, name, name_length, false, NULL);
  	}
@@ -1177,7 +1221,7 @@ index ea753f2..81eb912
  	if (!target->found) {
  		lx_tell("lx: THE NETWORK THAT IS WANTED WAS NOT HEARD (a name of %u bytes), in three scans\n", name_length);
  		return (ENOENT);
-@@ -1685,19 +1812,11 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
+@@ -1685,19 +1839,11 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
  	radio->channel->min_def = radio->channel->def;
  	radio->channel->rx_chains_static = radio->channel->rx_chains_dynamic = 2;
  	vif->bss_conf.chanreq.oper = radio->channel->def;
@@ -1202,7 +1246,7 @@ index ea753f2..81eb912
  	/* the access point as a station of the driver's: the firmware learns of it, and the radio goes to its channel */
  	radio->sta = (struct ieee80211_sta *)roundup2((uintptr_t)radio->sta_memory, 64);
  	memcpy(radio->sta->addr, target->address, ETH_ALEN);
-@@ -1715,6 +1834,20 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
+@@ -1715,6 +1861,20 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
  	}
  	radio->reached = IEEE80211_STA_NONE;
  
@@ -1223,7 +1267,7 @@ index ea753f2..81eb912
  	/* authentication, of the kind that asks nothing ("open system": the passphrase is proved in the handshake) */
  	for (unsigned attempt = 0; attempt < 3 && answer == ANSWER_NONE; attempt++) {
  		radio->answer = ANSWER_NONE;
-@@ -1792,7 +1925,11 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
+@@ -1792,7 +1952,11 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
  	/* the handshake: the access point begins it; its messages come in as frames and are answered where they come in */
  	began = lx_os_nanoseconds();
  	lx_os_lock();
@@ -5677,6 +5721,41 @@ index 7d3bb87..cd09139 100644
  		return;
  	}
  	if (!PE_parse_boot_argn("rpm", &steps, sizeof(steps))) {
+diff --git a/xnu/files/bsd/dev/redwood_status.c b/xnu/files/bsd/dev/redwood_status.c
+index 6bf1d08..3a58b80 100644
+--- a/xnu/files/bsd/dev/redwood_status.c
++++ b/xnu/files/bsd/dev/redwood_status.c
+@@ -12,6 +12,30 @@
+ 
+ #define STATUS_TEXT             56
+ 
++#include <sys/sysctl.h>
++
++/* a line for the panel from user space (net_test hud): kern.redwood_note, written by root, shown on the Keys line */
++static int
++redwood_note_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	char text[STATUS_TEXT + 1];
++	size_t n;
++	int error;
++
++	if (req->newptr == USER_ADDR_NULL) {
++		return 0;
++	}
++	n = req->newlen < STATUS_TEXT ? req->newlen : STATUS_TEXT;
++	if ((error = SYSCTL_IN(req, text, n)) != 0) {
++		return error;
++	}
++	text[n] = 0;
++	redwood_status(REDWOOD_STATUS_KEYS, "%s", text);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, redwood_note, CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_LOCKED, 0, 0, redwood_note_sysctl, "A",
++    "a line for the panel's Keys line");
++
+ /* each core's clock as cpu_speed_probe() measured it as the core came up (osfmk/arm/arm_init.c, cpuprobe=1) */
+ extern uint32_t redwood_cpu_mhz[8];
+ extern unsigned int vm_page_free_count, memorystatus_available_pages;
 diff --git a/xnu/files/bsd/dev/redwood_ufs.c b/xnu/files/bsd/dev/redwood_ufs.c
 index fce766f..952e572 100644
 --- a/xnu/files/bsd/dev/redwood_ufs.c

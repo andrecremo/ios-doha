@@ -564,12 +564,22 @@ const uint8_t rfc1042_header[6] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00 };
 void
 linuxkpi_ieee80211_tx_status(struct ieee80211_hw *hw, struct sk_buff *skb)
 {
+	extern unsigned lx_tx_status_seen;
+
+	lx_tx_status_seen += IEEE80211_SKB_CB(skb)->flags & IEEE80211_TX_STAT_ACK ? 1 : 0x10000;
 	dev_kfree_skb_any(skb);
 }
+unsigned lx_tx_status_seen;		/* doha: acknowledged (low 16 bits) and not (high), by the other report */
+
+/* doha: the data path's answers counted -- frames the access point acknowledged, and not -- for the panel (net_show()) */
+static unsigned lx_tx_acked, lx_tx_unacked;
 
 void
 linuxkpi_ieee80211_tx_status_ext(struct ieee80211_hw *hw, struct ieee80211_tx_status *status)
 {
+	if (status->info != NULL) {
+		*(status->info->flags & IEEE80211_TX_STAT_ACK ? &lx_tx_acked : &lx_tx_unacked) += 1;
+	}
 	if (status->skb != NULL) {
 		dev_kfree_skb_any(status->skb);
 	}
@@ -998,6 +1008,23 @@ linuxkpi_ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb, struct ieee8
 	const struct ieee80211_rx_status *status = IEEE80211_SKB_RXCB(skb);
 
 	radio->frames++;
+	{
+		/* doha: every 2 s while joined, what passes: sent (lost), received for us and for all, acknowledged (not) */
+		static unsigned long long shown;
+		unsigned long long now = lx_os_nanoseconds();
+
+		if (radio->joined && now - shown > 2000000000ull) {
+			char line[64];
+			extern unsigned lx_tx_status_seen;
+			void lx_os_status(const char *text);
+
+			shown = now;
+			snprintf(line, sizeof(line), "net s%u/%u r%u g%u ack%u/%u %u/%u f%u", radio->sent, radio->sent_lost,
+			    radio->received, radio->received_group, lx_tx_acked, lx_tx_unacked, lx_tx_status_seen & 0xffff,
+			    lx_tx_status_seen >> 16, radio->frames);
+			lx_os_status(line);
+		}
+	}
 	if (status->flag & RX_FLAG_8023) {
 		ethernet_received(radio, skb);
 	} else if (skb->len >= 36 && (skb->data[0] == 0x80 || skb->data[0] == 0x50)) {	/* a beacon, an answer to a probe */

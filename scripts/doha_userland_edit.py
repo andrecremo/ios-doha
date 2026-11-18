@@ -303,3 +303,98 @@ elif nb.count(nold) != 1:
 else:
     (tree / 'userland/build.sh').open('w', encoding='utf-8', newline='').write(nb.replace(nold, nnew))
     print("userland/build.sh: doha's network into fw/ (DOHA_NETWORK=1)")
+
+# doha: net_test's results on the panel (kern.redwood_note, the kernel's): "net_test hud STEP..." sends each line of its
+# output to the Keys line, one every 4 s, the last staying; and rc.jobs.dohanet, which tries the network layer by layer
+# (run-ios-flash.sh NETTEST=1)
+nt = tree / 'userland/src/net_test.m'
+n = nt.open(encoding='utf-8', newline='').read()
+hold = """int
+main(int argc, char **argv)
+{
+	setvbuf(stdout, NULL, _IOLBF, 0);
+	@autoreleasepool {"""
+hnew = """/* ---- hud (doha) -------------------------------------------------------------------------------------- */
+
+/* each line of the output onto the panel's Keys line (kern.redwood_note), 4 s apart, the last staying */
+static int hud_pipe = -1;
+static pthread_t hud_thread;
+
+static void *
+hud_forward(__unused void *unused)
+{
+	char line[256];
+	size_t at = 0;
+	char c;
+
+	while (read(hud_pipe, &c, 1) == 1) {
+		if (c != '\\n' && at < sizeof(line) - 1) {
+			line[at++] = c;
+			continue;
+		}
+		if (c != '\\n') {
+			continue;
+		}
+		line[at] = 0;
+		const char *shown = strncmp(line, "net_test: ", 10) == 0 ? line + 10 : line;
+		sysctlbyname("kern.redwood_note", NULL, NULL, (void *)shown, strlen(shown));
+		at = 0;
+		sleep(4);
+	}
+	return NULL;
+}
+
+static void
+hud_start(void)
+{
+	int fds[2];
+
+	if (pipe(fds) != 0) {
+		return;
+	}
+	hud_pipe = fds[0];
+	dup2(fds[1], STDOUT_FILENO);
+	close(fds[1]);
+	pthread_create(&hud_thread, NULL, hud_forward, NULL);
+}
+
+static void
+hud_finish(void)
+{
+	if (hud_pipe < 0) {
+		return;
+	}
+	fflush(stdout);
+	close(STDOUT_FILENO);
+	pthread_join(hud_thread, NULL);
+}
+
+""" + hold
+if 'hud_forward' in n:
+    print('userland/src/net_test.m: has hud already')
+elif n.count(hold) != 1 or n.count('\treturn 0;\n}\n') < 1:
+    raise SystemExit('userland/src/net_test.m: main is not where expected')
+else:
+    n = n.replace(hold, hnew)
+    n = n.replace("""	setvbuf(stdout, NULL, _IOLBF, 0);
+	@autoreleasepool {""", """	setvbuf(stdout, NULL, _IOLBF, 0);
+	if (argc > 1 && strcmp(argv[1], "hud") == 0) {
+		hud_start();
+		argv++;
+		argc--;
+	}
+	@autoreleasepool {""", 1)
+    end = n.rindex('\treturn 0;\n}\n')
+    n = n[:end] + '\thud_finish();\n' + n[end:]
+    if '#include <pthread.h>' not in n:
+        n = n.replace('#include <unistd.h>\n', '#include <unistd.h>\n#include <pthread.h>\n', 1)
+    nt.open('w', encoding='utf-8', newline='').write(n)
+    print('userland/src/net_test.m: hud')
+jobs = tree / 'userland/rc.jobs.dohanet'
+jobs.open('w', encoding='utf-8', newline='\n').write("""# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# doha (RC_JOBS=rc.jobs.dohanet, run-ios-flash.sh NETTEST=1): the lock screen swiped away as rc.jobs.unlock does, then
+# the network tried layer by layer -- the address, a name, TCP, HTTPS, reachability -- each result on the panel's Keys line
+/redwood/bin/rwtouch wait 32 swipe 0.5 0.985 0.5 0.3 250 &
+/redwood/bin/net_test hud waitaddr en0 180 resolve example.com tcp example.com 80 fetch https://example.com/ reach example.com resolve www.apple.com fetch https://www.apple.com/library/test/success.html
+""")
+print('userland/rc.jobs.dohanet: written')
