@@ -5128,3 +5128,59 @@ sub1(MSS, """		if (!taken) {
 				at += wlfw2_u8(tlvs + at, 0x18, 1);     /* cal_filesys_support */
 				at += wlfw2_u8(tlvs + at, 0x1a, 0);     /* cal_done: no -- the firmware asks for it */
 			}""")
+
+# (doha's radio is up; the network of the file was not joined: "(0, 22)", the station's last error EINVAL, its reason said
+# on the Touch line and overwritten at once by the failure's own line. The last "lx: " line said before -- the station's
+# reason -- goes to the Storage line when a join fails)
+sub1(WIFI, """static void
+say_line(const char *line, bool aloud)
+{
+	if (wifi_hud) {""", """static char last_lx[64];              /* the last "lx: " line said, for a failed join's reason */
+
+static void
+say_line(const char *line, bool aloud)
+{
+	if (strncmp(line, "lx: ", 4) == 0 && strnstr(line, "(dbg)", 200) == NULL) {
+		strlcpy(last_lx, line + 4, sizeof(last_lx));
+	}
+	if (wifi_hud) {""")
+sub1(WIFI, """		tell("wifi: THE NETWORK OF THE FILE IS NOT JOINED (%d, %d): the radio waits to be asked. The last of what was said:\\n",
+		    error, state->last_error);""", """		tell("wifi: THE NETWORK OF THE FILE IS NOT JOINED (%d, %d): the radio waits to be asked. The last of what was said:\\n",
+		    error, state->last_error);
+		redwood_status(REDWOOD_STATUS_STORAGE, "join %d: %.48s", state->last_error, last_lx);""")
+
+# (doha's radio joined its network once -- the Wi-Fi bars in iOS's status bar -- and on the next start the WPA2 handshake
+# did not come through in 4 s ("join 80"): one of its first frames lost in the air, which a supplicant simply tries
+# again. The network of the file is now asked for up to three times, 2 s apart (wifi_join_tries=N))
+sub1(WIFI, """	error = redwood_sta_ask_join_standing(&what);
+	bzero(&what, sizeof(what));
+	for (unsigned waited = 0; error == 0 && redwood_sta_busy() && waited < 300; waited++) {
+		sleep_ms(100);
+	}
+	if ((state = kalloc_data(sizeof(*state), Z_WAITOK)) == NULL) {
+		return;
+	}
+	redwood_sta_state(state);""", """	if ((state = kalloc_data(sizeof(*state), Z_WAITOK)) == NULL) {
+		bzero(&what, sizeof(what));
+		return;
+	}
+	{
+		uint32_t tries = 3;
+
+		PE_parse_boot_argn("wifi_join_tries", &tries, sizeof(tries));
+		for (uint32_t attempt = 1; attempt <= (tries ? tries : 1); attempt++) {
+			error = redwood_sta_ask_join_standing(&what);
+			for (unsigned waited = 0; error == 0 && redwood_sta_busy() && waited < 300; waited++) {
+				sleep_ms(100);
+			}
+			redwood_sta_state(state);
+			if (state->phase == REDWOOD_STA_JOINED || attempt == tries) {
+				break;
+			}
+			tell("wifi: the network of the file: try %u of %u did not come through (%d, %d); again in 2 s\\n", attempt, tries,
+			    error, state->last_error);
+			redwood_status(REDWOOD_STATUS_STORAGE, "join try %u: %d %.40s", attempt, state->last_error, last_lx);
+			sleep_ms(2000);
+		}
+	}
+	bzero(&what, sizeof(what));""")

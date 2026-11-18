@@ -1124,6 +1124,17 @@ station_scan(struct lx_radio *radio, const uint8_t *name, unsigned name_length, 
 		}
 	}
 	if (request->req.n_channels == 0) {
+		unsigned all = 0, off = 0;
+
+		for (unsigned band = 0; band < NUM_NL80211_BANDS; band++) {
+			struct ieee80211_supported_band *has = hw->wiphy->bands[band];
+
+			for (int i = 0; has != NULL && i < has->n_channels; i++) {
+				all++;
+				off += (has->channels[i].flags & IEEE80211_CHAN_DISABLED) ? 1 : 0;
+			}
+		}
+		lx_tell("lx: the scan has no channel to listen on: %u channels, %u of them disabled (regulatory?)\n", all, off);
 		kfree(request);
 		return (EINVAL);
 	}
@@ -1801,19 +1812,11 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
 	radio->channel->min_def = radio->channel->def;
 	radio->channel->rx_chains_static = radio->channel->rx_chains_dynamic = 2;
 	vif->bss_conf.chanreq.oper = radio->channel->def;
-	mutex_lock(&hw->wiphy->mtx);
-	ret = radio->ops->add_chanctx(hw, radio->channel);
-	if (ret == 0) {
-		vif->bss_conf.chanctx_conf = radio->channel;
-		ret = radio->ops->assign_vif_chanctx(hw, vif, &vif->bss_conf, radio->channel);
-	}
-	mutex_unlock(&hw->wiphy->mtx);
-	lx_tell("lx: the channel is taken, %u MHz wide around %u MHz: %d\n", radio->width, radio->channel->def.center_freq1, ret);
-	if (ret != 0) {
-		error = -ret;
-		goto out;
-	}
-
+	/*
+	 * doha / ginkgo-mainline-linux (WCN3990, WLAN.HL.3.x): the firmware starts a station's vdev only once it knows the
+	 * access point as a peer -- the other way round every vdev start fails ("the channel is taken: -22"). So the access
+	 * point is made known first, then the channel taken (mac80211 does the opposite)
+	 */
 	/* the access point as a station of the driver's: the firmware learns of it, and the radio goes to its channel */
 	radio->sta = (struct ieee80211_sta *)roundup2((uintptr_t)radio->sta_memory, 64);
 	memcpy(radio->sta->addr, target->address, ETH_ALEN);
@@ -1830,6 +1833,20 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
 		goto out;
 	}
 	radio->reached = IEEE80211_STA_NONE;
+
+	mutex_lock(&hw->wiphy->mtx);
+	ret = radio->ops->add_chanctx(hw, radio->channel);
+	if (ret == 0) {
+		vif->bss_conf.chanctx_conf = radio->channel;
+		ret = radio->ops->assign_vif_chanctx(hw, vif, &vif->bss_conf, radio->channel);
+	}
+	mutex_unlock(&hw->wiphy->mtx);
+	lx_tell("lx: the channel is taken, %u MHz wide around %u MHz: %d\n", radio->width, radio->channel->def.center_freq1, ret);
+	if (ret != 0) {
+		error = -ret;
+		goto out;
+	}
+
 
 	/* authentication, of the kind that asks nothing ("open system": the passphrase is proved in the handshake) */
 	for (unsigned attempt = 0; attempt < 3 && answer == ANSWER_NONE; attempt++) {

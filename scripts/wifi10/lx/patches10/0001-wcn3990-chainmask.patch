@@ -1,0 +1,15 @@
+--- a/ath10k/wmi-tlv.c	2026-11-17 20:41:49.546850948 -0300
++++ b/ath10k/wmi-tlv.c	2026-11-17 20:41:49.570850948 -0300
+@@ -1927,8 +1927,10 @@
+ 		cfg->num_tids = __cpu_to_le32(ar->hw_params.num_peers * 2);
+ 	else
+ 		cfg->num_tids = __cpu_to_le32(TARGET_TLV_NUM_TIDS);
+-	cfg->tx_chain_mask = __cpu_to_le32(0x7);
+-	cfg->rx_chain_mask = __cpu_to_le32(0x7);
++	/* doha / ginkgo (WCN3990 on SM6125, WLAN.HL.3.0.2): one RF chain; a mask of three makes every vdev start fail */
++	cfg->tx_chain_mask = __cpu_to_le32(QCA_REV_WCN3990(ar) && ar->num_rf_chains > 0 && ar->num_rf_chains < 3 ?
++	    (1u << ar->num_rf_chains) - 1 : 0x7);
++	cfg->rx_chain_mask = cfg->tx_chain_mask;
+ 	cfg->rx_timeout_pri[0] = __cpu_to_le32(0x64);
+ 	cfg->rx_timeout_pri[1] = __cpu_to_le32(0x64);
+ 	cfg->rx_timeout_pri[2] = __cpu_to_le32(0x64);

@@ -48,6 +48,16 @@ if [ "$(cat src/.release 2>/dev/null)" != "$VERSION $SHA256" ]; then
 fi
 [ "$1" = fetch ] && { echo "mk-ath10k.sh: ath10k of Linux $VERSION: $B/src/ath10k"; exit 0; }
 W=$ROOT/wifi/lx
+# --- doha's changes to the driver's own files (wifi/lx/patches10/*.patch, paths under src/), each applied once: a patch
+# that reverses cleanly is there already. What a patch changes is newer than its object, and is compiled again
+for p in "$W"/patches10/*.patch; do
+	[ -f "$p" ] || continue
+	if patch -s -R -p1 -d "$B/src" --dry-run < "$p" > /dev/null 2>&1; then
+		continue
+	fi
+	patch -s --no-backup-if-mismatch -p1 -d "$B/src" < "$p" || { echo "mk-ath10k.sh: $p does not apply" >&2; exit 1; }
+	echo "mk-ath10k.sh: $(basename "$p") applied"
+done
 
 # --- FreeBSD's LinuxKPI and the kernel headers under it, with our patches on top. When the patches
 # change, the tree is taken from the archive again (as tools/mk-mesa.sh does with Mesa's).

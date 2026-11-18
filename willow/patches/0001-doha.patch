@@ -1,10 +1,10 @@
-From 3f5f87c4b761f1395df784f52fe4689132b38aee Mon Sep 17 00:00:00 2001
+From f1d762b32eecbe7a65de287387e122e1f4aeea65 Mon Sep 17 00:00:00 2001
 From: andrecremo <andreljsantos@gmail.com>
-Date: Mon, 16 Nov 2026 21:34:26 -0300
+Date: Tue, 17 Nov 2026 21:02:01 -0300
 Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
 
 ---
- tools/mk-ath10k.sh                            |  178 +++
+ tools/mk-ath10k.sh                            |  188 +++
  wifi/lx/include/linux/acpi.h                  |   59 +
  wifi/lx/include/linux/clk.h                   |   21 +
  .../lx/include/linux/firmware/qcom/qcom_scm.h |   28 +
@@ -41,8 +41,9 @@ Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
  wifi/lx/patches/include-linux-socket.h.patch  |    0
  wifi/lx/patches/include-net-cfg80211.h.patch  |    0
  wifi/lx/patches/include-net-mac80211.h.patch  |    0
+ .../lx/patches10/0001-wcn3990-chainmask.patch |   15 +
  wifi/lx/src/lx.h                              |    0
- wifi/lx/src/lx_80211.c                        |  144 +-
+ wifi/lx/src/lx_80211.c                        |  187 ++-
  wifi/lx/src/lx_base.c                         |  114 +-
  wifi/lx/src/lx_bus.c                          |    4 +-
  wifi/lx/src/lx_wpa.c                          |   21 +-
@@ -60,7 +61,7 @@ Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
  xnu/files/bsd/dev/redwood_osm.c               |  154 ++-
  xnu/files/bsd/dev/redwood_rpm.c               |   11 +-
  xnu/files/bsd/dev/redwood_ufs.c               |    5 +
- xnu/files/bsd/dev/redwood_wifi.c              |  263 +++-
+ xnu/files/bsd/dev/redwood_wifi.c              |  296 +++-
  xnu/files/bsd/sys/redwood_input.h             |    3 +
  xnu/files/bsd/sys/redwood_lx.h                |    6 +
  .../iokit/Kernel/MiniIOMobileFramebuffer.cpp  |  440 +++++-
@@ -71,7 +72,7 @@ Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
  xnu/redwood.patch                             |    9 +-
  xnuloader/build.sh                            |    3 +-
  xnuloader/loader.c                            |  565 +++++++-
- 67 files changed, 5930 insertions(+), 69 deletions(-)
+ 68 files changed, 6012 insertions(+), 88 deletions(-)
  create mode 100755 tools/mk-ath10k.sh
  create mode 100755 wifi/lx/include/linux/acpi.h
  create mode 100755 wifi/lx/include/linux/clk.h
@@ -109,6 +110,7 @@ Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
  mode change 100644 => 100755 wifi/lx/patches/include-linux-socket.h.patch
  mode change 100644 => 100755 wifi/lx/patches/include-net-cfg80211.h.patch
  mode change 100644 => 100755 wifi/lx/patches/include-net-mac80211.h.patch
+ create mode 100755 wifi/lx/patches10/0001-wcn3990-chainmask.patch
  mode change 100644 => 100755 wifi/lx/src/lx.h
  mode change 100644 => 100755 wifi/lx/src/lx_80211.c
  mode change 100644 => 100755 wifi/lx/src/lx_base.c
@@ -120,10 +122,10 @@ Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
 
 diff --git a/tools/mk-ath10k.sh b/tools/mk-ath10k.sh
 new file mode 100755
-index 0000000..88bee6b
+index 0000000..6dfe811
 --- /dev/null
 +++ b/tools/mk-ath10k.sh
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,188 @@
 +#!/bin/bash
 +# Build the driver of miatoll's Wi-Fi radio for our kernel: ath10k, Qualcomm's driver for the WCN3990 (the
 +# Redmi Note 9S's radio, run by firmware in the modem), as it is in Linux, unmodified, on the same layer as the
@@ -174,6 +176,16 @@ index 0000000..88bee6b
 +fi
 +[ "$1" = fetch ] && { echo "mk-ath10k.sh: ath10k of Linux $VERSION: $B/src/ath10k"; exit 0; }
 +W=$ROOT/wifi/lx
++# --- doha's changes to the driver's own files (wifi/lx/patches10/*.patch, paths under src/), each applied once: a patch
++# that reverses cleanly is there already. What a patch changes is newer than its object, and is compiled again
++for p in "$W"/patches10/*.patch; do
++	[ -f "$p" ] || continue
++	if patch -s -R -p1 -d "$B/src" --dry-run < "$p" > /dev/null 2>&1; then
++		continue
++	fi
++	patch -s --no-backup-if-mismatch -p1 -d "$B/src" < "$p" || { echo "mk-ath10k.sh: $p does not apply" >&2; exit 1; }
++	echo "mk-ath10k.sh: $(basename "$p") applied"
++done
 +
 +# --- FreeBSD's LinuxKPI and the kernel headers under it, with our patches on top. When the patches
 +# change, the tree is taken from the archive again (as tools/mk-mesa.sh does with Mesa's).
@@ -896,13 +908,34 @@ new mode 100755
 diff --git a/wifi/lx/patches/include-net-mac80211.h.patch b/wifi/lx/patches/include-net-mac80211.h.patch
 old mode 100644
 new mode 100755
+diff --git a/wifi/lx/patches10/0001-wcn3990-chainmask.patch b/wifi/lx/patches10/0001-wcn3990-chainmask.patch
+new file mode 100755
+index 0000000..8448a72
+--- /dev/null
++++ b/wifi/lx/patches10/0001-wcn3990-chainmask.patch
+@@ -0,0 +1,15 @@
++--- a/ath10k/wmi-tlv.c	2026-11-17 20:41:49.546850948 -0300
+++++ b/ath10k/wmi-tlv.c	2026-11-17 20:41:49.570850948 -0300
++@@ -1927,8 +1927,10 @@
++ 		cfg->num_tids = __cpu_to_le32(ar->hw_params.num_peers * 2);
++ 	else
++ 		cfg->num_tids = __cpu_to_le32(TARGET_TLV_NUM_TIDS);
++-	cfg->tx_chain_mask = __cpu_to_le32(0x7);
++-	cfg->rx_chain_mask = __cpu_to_le32(0x7);
+++	/* doha / ginkgo (WCN3990 on SM6125, WLAN.HL.3.0.2): one RF chain; a mask of three makes every vdev start fail */
+++	cfg->tx_chain_mask = __cpu_to_le32(QCA_REV_WCN3990(ar) && ar->num_rf_chains > 0 && ar->num_rf_chains < 3 ?
+++	    (1u << ar->num_rf_chains) - 1 : 0x7);
+++	cfg->rx_chain_mask = cfg->tx_chain_mask;
++ 	cfg->rx_timeout_pri[0] = __cpu_to_le32(0x64);
++ 	cfg->rx_timeout_pri[1] = __cpu_to_le32(0x64);
++ 	cfg->rx_timeout_pri[2] = __cpu_to_le32(0x64);
 diff --git a/wifi/lx/src/lx.h b/wifi/lx/src/lx.h
 old mode 100644
 new mode 100755
 diff --git a/wifi/lx/src/lx_80211.c b/wifi/lx/src/lx_80211.c
 old mode 100644
 new mode 100755
-index ea753f2..e580eba
+index ea753f2..81eb912
 --- a/wifi/lx/src/lx_80211.c
 +++ b/wifi/lx/src/lx_80211.c
 @@ -19,7 +19,7 @@
@@ -1075,7 +1108,25 @@ index ea753f2..e580eba
  		lx_os_wakeup(&radio->handshake);
  		lx_os_unlock();
  	}
-@@ -1418,12 +1513,24 @@ static void
+@@ -1029,6 +1124,17 @@ station_scan(struct lx_radio *radio, const uint8_t *name, unsigned name_length,
+ 		}
+ 	}
+ 	if (request->req.n_channels == 0) {
++		unsigned all = 0, off = 0;
++
++		for (unsigned band = 0; band < NUM_NL80211_BANDS; band++) {
++			struct ieee80211_supported_band *has = hw->wiphy->bands[band];
++
++			for (int i = 0; has != NULL && i < has->n_channels; i++) {
++				all++;
++				off += (has->channels[i].flags & IEEE80211_CHAN_DISABLED) ? 1 : 0;
++			}
++		}
++		lx_tell("lx: the scan has no channel to listen on: %u channels, %u of them disabled (regulatory?)\n", all, off);
+ 		kfree(request);
+ 		return (EINVAL);
+ 	}
+@@ -1418,12 +1524,24 @@ static void
  group_rekey(struct work_struct *work)
  {
  	struct lx_radio *radio = __containerof(work, struct lx_radio, group_work);
@@ -1102,7 +1153,7 @@ index ea753f2..e580eba
  	key_drop(radio, &old, false);
  }
  
-@@ -1600,7 +1707,12 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
+@@ -1600,7 +1718,12 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
  	bzero(radio->ba, sizeof(radio->ba));
  	memcpy(radio->want, name, name_length);
  	radio->want_length = (uint8_t)name_length;
@@ -1115,7 +1166,7 @@ index ea753f2..e580eba
  	if ((ret = station_up(radio)) != 0) {
  		return (ret);
  	}
-@@ -1626,6 +1738,10 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
+@@ -1626,6 +1749,10 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
  	for (unsigned attempt = 0; attempt < 3 && !target->found; attempt++) {
  		station_scan(radio, name, name_length, false, NULL);
  	}
@@ -1126,7 +1177,53 @@ index ea753f2..e580eba
  	if (!target->found) {
  		lx_tell("lx: THE NETWORK THAT IS WANTED WAS NOT HEARD (a name of %u bytes), in three scans\n", name_length);
  		return (ENOENT);
-@@ -1792,7 +1908,11 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
+@@ -1685,19 +1812,11 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
+ 	radio->channel->min_def = radio->channel->def;
+ 	radio->channel->rx_chains_static = radio->channel->rx_chains_dynamic = 2;
+ 	vif->bss_conf.chanreq.oper = radio->channel->def;
+-	mutex_lock(&hw->wiphy->mtx);
+-	ret = radio->ops->add_chanctx(hw, radio->channel);
+-	if (ret == 0) {
+-		vif->bss_conf.chanctx_conf = radio->channel;
+-		ret = radio->ops->assign_vif_chanctx(hw, vif, &vif->bss_conf, radio->channel);
+-	}
+-	mutex_unlock(&hw->wiphy->mtx);
+-	lx_tell("lx: the channel is taken, %u MHz wide around %u MHz: %d\n", radio->width, radio->channel->def.center_freq1, ret);
+-	if (ret != 0) {
+-		error = -ret;
+-		goto out;
+-	}
+-
++	/*
++	 * doha / ginkgo-mainline-linux (WCN3990, WLAN.HL.3.x): the firmware starts a station's vdev only once it knows the
++	 * access point as a peer -- the other way round every vdev start fails ("the channel is taken: -22"). So the access
++	 * point is made known first, then the channel taken (mac80211 does the opposite)
++	 */
+ 	/* the access point as a station of the driver's: the firmware learns of it, and the radio goes to its channel */
+ 	radio->sta = (struct ieee80211_sta *)roundup2((uintptr_t)radio->sta_memory, 64);
+ 	memcpy(radio->sta->addr, target->address, ETH_ALEN);
+@@ -1715,6 +1834,20 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
+ 	}
+ 	radio->reached = IEEE80211_STA_NONE;
+ 
++	mutex_lock(&hw->wiphy->mtx);
++	ret = radio->ops->add_chanctx(hw, radio->channel);
++	if (ret == 0) {
++		vif->bss_conf.chanctx_conf = radio->channel;
++		ret = radio->ops->assign_vif_chanctx(hw, vif, &vif->bss_conf, radio->channel);
++	}
++	mutex_unlock(&hw->wiphy->mtx);
++	lx_tell("lx: the channel is taken, %u MHz wide around %u MHz: %d\n", radio->width, radio->channel->def.center_freq1, ret);
++	if (ret != 0) {
++		error = -ret;
++		goto out;
++	}
++
++
+ 	/* authentication, of the kind that asks nothing ("open system": the passphrase is proved in the handshake) */
+ 	for (unsigned attempt = 0; attempt < 3 && answer == ANSWER_NONE; attempt++) {
+ 		radio->answer = ANSWER_NONE;
+@@ -1792,7 +1925,11 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
  	/* the handshake: the access point begins it; its messages come in as frames and are answered where they come in */
  	began = lx_os_nanoseconds();
  	lx_os_lock();
@@ -5597,10 +5694,10 @@ index fce766f..952e572 100644
  static uint64_t ufs_write_first = UFS_WRITE_FIRST;      /* the store's of this run, in blocks of 4096 */
  static bool ufs_write_fs;                               /* the store of this run is the data store */
 diff --git a/xnu/files/bsd/dev/redwood_wifi.c b/xnu/files/bsd/dev/redwood_wifi.c
-index c7751c1..5818a9a 100644
+index c7751c1..7a21365 100644
 --- a/xnu/files/bsd/dev/redwood_wifi.c
 +++ b/xnu/files/bsd/dev/redwood_wifi.c
-@@ -215,9 +215,59 @@ static char kept[64 * 1024];
+@@ -215,9 +215,64 @@ static char kept[64 * 1024];
  static uint32_t kept_at;
  static bool kept_wrapped;
  
@@ -5643,9 +5740,14 @@ index c7751c1..5818a9a 100644
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +}
 +
++static char last_lx[64];              /* the last "lx: " line said, for a failed join's reason */
++
  static void
  say_line(const char *line, bool aloud)
  {
++	if (strncmp(line, "lx: ", 4) == 0 && strnstr(line, "(dbg)", 200) == NULL) {
++		strlcpy(last_lx, line + 4, sizeof(last_lx));
++	}
 +	if (wifi_hud) {
 +		size_t n = strlen(line);
 +		char shown[60];
@@ -5660,7 +5762,7 @@ index c7751c1..5818a9a 100644
  	if (leaving) {
  		for (const char *c = line; *c != 0; c++) {
  			loader_log_putc(*c);
-@@ -225,6 +275,7 @@ say_line(const char *line, bool aloud)
+@@ -225,6 +280,7 @@ say_line(const char *line, bool aloud)
  		return;
  	}
  	lck_mtx_lock(&say_lock);
@@ -5668,7 +5770,7 @@ index c7751c1..5818a9a 100644
  	if (quiet && !aloud) {
  		for (const char *c = line; *c != 0; c++) {
  			kept[kept_at] = *c;
-@@ -280,6 +331,7 @@ redwood_wifi_tell(const char *format, ...)
+@@ -280,6 +336,7 @@ redwood_wifi_tell(const char *format, ...)
  	va_start(list, format);
  	vsnprintf(line, sizeof(line), format, list);
  	va_end(list);
@@ -5676,7 +5778,7 @@ index c7751c1..5818a9a 100644
  	say_line(line, true);
  	return 0;
  }
-@@ -3534,15 +3586,17 @@ step_qrtr(void)
+@@ -3534,15 +3591,17 @@ step_qrtr(void)
   * registers -- the ones the hypervisor answers for, see redwood_adreno.c -- and says which of
   * its stream match registers cover that stream. Nothing is written.
   */
@@ -5696,7 +5798,7 @@ index c7751c1..5818a9a 100644
  
  static void
  smmu_look(void)
-@@ -3732,7 +3786,7 @@ radio_space_find(void)
+@@ -3732,7 +3791,7 @@ radio_space_find(void)
  	}
  	radio_space.page = idr1 >> 31 ? 0x10000 : 0x1000;
  	radio_space.pages = 2u << (idr1 >> 28 & 7);
@@ -5705,7 +5807,7 @@ index c7751c1..5818a9a 100644
  		printf("wifi: %u: the SMMU says it has 2 x %u pages of %#x bytes, which is not the megabyte the device tree gives "
  		    "it: its contexts are not looked for\n", step, radio_space.pages, radio_space.page);
  		return false;
-@@ -3814,7 +3868,12 @@ radio_space_on(void)
+@@ -3814,7 +3873,12 @@ radio_space_on(void)
  	sleep_ms(pause_ms);
  	put(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR, 0);
  	put(&apps_smmu_second, "cba2r", SMMU_CBA2R(radio_space.context), SMMU_CBA2R_64_BIT);
@@ -5719,7 +5821,7 @@ index c7751c1..5818a9a 100644
  	put(&apps_smmu_context, "tcr2", SMMU_CB_TCR2, SMMU_TCR2);
  	put(&apps_smmu_context, "tcr", SMMU_CB_TCR, SMMU_TCR_39_BITS);
  	put(&apps_smmu_context, "ttbr0, low", SMMU_CB_TTBR0, (uint32_t)root);
-@@ -3882,6 +3941,12 @@ radio_space_off(void)
+@@ -3882,6 +3946,12 @@ radio_space_off(void)
  static bool
  radio_map(uint64_t physical, uint64_t size, uint64_t attributes, unsigned long long *address)
  {
@@ -5732,7 +5834,7 @@ index c7751c1..5818a9a 100644
  	size = (size + 4095) & ~4095ull;
  	if (radio_space.next + size > RADIO_ADDRESSES_SIZE) {
  		return false;
-@@ -3970,6 +4035,9 @@ radio_space_try(void)
+@@ -3970,6 +4040,9 @@ radio_space_try(void)
  bool
  redwood_wifi_dsp_is_up(void)
  {
@@ -5742,7 +5844,7 @@ index c7751c1..5818a9a 100644
  	printf("wifi: %u: the driver asks for the firmware's processor: it %s\n", step, dsp_started && glink.open ? "has been up "
  	    "since step 11, with the link of step 13" : "IS NOT UP");
  	return dsp_started && glink.open;
-@@ -3986,8 +4054,30 @@ const uint8_t *
+@@ -3986,8 +4059,30 @@ const uint8_t *
  redwood_wifi_driver_file(const char *name, uint64_t *size)
  {
  	static const char *const files[][2] = { { "board.bin", "bd_m20gl.elf" }, { "regdb.bin", "regdb_xiaomi.bin" } };
@@ -5773,7 +5875,7 @@ index c7751c1..5818a9a 100644
  	last = last == NULL ? name : last + 1;
  	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
  		if (strcmp(last, files[i][0]) == 0) {
-@@ -4013,6 +4103,14 @@ redwood_wifi_radio_address(uint8_t *address)
+@@ -4013,6 +4108,14 @@ redwood_wifi_radio_address(uint8_t *address)
  	bool good;
  
  	if (!PE_parse_boot_arg_str("wifi_mac", text, sizeof(text)) || text[0] == 0) {
@@ -5788,7 +5890,51 @@ index c7751c1..5818a9a 100644
  		printf("wifi: %u: the driver asks for the radio's address: none was given (wifi_mac)\n", step);
  		return false;
  	}
-@@ -4259,12 +4357,140 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
+@@ -4191,21 +4294,37 @@ join_given(uint64_t began)
+ 	what.ssid_length = (uint8_t)name_length;
+ 	what.passphrase_length = (uint8_t)passphrase_length;
+ 	what.security = REDWOOD_STA_WPA2_PSK;
+-	error = redwood_sta_ask_join_standing(&what);
+-	bzero(&what, sizeof(what));
+-	for (unsigned waited = 0; error == 0 && redwood_sta_busy() && waited < 300; waited++) {
+-		sleep_ms(100);
+-	}
+ 	if ((state = kalloc_data(sizeof(*state), Z_WAITOK)) == NULL) {
++		bzero(&what, sizeof(what));
+ 		return;
+ 	}
+-	redwood_sta_state(state);
++	{
++		uint32_t tries = 3;
++
++		PE_parse_boot_argn("wifi_join_tries", &tries, sizeof(tries));
++		for (uint32_t attempt = 1; attempt <= (tries ? tries : 1); attempt++) {
++			error = redwood_sta_ask_join_standing(&what);
++			for (unsigned waited = 0; error == 0 && redwood_sta_busy() && waited < 300; waited++) {
++				sleep_ms(100);
++			}
++			redwood_sta_state(state);
++			if (state->phase == REDWOOD_STA_JOINED || attempt == tries) {
++				break;
++			}
++			tell("wifi: the network of the file: try %u of %u did not come through (%d, %d); again in 2 s\n", attempt, tries,
++			    error, state->last_error);
++			redwood_status(REDWOOD_STATUS_STORAGE, "join try %u: %d %.40s", attempt, state->last_error, last_lx);
++			sleep_ms(2000);
++		}
++	}
++	bzero(&what, sizeof(what));
+ 	if (state->phase == REDWOOD_STA_JOINED) {
+ 		tell("wifi: THE NETWORK OF THE FILE IS JOINED, %llu.%llu s after the kernel began on the radio\n", (now_us() - began) /
+ 		    1000000, (now_us() - began) / 100000 % 10);
+ 	} else {
+ 		tell("wifi: THE NETWORK OF THE FILE IS NOT JOINED (%d, %d): the radio waits to be asked. The last of what was said:\n",
+ 		    error, state->last_error);
++		redwood_status(REDWOOD_STATUS_STORAGE, "join %d: %.48s", state->last_error, last_lx);
+ 		say_kept();
+ 	}
+ 	kfree_data(state, sizeof(*state));
+@@ -4259,12 +4378,140 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
   * Called while the system starts, before there is a root file system. With wifi_step=N the start
   * waits until the steps are over (see redwood_adreno_init()); with wifi=1 it does not.
   */
@@ -5929,7 +6075,7 @@ index c7751c1..5818a9a 100644
  
  	PE_parse_boot_argn("wifi_step", &last_step, sizeof(last_step));
  	if (last_step == 0 && (!PE_parse_boot_argn("wifi", &on, sizeof(on)) || on == 0)) {
-@@ -4274,6 +4500,35 @@ redwood_wifi_init(void)
+@@ -4274,6 +4521,35 @@ redwood_wifi_init(void)
  		printf("wifi: wifi=%u is not understood: wifi=1 turns the radio on, wifi_step=N goes the first N steps of that\n", on);
  		return;
  	}
