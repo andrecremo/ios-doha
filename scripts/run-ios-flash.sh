@@ -95,6 +95,9 @@ if [ "${NETWORK:-0}" = 1 ]; then
 fi
 # NETTEST=1: the job of the demo is rc.jobs.dohanet -- the network tried layer by layer, each result on the panel
 [ "${NETTEST:-0}" = 1 ] && DOHA_RC_JOBS=rc.jobs.dohanet && echo "NETTEST=1: net_test's results on the panel's Keys line"
+[ "${METALTEST:-0}" = 2 ] && DOHA_RC_JOBS=rc.jobs.dohamv && echo "METALTEST=2: Metal on Vulkan (m2v_test) on the panel and TCP port 7000"
+# METALTEST=1: the job is rc.jobs.dohametal -- hakios-metal's probe on the GPU, its results on the panel
+[ "${METALTEST:-0}" = 1 ] && DOHA_RC_JOBS=rc.jobs.dohametal && echo "METALTEST=1: hakios-metal's probe on the panel's Keys line"
 FLASHBOOT=1 CRYPTEXES=flash REST=1 RC_JOBS=${DOHA_RC_JOBS:-rc.jobs.unlock} SHARE=1 bash userland/build.sh > ~/doha-xnu/ios-flash-build.log 2>&1 ||
 	{ tail -n 20 ~/doha-xnu/ios-flash-build.log; echo "build.sh failed: see ~/doha-xnu/ios-flash-build.log"; exit 1; }
 grep -E 'flashboot.apfs|root.apfs:' ~/doha-xnu/ios-flash-build.log | tail -3

@@ -1,6 +1,6 @@
-From 5acd153accfd77c3076482445a66245d3de7d1e8 Mon Sep 17 00:00:00 2001
+From 60c77d65de5ab654900d89537d68808790207fa4 Mon Sep 17 00:00:00 2001
 From: andrecremo <andreljsantos@gmail.com>
-Date: Tue, 17 Nov 2026 21:29:59 -0300
+Date: Wed, 18 Nov 2026 11:27:51 -0300
 Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
 
 ---
@@ -68,12 +68,12 @@ Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
  .../iokit/Kernel/MiniIOMobileFramebuffer.cpp  |  440 +++++-
  xnu/files/iokit/Kernel/MiniIOSurface.cpp      |   31 +
  xnu/files/iokit/Kernel/MiniIOSurface.h        |    2 +
- xnu/files/iokit/Kernel/RedwoodGPU.cpp         |   41 +-
+ xnu/files/iokit/Kernel/RedwoodGPU.cpp         |  154 ++-
  xnu/files/osfmk/arm64/gic_v3_irq.c            |   12 +-
  xnu/redwood.patch                             |    9 +-
  xnuloader/build.sh                            |    3 +-
  xnuloader/loader.c                            |  565 +++++++-
- 69 files changed, 6063 insertions(+), 88 deletions(-)
+ 69 files changed, 6175 insertions(+), 89 deletions(-)
  create mode 100755 tools/mk-ath10k.sh
  create mode 100755 wifi/lx/include/linux/acpi.h
  create mode 100755 wifi/lx/include/linux/clk.h
@@ -6822,7 +6822,7 @@ index 79216b3..f2aa6df 100644
  mach_port_name_t MiniIOSurfaceMakeSendRight(task_t task, MiniIOSurface * surface);
  
 diff --git a/xnu/files/iokit/Kernel/RedwoodGPU.cpp b/xnu/files/iokit/Kernel/RedwoodGPU.cpp
-index 851cf43..bf3783f 100644
+index 851cf43..985c99d 100644
 --- a/xnu/files/iokit/Kernel/RedwoodGPU.cpp
 +++ b/xnu/files/iokit/Kernel/RedwoodGPU.cpp
 @@ -65,6 +65,8 @@ extern uint32_t gpu_log;
@@ -6834,7 +6834,27 @@ index 851cf43..bf3783f 100644
  void redwood_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
  void redwood_gpu_report(const char * why);
  bool redwood_gpu_recover(void);
-@@ -229,6 +231,9 @@ static struct {
+@@ -90,6 +92,7 @@ enum {
+ 	kMsmSubmitQueueNew      = 0x4a,
+ 	kMsmSubmitQueueClose    = 0x4b,
+ 	kMsmSubmitQueueQuery    = 0x4c,
++	kRedwoodUserMemory      = 0x7c,         /* ours: pages of the caller's own as a buffer (Linux's userptr; hakios's 0x7d) */
+ 	kRedwoodGPUWorked       = 0x7d,         /* ours: how long the 3D core itself has worked, and on how many */
+ 	kRedwoodSurface         = 0x7e,         /* ours: an IOSurface's memory as a buffer */
+ 	kRedwoodShow            = 0x7f,         /* ours: pixels of the caller's onto the panel, to see a test's result */
+@@ -150,6 +153,11 @@ struct msm_submitqueue_query {
+ struct drm_gem_close {
+ 	uint32_t handle, pad;
+ };
++struct redwood_user_memory {
++	uint64_t address, size;                 /* in the caller, in whole pages */
++	uint32_t handle;                        /* back: the buffer */
++	uint32_t flags;
++};
+ struct redwood_surface {
+ 	uint32_t surface;                       /* the IOSurface's ID */
+ 	uint32_t handle;                        /* kRedwoodDescribe: no buffer is wanted; else, back: the buffer, */
+@@ -229,6 +237,9 @@ static struct {
  	uint64_t prepWaiting;                   /* ... and the time those waited */
  	uint64_t making;                        /* ... and the time it took to make the others */
  } gGPUStat;
@@ -6844,7 +6864,7 @@ index 851cf43..bf3783f 100644
  
  /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
  static bool
-@@ -295,12 +300,16 @@ MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
+@@ -295,12 +306,16 @@ MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
  		gAnnounced.waited++;
  		gAnnounced.late += surface->delivered != surface->announced;
  		gAnnounced.waiting += mach_absolute_time() - began;
@@ -6861,7 +6881,7 @@ index 851cf43..bf3783f 100644
  		IOLockUnlock(gGPULock);
  	}
  	return done;
-@@ -534,7 +543,16 @@ RedwoodGPUBlitToPanel(MiniIOSurface * s, uint32_t sx, uint32_t sy, uint32_t w, u
+@@ -534,7 +549,16 @@ RedwoodGPUBlitToPanel(MiniIOSurface * s, uint32_t sx, uint32_t sy, uint32_t w, u
  	blitEvent(words, &n, 0x1d);                                                     /* the colour cache out to memory */
  	redwood_gpu_to_memory(words, n * 4);
  	fence = redwood_gpu_submit(&gBlitCommandsAt, &n, 1);
@@ -6879,7 +6899,159 @@ index 851cf43..bf3783f 100644
  	IOLockUnlock(gGPULock);
  	if (!done && gBlitSaid++ < 4) {
  		IOLog("RedwoodGPU: a frame onto the panel by the GPU did not finish (submission %u)\n", fence);
-@@ -1381,6 +1399,26 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+@@ -667,6 +691,8 @@ struct gpu_buffer {
+ 	bool                            seen;           /* by the program: mapped, and from then on written by it */
+ 	uint32_t                        gpuBumps;       /* the surface's gpuBumps when it was last pushed */
+ 	uint32_t                        fence;          /* the last submission that names it (0: none has) */
++	bool                            user;           /* pages of the program's own (kRedwoodUserMemory) */
++	IOMemoryMap *                   userMap;        /* ... and the kernel's mapping of them, for the cache */
+ };
+ 
+ /*
+@@ -733,6 +759,7 @@ class RedwoodGPUUserClient : public IOUserClient
+ 	void reap(void);
+ 	IOReturn gemNew(struct msm_gem_new * request);
+ 	IOReturn surfaceBuffer(struct redwood_surface * request);
++	IOReturn userBuffer(struct redwood_user_memory * request);
+ 	IOReturn gemInfo(struct msm_gem_info * request);
+ 	IOReturn submit(struct msm_gem_submit * request);
+ 	IOReturn show(const struct redwood_show * request);
+@@ -779,6 +806,12 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ {
+ 	bool busy = redwood_gpu_ready() && b->fence != 0 && !redwood_gpu_done(b->fence);
+ 
++	if (b->userMap != NULL) {                       /* (the kernel's view of a program's pages: not needed any more) */
++		b->userMap->release();
++		b->userMap = NULL;
++		b->kernel = NULL;
++	}
++
+ 	if (busy && fLeftCount == GPU_LEFT) {
+ 		busy = !gpuWait(b->fence, 1000);        /* (nowhere to keep it: this one is waited for) */
+ 	}
+@@ -803,7 +836,7 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ 			if (said++ < 8) {
+ 				IOLog("RedwoodGPU: the GPU is not done with what it was given: a buffer of %llu bytes stays its own\n", b->size);
+ 			}
+-		} else if (b->surface == NULL && redwood_gpu_ready() && keep(b->memory, b->kernel, b->address, b->size, b->flags)) {
++		} else if (b->surface == NULL && !b->user && redwood_gpu_ready() && keep(b->memory, b->kernel, b->address, b->size, b->flags)) {
+ 			b->memory = NULL;               /* (now the kept one's) */
+ 		} else if (redwood_gpu_ready()) {
+ 			redwood_gpu_unmap(b->address, b->size);
+@@ -946,6 +979,8 @@ RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint
+ 	b->seen = false;
+ 	b->fence = 0;
+ 	b->surface = NULL;
++	b->user = false;
++	b->userMap = NULL;
+ 	fBufferCount++;
+ 	fBufferBytes += size;
+ 	return b;
+@@ -1155,6 +1190,89 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * Pages of the client's own as a buffer, as Linux's userptr (hakios's HakiosGPU userBuffer()): wired for as long as the
++ * buffer is there, entered into the GPU's address space, mapped into the kernel for the cache, and pushed out of this
++ * processor's cache at every submission that names them. Vulkan's VK_EXT_external_memory_host over it (Turnip, through
++ * hakios-drm): Metal's no-copy buffers, CoreAnimation's backing stores.
++ */
++IOReturn
++RedwoodGPUUserClient::userBuffer(struct redwood_user_memory * request)
++{
++	IOMemoryDescriptor * memory = NULL;
++	IOMemoryMap * map = NULL;
++	struct gpu_buffer * b;
++	IOReturn prepared = kIOReturnNoMemory;
++	uint64_t began = mach_absolute_time();
++
++	if ((request->address & PAGE_MASK) || (request->size & PAGE_MASK) || request->size == 0 || request->size > GPU_BUFFER_MAX) {
++		static uint32_t said;
++
++		if (said++ < 8) {
++			IOLog("RedwoodGPU: pages at %#llx (%llu bytes) of the client: not whole pages of %u bytes\n",
++			    request->address, request->size, (unsigned) PAGE_SIZE);
++		}
++		return kIOReturnBadArgument;
++	}
++	/* pages the client may only read (a window server's view of another program's backing store): the GPU reads them only */
++	for (int pass = 0; pass < 2 && prepared != kIOReturnSuccess; pass++) {
++		memory = IOMemoryDescriptor::withAddressRange(request->address, request->size,
++		    pass == 0 ? kIODirectionInOut : kIODirectionOut, fTask);
++		if (memory == NULL) {
++			return kIOReturnNoMemory;
++		}
++		prepared = memory->prepare();
++		if (prepared != kIOReturnSuccess) {
++			memory->release();
++			memory = NULL;
++		} else if (pass == 1) {
++			request->flags |= MSM_BO_GPU_READONLY;
++		}
++	}
++	if (memory == NULL) {
++		static uint32_t said;
++
++		if (said++ < 8) {
++			IOLog("RedwoodGPU: pages at %#llx (%llu bytes) of the client cannot be wired: %#x\n", request->address,
++			    request->size, prepared);
++		}
++		return kIOReturnVMError;
++	}
++	map = memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere);
++	if (map == NULL) {
++		memory->complete();
++		memory->release();
++		IOLog("RedwoodGPU: pages at %#llx (%llu bytes) of the client: no mapping of them in the kernel\n",
++		    request->address, request->size);
++		return kIOReturnNoMemory;
++	}
++	IOLockLock(gGPULock);
++	b = newBuffer(memory, 0, request->size, request->flags, &request->handle);
++	if (b != NULL) {
++		b->memory = memory;             /* (its pages unwired as it goes: IOGeneralMemoryDescriptor::free) */
++		b->kernel = (uint8_t *) map->getVirtualAddress();
++		b->userMap = map;
++		b->user = true;
++		b->seen = true;
++		gGPUStat.surfaces++;
++	}
++	gGPUStat.taking += mach_absolute_time() - began;
++	IOLockUnlock(gGPULock);
++	if (b == NULL) {
++		static uint32_t said;
++
++		if (said++ < 8) {
++			IOLog("RedwoodGPU: pages at %#llx (%llu bytes) of the client: no room for them in the GPU\n",
++			    request->address, request->size);
++		}
++		map->release();
++		memory->complete();
++		memory->release();
++		return kIOReturnNoMemory;
++	}
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ RedwoodGPUUserClient::gemInfo(struct msm_gem_info * request)
+ {
+@@ -1246,6 +1364,13 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		if (b == NULL) {
+ 			continue;
+ 		}
++		if (b->user) {                          /* a program's own pages: ordinary memory, written as it pleases */
++			if (b->kernel != NULL) {
++				redwood_gpu_to_memory(b->kernel, b->size);
++				gGPUStat.flushed += b->size;
++			}
++			continue;
++		}
+ 		if (b->surface != NULL) {
+ 			uint32_t seed = b->surface->shared()->seed, gpuBumps = b->surface->gpuBumps;
+ 			bool drawn = b->surface->drawn != 0 && !gGPUPushAll;
+@@ -1381,6 +1506,26 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
  			bzero(&gAnnounced, sizeof(gAnnounced));
  		}
  		absolutetime_to_nanoseconds(gGPUStat.prepWaiting, &prepWaiting);
@@ -6906,7 +7078,15 @@ index 851cf43..bf3783f 100644
  		IOLog("RedwoodGPU: cpu-prep: %u asked, %u waited for the GPU, %llu us each\n", gGPUStat.preps, gGPUStat.prepsWaited,
  		    gGPUStat.prepsWaited ? prepWaiting / NSEC_PER_USEC / gGPUStat.prepsWaited : 0);
  		IOLog("RedwoodGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
-@@ -1560,6 +1598,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+@@ -1483,6 +1628,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 		struct msm_submitqueue_query query;
+ 		struct drm_gem_close close;
+ 		struct redwood_surface surface;
++		struct redwood_user_memory user;
+ 		struct redwood_show show;
+ 		struct redwood_worked worked;
+ 	} r;
+@@ -1560,6 +1706,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
  			}
  		}
  		IOLockUnlock(gGPULock);
@@ -6914,6 +7094,16 @@ index 851cf43..bf3783f 100644
  		slowWait("fence", waitBegan);
  		break;
  	case kMsmGemMadvise:
+@@ -1601,6 +1748,9 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 	case kRedwoodSurface:
+ 		ret = surfaceBuffer(&r.surface);
+ 		break;
++	case kRedwoodUserMemory:
++		ret = userBuffer(&r.user);
++		break;
+ 	case kRedwoodShow:
+ 		ret = show(&r.show);
+ 		break;
 diff --git a/xnu/files/osfmk/arm64/gic_v3_irq.c b/xnu/files/osfmk/arm64/gic_v3_irq.c
 index ce5452a..00b41f0 100644
 --- a/xnu/files/osfmk/arm64/gic_v3_irq.c

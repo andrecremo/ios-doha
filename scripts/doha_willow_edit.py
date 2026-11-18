@@ -5216,3 +5216,172 @@ redwood_note_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unu
 SYSCTL_PROC(_kern, OID_AUTO, redwood_note, CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_LOCKED, 0, 0, redwood_note_sysctl, "A",
     "a line for the panel's Keys line");
 """)
+
+# (doha, Metal on Vulkan: m2v_test on the A610 through Turnip -- the device, a blit fill, full-screen clears in 4.5 ms,
+# IOSurfaces both ways -- and one refusal: a program's own pages as a GPU buffer (Linux's userptr), which Metal's no-copy
+# buffers and CoreAnimation's backing stores are. hakios's HakiosGPU has it as request 0x7d; here 0x7d is
+# kRedwoodGPUWorked, so it is 0x7c (and hakios-drm, Turnip's libdrm, asks 0x7c). As hakios's userBuffer(): the pages
+# wired (read-only ones too: a window server's view of another program's store), entered into the GPU's address space,
+# mapped into the kernel, pushed out of this processor's cache at every submission that names them, never kept for reuse)
+sub1(GPUF, """	kRedwoodGPUWorked       = 0x7d,         /* ours: how long the 3D core itself has worked, and on how many */""",
+     """	kRedwoodUserMemory      = 0x7c,         /* ours: pages of the caller's own as a buffer (Linux's userptr; hakios's 0x7d) */
+	kRedwoodGPUWorked       = 0x7d,         /* ours: how long the 3D core itself has worked, and on how many */""")
+sub1(GPUF, """struct redwood_surface {
+	uint32_t surface;                       /* the IOSurface's ID */""", """struct redwood_user_memory {
+	uint64_t address, size;                 /* in the caller, in whole pages */
+	uint32_t handle;                        /* back: the buffer */
+	uint32_t flags;
+};
+struct redwood_surface {
+	uint32_t surface;                       /* the IOSurface's ID */""")
+sub1(GPUF, """	uint32_t                        fence;          /* the last submission that names it (0: none has) */
+};""", """	uint32_t                        fence;          /* the last submission that names it (0: none has) */
+	bool                            user;           /* pages of the program's own (kRedwoodUserMemory) */
+	IOMemoryMap *                   userMap;        /* ... and the kernel's mapping of them, for the cache */
+};""")
+sub1(GPUF, """	IOReturn surfaceBuffer(struct redwood_surface * request);
+	IOReturn gemInfo(struct msm_gem_info * request);""", """	IOReturn surfaceBuffer(struct redwood_surface * request);
+	IOReturn userBuffer(struct redwood_user_memory * request);
+	IOReturn gemInfo(struct msm_gem_info * request);""")
+sub1(GPUF, """	b->fence = 0;
+	b->surface = NULL;
+	fBufferCount++;""", """	b->fence = 0;
+	b->surface = NULL;
+	b->user = false;
+	b->userMap = NULL;
+	fBufferCount++;""")
+sub1(GPUF, """RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+{
+	bool busy = redwood_gpu_ready() && b->fence != 0 && !redwood_gpu_done(b->fence);
+""", """RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+{
+	bool busy = redwood_gpu_ready() && b->fence != 0 && !redwood_gpu_done(b->fence);
+
+	if (b->userMap != NULL) {                       /* (the kernel's view of a program's pages: not needed any more) */
+		b->userMap->release();
+		b->userMap = NULL;
+		b->kernel = NULL;
+	}
+""")
+sub1(GPUF, """		} else if (b->surface == NULL && redwood_gpu_ready() && keep(b->memory, b->kernel, b->address, b->size, b->flags)) {""",
+     """		} else if (b->surface == NULL && !b->user && redwood_gpu_ready() && keep(b->memory, b->kernel, b->address, b->size, b->flags)) {""")
+sub1(GPUF, """		if (b == NULL) {
+			continue;
+		}
+		if (b->surface != NULL) {
+			uint32_t seed = b->surface->shared()->seed, gpuBumps = b->surface->gpuBumps;""", """		if (b == NULL) {
+			continue;
+		}
+		if (b->user) {                          /* a program's own pages: ordinary memory, written as it pleases */
+			if (b->kernel != NULL) {
+				redwood_gpu_to_memory(b->kernel, b->size);
+				gGPUStat.flushed += b->size;
+			}
+			continue;
+		}
+		if (b->surface != NULL) {
+			uint32_t seed = b->surface->shared()->seed, gpuBumps = b->surface->gpuBumps;""")
+sub1(GPUF, """IOReturn
+RedwoodGPUUserClient::gemInfo(struct msm_gem_info * request)
+{""", """/*
+ * Pages of the client's own as a buffer, as Linux's userptr (hakios's HakiosGPU userBuffer()): wired for as long as the
+ * buffer is there, entered into the GPU's address space, mapped into the kernel for the cache, and pushed out of this
+ * processor's cache at every submission that names them. Vulkan's VK_EXT_external_memory_host over it (Turnip, through
+ * hakios-drm): Metal's no-copy buffers, CoreAnimation's backing stores.
+ */
+IOReturn
+RedwoodGPUUserClient::userBuffer(struct redwood_user_memory * request)
+{
+	IOMemoryDescriptor * memory = NULL;
+	IOMemoryMap * map = NULL;
+	struct gpu_buffer * b;
+	IOReturn prepared = kIOReturnNoMemory;
+	uint64_t began = mach_absolute_time();
+
+	if ((request->address & PAGE_MASK) || (request->size & PAGE_MASK) || request->size == 0 || request->size > GPU_BUFFER_MAX) {
+		static uint32_t said;
+
+		if (said++ < 8) {
+			IOLog("RedwoodGPU: pages at %#llx (%llu bytes) of the client: not whole pages of %u bytes\\n",
+			    request->address, request->size, (unsigned) PAGE_SIZE);
+		}
+		return kIOReturnBadArgument;
+	}
+	/* pages the client may only read (a window server's view of another program's backing store): the GPU reads them only */
+	for (int pass = 0; pass < 2 && prepared != kIOReturnSuccess; pass++) {
+		memory = IOMemoryDescriptor::withAddressRange(request->address, request->size,
+		    pass == 0 ? kIODirectionInOut : kIODirectionOut, fTask);
+		if (memory == NULL) {
+			return kIOReturnNoMemory;
+		}
+		prepared = memory->prepare();
+		if (prepared != kIOReturnSuccess) {
+			memory->release();
+			memory = NULL;
+		} else if (pass == 1) {
+			request->flags |= MSM_BO_GPU_READONLY;
+		}
+	}
+	if (memory == NULL) {
+		static uint32_t said;
+
+		if (said++ < 8) {
+			IOLog("RedwoodGPU: pages at %#llx (%llu bytes) of the client cannot be wired: %#x\\n", request->address,
+			    request->size, prepared);
+		}
+		return kIOReturnVMError;
+	}
+	map = memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere);
+	if (map == NULL) {
+		memory->complete();
+		memory->release();
+		IOLog("RedwoodGPU: pages at %#llx (%llu bytes) of the client: no mapping of them in the kernel\\n",
+		    request->address, request->size);
+		return kIOReturnNoMemory;
+	}
+	IOLockLock(gGPULock);
+	b = newBuffer(memory, 0, request->size, request->flags, &request->handle);
+	if (b != NULL) {
+		b->memory = memory;             /* (its pages unwired as it goes: IOGeneralMemoryDescriptor::free) */
+		b->kernel = (uint8_t *) map->getVirtualAddress();
+		b->userMap = map;
+		b->user = true;
+		b->seen = true;
+		gGPUStat.surfaces++;
+	}
+	gGPUStat.taking += mach_absolute_time() - began;
+	IOLockUnlock(gGPULock);
+	if (b == NULL) {
+		static uint32_t said;
+
+		if (said++ < 8) {
+			IOLog("RedwoodGPU: pages at %#llx (%llu bytes) of the client: no room for them in the GPU\\n",
+			    request->address, request->size);
+		}
+		map->release();
+		memory->complete();
+		memory->release();
+		return kIOReturnNoMemory;
+	}
+	return kIOReturnSuccess;
+}
+
+IOReturn
+RedwoodGPUUserClient::gemInfo(struct msm_gem_info * request)
+{""")
+sub1(GPUF, """		struct redwood_surface surface;
+		struct redwood_show show;
+		struct redwood_worked worked;
+	} r;""", """		struct redwood_surface surface;
+		struct redwood_user_memory user;
+		struct redwood_show show;
+		struct redwood_worked worked;
+	} r;""")
+sub1(GPUF, """	case kRedwoodSurface:
+		ret = surfaceBuffer(&r.surface);
+		break;""", """	case kRedwoodSurface:
+		ret = surfaceBuffer(&r.surface);
+		break;
+	case kRedwoodUserMemory:
+		ret = userBuffer(&r.user);
+		break;""")

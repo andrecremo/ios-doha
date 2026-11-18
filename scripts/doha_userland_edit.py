@@ -398,3 +398,88 @@ jobs.open('w', encoding='utf-8', newline='\n').write("""# Commands run by the la
 /redwood/bin/net_test hud waitaddr en0 180 resolve example.com tcp example.com 80 fetch https://example.com/ reach example.com resolve www.apple.com fetch https://www.apple.com/library/test/success.html
 """)
 print('userland/rc.jobs.dohanet: written')
+
+# doha: mobileactivationd denied again. willow let it run (on its phone it answers at once: "Device is not activated",
+# Code=-8); hakios-fajita (OnePlus 6T, no Secure Enclave either, Beta 0.3) found it trapping at every start and never
+# answering what is queued for it -- apsd asks it while starting, amsaccountsd asks apsd, and Safari's main thread waits
+# on AppleMediaServices: pages spin for ever although the network works, as here. Left out, everything that asks it gets
+# its error at once. ALLOW=mobileactivationd lets it run again.
+mj = tree / 'userland/mkjobs.py'
+m = mj.open(encoding='utf-8', newline='').read()
+mold = """        'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd', 'avconferenced')
+"""
+mnew = """        'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd', 'avconferenced',
+        # doha (as hakios-fajita): it traps at every start and never answers; Safari waited on it through apsd and AMS
+        'mobileactivationd')
+"""
+if "'mobileactivationd')" in m:
+    print('userland/mkjobs.py: mobileactivationd denied already')
+elif m.count(mold) != 1:
+    raise SystemExit('userland/mkjobs.py: the end of DENY is not where expected')
+else:
+    mj.open('w', encoding='utf-8', newline='').write(m.replace(mold, mnew))
+    print('userland/mkjobs.py: mobileactivationd denied (doha)')
+
+# doha: hud_test (userland10/hud_test.c, beside this script): processes, crash reports and a test program's results on the
+# panel's Keys line; and hakios-metal's probe (hakios-xnu-kernel's Metal driver, built for doha's RedwoodGPU into
+# ~/doha-xnu/hakios-metal-doha, never in this repository) when it is there, run by rc.jobs.dohametal
+# (run-ios-flash.sh METALTEST=1)
+import shutil
+shutil.copy(Path(__file__).parent / 'userland10' / 'hud_test.c', tree / 'userland/src/hud_test.c')
+hb = (tree / 'userland/build.sh').open(encoding='utf-8', newline='').read()
+hc_old = """		$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -o obj/net_test src/net_test.m
+"""
+hc_new = hc_old + """		$DYN -o obj/hud_test src/hud_test.c
+"""
+hi_old = """	[ -f obj/net_test ] && cp obj/net_test root/bin/
+"""
+hi_new = hi_old + """	[ -f obj/hud_test ] && cp obj/hud_test root/bin/
+	[ -f $HOME/doha-xnu/hakios-metal-doha/out/ios/hakios-metal-probe ] && cp $HOME/doha-xnu/hakios-metal-doha/out/ios/hakios-metal-probe root/bin/
+"""
+if 'obj/hud_test' in hb:
+    print('userland/build.sh: has hud_test already')
+elif hb.count(hc_old) != 1 or hb.count(hi_old) != 1:
+    raise SystemExit('userland/build.sh: net_test\'s lines are not where expected')
+else:
+    (tree / 'userland/build.sh').open('w', encoding='utf-8', newline='').write(hb.replace(hc_old, hc_new).replace(hi_old, hi_new))
+    print('userland/build.sh: hud_test, and hakios-metal-probe when it is built')
+(tree / 'userland/rc.jobs.dohametal').open('w', encoding='utf-8', newline='\n').write("""# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# doha (RC_JOBS=rc.jobs.dohametal, run-ios-flash.sh METALTEST=1): the lock screen swiped away, then hakios-metal's probe on
+# the Adreno 610 through RedwoodGPU -- copies, fills, command-buffer chains, kernels, a triangle -- each FAIL and the counts
+# on the panel's Keys line, and the whole log on TCP port 7000 once the Wi-Fi has an address (WIFI=1 NETWORK=1)
+/redwood/bin/rwtouch wait 32 swipe 0.5 0.985 0.5 0.3 250 &
+/redwood/bin/net_test waitaddr en0 180
+/redwood/bin/hud_test serve 7000 wait 20 say metal-probe-begins probe /redwood/bin/hakios-metal-probe wait 1800
+""")
+print('userland/rc.jobs.dohametal: written')
+
+# doha: UniXNU's Metal on Vulkan (AdrenoMetal's frontend, metal2vulkan) over Turnip, built by hakios-xnu-kernel's
+# tools/mk-mesa.sh, mk-turnip.sh and mk-m2v.sh in a clone of it (its hakios-drm pointed at RedwoodGPU), linked into
+# its m2v_test, all in ~/doha-xnu/m2v-out (never in this repository): when they are there, into the small image
+# (Turnip at /redwood/lib/libvulkan_freedreno.dylib, where m2v_test opens it), run by rc.jobs.dohamv (METALTEST=2)
+mb = (tree / 'userland/build.sh').open(encoding='utf-8', newline='').read()
+m_old = """	[ -f obj/hud_test ] && cp obj/hud_test root/bin/
+"""
+m_new = m_old + """	if [ -f $HOME/doha-xnu/m2v-out/m2v_test ] && [ -f $HOME/doha-xnu/m2v-out/libvulkan_freedreno.dylib ]; then
+		mkdir -p root/lib
+		cp $HOME/doha-xnu/m2v-out/m2v_test root/bin/
+		cp $HOME/doha-xnu/m2v-out/libvulkan_freedreno.dylib root/lib/
+		echo "build.sh: m2v_test and Turnip (Metal on Vulkan) in the image"
+	fi
+"""
+if 'm2v-out/m2v_test' in mb:
+    print('userland/build.sh: has m2v_test already')
+elif mb.count(m_old) != 1:
+    raise SystemExit('userland/build.sh: hud_test\'s line is not where expected')
+else:
+    (tree / 'userland/build.sh').open('w', encoding='utf-8', newline='').write(mb.replace(m_old, m_new))
+    print('userland/build.sh: m2v_test and Turnip when they are built')
+(tree / 'userland/rc.jobs.dohamv').open('w', encoding='utf-8', newline='\n').write("""# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# doha (RC_JOBS=rc.jobs.dohamv, run-ios-flash.sh METALTEST=2): UniXNU's Metal on Vulkan over Turnip on the Adreno 610
+# (m2v_test: the device, a blit, a clear, surfaces as textures), its output on TCP port 7000 and its FAILs on the panel.
+# TU_DEBUG=noconform: Turnip gives the A610 (no multiview in hardware) Vulkan 1.0 otherwise, and metal2vulkan needs 1.2
+/redwood/bin/rwtouch wait 32 swipe 0.5 0.985 0.5 0.3 250 &
+/redwood/bin/net_test waitaddr en0 180
+/redwood/bin/hud_test serve 7000 wait 20 env TU_DEBUG=startup,noconform say m2v-test-begins probe /redwood/bin/m2v_test wait 1800
+""")
+print('userland/rc.jobs.dohamv: written')
