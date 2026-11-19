@@ -1,6 +1,6 @@
-From 8073b226e0d02e2e8a699452a0dca059dccecace Mon Sep 17 00:00:00 2001
+From 0a3cdcd41f28af43dedcc213a168cb867c10d512 Mon Sep 17 00:00:00 2001
 From: andrecremo <andreljsantos@gmail.com>
-Date: Wed, 18 Nov 2026 20:51:05 -0300
+Date: Thu, 19 Nov 2026 12:27:29 -0300
 Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
 
 ---
@@ -61,19 +61,19 @@ Subject: [PATCH] doha: a platform of its own (SM6125, 1080 x 2280)
  xnu/files/bsd/dev/redwood_osm.c               |  154 ++-
  xnu/files/bsd/dev/redwood_rpm.c               |   11 +-
  xnu/files/bsd/dev/redwood_status.c            |   24 +
- xnu/files/bsd/dev/redwood_ufs.c               |    5 +
+ xnu/files/bsd/dev/redwood_ufs.c               |  116 +-
  xnu/files/bsd/dev/redwood_wifi.c              |  296 +++-
  xnu/files/bsd/sys/redwood_input.h             |    3 +
  xnu/files/bsd/sys/redwood_lx.h                |    6 +
  .../iokit/Kernel/MiniIOMobileFramebuffer.cpp  |  657 ++++++++-
- xnu/files/iokit/Kernel/MiniIOSurface.cpp      |  141 ++
+ xnu/files/iokit/Kernel/MiniIOSurface.cpp      |  140 +-
  xnu/files/iokit/Kernel/MiniIOSurface.h        |    2 +
  xnu/files/iokit/Kernel/RedwoodGPU.cpp         |  155 ++-
  xnu/files/osfmk/arm64/gic_v3_irq.c            |   12 +-
  xnu/redwood.patch                             |    9 +-
  xnuloader/build.sh                            |    3 +-
  xnuloader/loader.c                            |  565 +++++++-
- 69 files changed, 6563 insertions(+), 89 deletions(-)
+ 69 files changed, 6665 insertions(+), 97 deletions(-)
  create mode 100755 tools/mk-ath10k.sh
  create mode 100755 wifi/lx/include/linux/acpi.h
  create mode 100755 wifi/lx/include/linux/clk.h
@@ -5817,10 +5817,18 @@ index 6bf1d08..3a58b80 100644
  extern uint32_t redwood_cpu_mhz[8];
  extern unsigned int vm_page_free_count, memorystatus_available_pages;
 diff --git a/xnu/files/bsd/dev/redwood_ufs.c b/xnu/files/bsd/dev/redwood_ufs.c
-index fce766f..952e572 100644
+index fce766f..ea2b63d 100644
 --- a/xnu/files/bsd/dev/redwood_ufs.c
 +++ b/xnu/files/bsd/dev/redwood_ufs.c
-@@ -92,6 +92,11 @@ static const struct ufs_store {
+@@ -37,6 +37,7 @@
+ #include <kern/clock.h>
+ #include <kern/locks.h>
+ #include <kern/thread.h>
++#include <kern/thread_call.h>
+ #include <os/atomic_private.h>
+ #include <libkern/libkern.h>
+ #include <mach/mach_types.h>
+@@ -92,6 +93,11 @@ static const struct ufs_store {
  	 * filesystem iOS's data lives in. Its block device writes, so it can be mounted for writing.
  	 */
  	{ "userdata", 31031296, 91111391, 512, 0, true },
@@ -5832,6 +5840,187 @@ index fce766f..952e572 100644
  };
  static uint64_t ufs_write_first = UFS_WRITE_FIRST;      /* the store's of this run, in blocks of 4096 */
  static bool ufs_write_fs;                               /* the store of this run is the data store */
+@@ -226,6 +232,14 @@ static volatile bool ufs_write_busy;            /* a write of ours has this kern
+ static bool ufs_write_out, ufs_write_was_native;        /* the list is out for writing, and was in before */
+ static uint64_t ufs_writes, ufs_write_bytes, ufs_write_errors, ufs_write_refused;
+ 
++/* doha, var_disk=1: /dev/ufs_var, userdata from UFS_VAR_AT on, the data volume's (see redwood_ufs_init) */
++#define UFS_VAR_AT         12884901888ULL      /* 12 GiB: past the iOS volume, the cryptexes and var_store's 2 x 2 GiB */
++#define UFS_VAR_MINOR      250                 /* not a partition's: there are BLOCK_MAX_PARTS of those at most */
++static bool ufs_var_on;
++static uint32_t ufs_var_bsize = 512;
++static thread_call_t ufs_var_restore_call;
++static uint64_t ufs_var_reads, ufs_var_writes;
++
+ SYSCTL_DECL(_kern_redwood);
+ SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_requests, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_requests,
+     "requests the phone's storage has answered through the loader");
+@@ -745,11 +759,21 @@ ufs_write_restore(void)
+ 	lck_mtx_unlock(&ufs_write_mtx);
+ }
+ 
++/* doha: a burst of writes to /dev/ufs_var over, this kernel's own transfer list back in */
++static void
++ufs_var_restore(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	ufs_write_restore();
++}
++
+ /* ---- the devices ---- */
+ 
+ static int
+ ufs_open(dev_t dev, int flags, __unused int devtype, __unused proc_t p)
+ {
++	if (ufs_ready && ufs_var_on && (uint32_t)minor(dev) == UFS_VAR_MINOR) {
++		return 0;               /* doha: /dev/ufs_var, the data volume's, reads and writes */
++	}
+ 	if (!ufs_ready || (uint32_t)minor(dev) >= ufs_parts || (ufs_page->part[minor(dev)].flags & BLOCK_PART_UNIT)) {
+ 		return ENXIO;
+ 	}
+@@ -790,22 +814,28 @@ ufs_cclose(dev_t dev, int flags, int devtype, proc_t p)
+ static void
+ ufs_strategy(buf_t bp)
+ {
+-	uint32_t part = (uint32_t)minor(buf_device(bp));
+-	uint64_t offset, len, size;
++	uint32_t part = (uint32_t)minor(buf_device(bp)), bsize;
++	uint64_t offset, len, size, base = 0;
++	bool var = ufs_ready && ufs_var_on && part == UFS_VAR_MINOR;
+ 	int error;
+ 
++	if (var) {                      /* doha: /dev/ufs_var, userdata from UFS_VAR_AT */
++		part = (uint32_t)ufs_write_part;
++		base = UFS_VAR_AT;
++	}
+ 	if (!ufs_ready || part >= ufs_parts) {
+ 		buf_seterror(bp, ENXIO);
+ 		buf_biodone(bp);
+ 		return;
+ 	}
+-	if (!(buf_flags(bp) & B_READ) && !(ufs_write_fs && ufs_write_part >= 0 && part == (uint32_t)ufs_write_part)) {
++	if (!(buf_flags(bp) & B_READ) && !var && !(ufs_write_fs && ufs_write_part >= 0 && part == (uint32_t)ufs_write_part)) {
+ 		buf_seterror(bp, EROFS);         /* this device never writes, but the data store */
+ 		buf_biodone(bp);
+ 		return;
+ 	}
+-	size = ufs_part_bytes(part);
+-	offset = (uint64_t)buf_blkno(bp) * ufs_bsize[part];
++	size = ufs_part_bytes(part) - base;
++	bsize = var ? ufs_var_bsize : ufs_bsize[part];
++	offset = (uint64_t)buf_blkno(bp) * bsize;
+ 	len = buf_count(bp);
+ 	if (offset >= size) {
+ 		buf_seterror(bp, offset == size ? 0 : EINVAL);
+@@ -826,9 +856,17 @@ ufs_strategy(buf_t bp)
+ 	error = buf_map(bp, &data);
+ 	if (error == 0) {
+ 		if (buf_flags(bp) & B_READ) {
+-			error = ufs_read(part, offset, (uint8_t *)data, len);
++			error = ufs_read(part, base + offset, (uint8_t *)data, len);
++			ufs_var_reads += var;
+ 		} else {
+-			error = ufs_write(part, offset, (const uint8_t *)data, len);
++			error = ufs_write(part, base + offset, (const uint8_t *)data, len);
++			if (var) {
++				uint64_t deadline;
++
++				ufs_var_writes++;
++				clock_interval_to_deadline(300, NSEC_PER_MSEC, &deadline);
++				(void)thread_call_enter_delayed(ufs_var_restore_call, deadline);
++			}
+ 		}
+ 		(void)buf_unmap(bp);
+ 	}
+@@ -839,11 +877,56 @@ ufs_strategy(buf_t bp)
+ 	buf_biodone(bp);
+ }
+ 
++/* doha: /dev/ufs_var's answers: userdata from UFS_VAR_AT, written by the filesystem on it */
++static int
++ufs_var_ioctl(u_long cmd, caddr_t data)
++{
++	uint32_t part = (uint32_t)ufs_write_part, native = ufs_page->part[part].block_size;
++	uint64_t size = ufs_part_bytes(part) - UFS_VAR_AT;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*(uint32_t *)data = ufs_var_bsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (*(uint32_t *)data < 512 || *(uint32_t *)data > 4096 || (*(uint32_t *)data & (*(uint32_t *)data - 1)) != 0) {
++			return EINVAL;
++		}
++		ufs_var_bsize = *(uint32_t *)data;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*(uint32_t *)data = native;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*(uint64_t *)data = size / ufs_var_bsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*(uint32_t *)data = 1;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*(uint64_t *)data = ufs_buffer_size / ufs_var_bsize;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE:
++		return 0;               /* every write is on the flash, and read back, before it answers */
++	case DKIOCISVIRTUAL:
++		*(uint32_t *)data = 0;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
+ static int
+ ufs_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc_t p)
+ {
+ 	uint32_t part = (uint32_t)minor(dev), native;
+ 
++	if (ufs_ready && ufs_var_on && part == UFS_VAR_MINOR) {
++		return ufs_var_ioctl(cmd, data);
++	}
++
+ 	if (!ufs_ready || part >= ufs_parts) {
+ 		return ENXIO;
+ 	}
+@@ -894,6 +977,9 @@ ufs_psize(dev_t dev)
+ {
+ 	uint32_t part = (uint32_t)minor(dev);
+ 
++	if (ufs_ready && ufs_var_on && part == UFS_VAR_MINOR) {
++		return (int)ufs_var_bsize;
++	}
+ 	return ufs_ready && part < ufs_parts ? (int)ufs_bsize[part] : -1;
+ }
+ 
+@@ -1685,6 +1771,22 @@ redwood_ufs_init(void)
+ 		} else {
+ 			printf("ufs: nothing takes writes: no store among the partitions\n");
+ 		}
++		/* doha, var_disk=1: the data volume's device, userdata from UFS_VAR_AT, a filesystem's */
++		{
++			uint32_t on = 0;
++
++			if (ufs_write_part >= 0 && !ufs_write_fs && strcmp(ufs_store_name, "userdata") == 0 &&
++			    PE_parse_boot_argn("var_disk", &on, sizeof(on)) && on != 0 &&
++			    ufs_part_bytes((uint32_t)ufs_write_part) > UFS_VAR_AT + (1ULL << 30) &&
++			    (ufs_var_restore_call = thread_call_allocate(ufs_var_restore, NULL)) != NULL &&
++			    devfs_make_node(makedev(ufs_bmajor, UFS_VAR_MINOR), DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640,
++			    "ufs_var") != NULL) {
++				ufs_var_on = true;
++				redwood_status(REDWOOD_STATUS_STORAGE, "ok, %u partitions; /var on userdata from 12 GiB", made);
++				printf("ufs: /dev/ufs_var: userdata from byte %llu, %llu MB, for the data volume (var_disk=1)\n",
++				    UFS_VAR_AT, (ufs_part_bytes((uint32_t)ufs_write_part) - UFS_VAR_AT) >> 20);
++			}
++		}
+ 	}
+ 
+ 	/*
 diff --git a/xnu/files/bsd/dev/redwood_wifi.c b/xnu/files/bsd/dev/redwood_wifi.c
 index c7751c1..7a21365 100644
 --- a/xnu/files/bsd/dev/redwood_wifi.c
@@ -7073,9 +7262,18 @@ index 65a99ee..134914c 100644
  		/* the first line to look for in the log of such a boot: the gate is open, nothing is set yet */
  		if (gAcceleratorTakesProperties) {
 diff --git a/xnu/files/iokit/Kernel/MiniIOSurface.cpp b/xnu/files/iokit/Kernel/MiniIOSurface.cpp
-index 579ea6c..01afc8e 100644
+index 579ea6c..0a69cfb 100644
 --- a/xnu/files/iokit/Kernel/MiniIOSurface.cpp
 +++ b/xnu/files/iokit/Kernel/MiniIOSurface.cpp
+@@ -137,7 +137,7 @@ OSDefineMetaClassAndStructors(MiniIOSurface, OSObject);
+  * out, or by whoever asks for the memory if that comes first.
+  */
+ #define SURFACE_KEEP_FROM       (4u << 20)      /* bytes: smaller ones are not worth it */
+-#define SURFACE_KEPT            4
++#define SURFACE_KEPT            8       /* doha: 4 before */
+ #define SURFACE_CLEAR_MS        40              /* kept memory is cleared this long after, if the display's driver has not done it */
+ 
+ static struct {
 @@ -182,6 +182,108 @@ surfaceMemoryClear(thread_call_param_t unused0 __unused, thread_call_param_t unu
  	MiniIOSurfaceClearKept();
  }
@@ -7196,7 +7394,7 @@ index 579ea6c..01afc8e 100644
  	if (bytes >= SURFACE_KEEP_FROM && gSurfaceKeptLock != NULL) {
  		IOLockLock(gSurfaceKeptLock);
  		for (int pass = 0; pass < 2 && memory == NULL; pass++) {
-@@ -208,6 +314,22 @@ surfaceMemory(vm_size_t bytes)
+@@ -208,6 +314,19 @@ surfaceMemory(vm_size_t bytes)
  			bzero(memory->getBytesNoCopy(), gSurfaceClear ? bytes : PAGE_SIZE);
  		}
  	}
@@ -7211,15 +7409,12 @@ index 579ea6c..01afc8e 100644
 +		if (flip < 0) {
 +			flip = PE_parse_boot_argn("fb_flip", &value, sizeof(value)) && value != 0;
 +		}
-+		if (memory == NULL && flip && bytes >= (4u << 20)) {
-+			memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut |
-+			    kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, bytes, 0xfffff000ull);
-+		}
++		(void)flip;     /* doha: memory of one piece from the frame pool only (framePoolTake): asked here it took 47 ms */
 +	}
  	if (memory == NULL) {
  		memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, bytes,
  		    PAGE_SIZE);
-@@ -226,6 +348,10 @@ surfaceMemoryBack(IOBufferMemoryDescriptor * memory)
+@@ -226,6 +345,10 @@ surfaceMemoryBack(IOBufferMemoryDescriptor * memory)
  {
  	IOBufferMemoryDescriptor * evicted = NULL;
  
@@ -7230,7 +7425,7 @@ index 579ea6c..01afc8e 100644
  	if (memory->getCapacity() >= SURFACE_KEEP_FROM && memory->getRetainCount() != 1) {
  		OSIncrementAtomic(&gSurfacesNotKept[0]);
  	}
-@@ -764,6 +890,21 @@ MiniIOSurfaceDrop(MiniIOSurface * s)
+@@ -764,6 +887,21 @@ MiniIOSurfaceDrop(MiniIOSurface * s)
  	IOLockUnlock(gSurfaceLock);
  }
  

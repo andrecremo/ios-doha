@@ -6079,3 +6079,184 @@ sub1('xnu/files/bsd/dev/redwood_buttons.c', "extern void redwood_battery_direct(
      "extern void redwood_battery_direct(int soc, int voltage_mv, int plugged, int charging, int android_soc, int into_battery_ma);")
 sub1('xnu/files/bsd/dev/redwood_buttons.c', "	redwood_battery_direct(soc, mv, (usb & 0x10) != 0, state >= 1 && state <= 4, android);",
      "	redwood_battery_direct(soc, mv, (usb & 0x10) != 0, state >= 1 && state <= 4, android, -current_now());   /* (negative: charging) */")
+
+# (doha, the hitches of 70-90 ms: "8 big surfaces made, 47160 us each: 46911 getting the memory". With fb_flip every
+# surface from 4 MB first asked for memory of one piece, which is slow (and mostly fails) once the frame pool is full.
+# Pieces of one piece come from the frame pool alone now (framePoolTake); other big surfaces get ordinary memory. And
+# 8 big pieces are kept for the next surface instead of 4: a full-screen surface (11 MB) made again takes a kept one
+# instead of memory wired and cleared afresh)
+sub1('xnu/files/iokit/Kernel/MiniIOSurface.cpp', """		if (memory == NULL && flip && bytes >= (4u << 20)) {
+			memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut |
+			    kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, bytes, 0xfffff000ull);
+		}""", """		(void)flip;     /* doha: memory of one piece from the frame pool only (framePoolTake): asked here it took 47 ms */""")
+sub1('xnu/files/iokit/Kernel/MiniIOSurface.cpp', "#define SURFACE_KEPT            4", "#define SURFACE_KEPT            8       /* doha: 4 before */")
+
+# (doha: /private/var on the flash, as willow's var_disk=1, but in a part of doha's userdata, which holds the iOS volume
+# and the cryptexes (0 - 7.8 GiB) and var_store's two slots (8 - 12 GiB) besides: with var_disk=1 and the store on
+# userdata, /dev/ufs_var is a block device of userdata from byte 12 GiB to its end (~37.7 GiB), which a filesystem may
+# write -- the HFS+ volume the init puts there and mounts on /private/var. Writes to it go through ufs_write, which keeps
+# to the partition's writable part as before; after a burst of them this kernel's own transfer list goes back in (a
+# filesystem never closes its device, and reads would otherwise all go through the loader))
+UFSF = 'xnu/files/bsd/dev/redwood_ufs.c'
+sub1(UFSF, "#include <kern/thread.h>\n#include <os/atomic_private.h>", "#include <kern/thread.h>\n#include <kern/thread_call.h>\n#include <os/atomic_private.h>")
+sub1(UFSF, "static uint64_t ufs_writes, ufs_write_bytes, ufs_write_errors, ufs_write_refused;",
+     """static uint64_t ufs_writes, ufs_write_bytes, ufs_write_errors, ufs_write_refused;
+
+/* doha, var_disk=1: /dev/ufs_var, userdata from UFS_VAR_AT on, the data volume's (see redwood_ufs_init) */
+#define UFS_VAR_AT         12884901888ULL      /* 12 GiB: past the iOS volume, the cryptexes and var_store's 2 x 2 GiB */
+#define UFS_VAR_MINOR      250                 /* not a partition's: there are BLOCK_MAX_PARTS of those at most */
+static bool ufs_var_on;
+static uint32_t ufs_var_bsize = 512;
+static thread_call_t ufs_var_restore_call;
+static uint64_t ufs_var_reads, ufs_var_writes;""")
+sub1(UFSF, """/* ---- the devices ---- */
+""", """/* doha: a burst of writes to /dev/ufs_var over, this kernel's own transfer list back in */
+static void
+ufs_var_restore(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	ufs_write_restore();
+}
+
+/* ---- the devices ---- */
+""")
+sub1(UFSF, """ufs_open(dev_t dev, int flags, __unused int devtype, __unused proc_t p)
+{
+	if (!ufs_ready""", """ufs_open(dev_t dev, int flags, __unused int devtype, __unused proc_t p)
+{
+	if (ufs_ready && ufs_var_on && (uint32_t)minor(dev) == UFS_VAR_MINOR) {
+		return 0;               /* doha: /dev/ufs_var, the data volume's, reads and writes */
+	}
+	if (!ufs_ready""")
+sub1(UFSF, """	uint32_t part = (uint32_t)minor(buf_device(bp));
+	uint64_t offset, len, size;
+	int error;
+
+	if (!ufs_ready || part >= ufs_parts) {
+		buf_seterror(bp, ENXIO);
+		buf_biodone(bp);
+		return;
+	}
+	if (!(buf_flags(bp) & B_READ) && !(ufs_write_fs && ufs_write_part >= 0 && part == (uint32_t)ufs_write_part)) {""",
+     """	uint32_t part = (uint32_t)minor(buf_device(bp)), bsize;
+	uint64_t offset, len, size, base = 0;
+	bool var = ufs_ready && ufs_var_on && part == UFS_VAR_MINOR;
+	int error;
+
+	if (var) {                      /* doha: /dev/ufs_var, userdata from UFS_VAR_AT */
+		part = (uint32_t)ufs_write_part;
+		base = UFS_VAR_AT;
+	}
+	if (!ufs_ready || part >= ufs_parts) {
+		buf_seterror(bp, ENXIO);
+		buf_biodone(bp);
+		return;
+	}
+	if (!(buf_flags(bp) & B_READ) && !var && !(ufs_write_fs && ufs_write_part >= 0 && part == (uint32_t)ufs_write_part)) {""")
+sub1(UFSF, """	size = ufs_part_bytes(part);
+	offset = (uint64_t)buf_blkno(bp) * ufs_bsize[part];
+	len = buf_count(bp);""", """	size = ufs_part_bytes(part) - base;
+	bsize = var ? ufs_var_bsize : ufs_bsize[part];
+	offset = (uint64_t)buf_blkno(bp) * bsize;
+	len = buf_count(bp);""")
+sub1(UFSF, """		if (buf_flags(bp) & B_READ) {
+			error = ufs_read(part, offset, (uint8_t *)data, len);
+		} else {
+			error = ufs_write(part, offset, (const uint8_t *)data, len);
+		}""", """		if (buf_flags(bp) & B_READ) {
+			error = ufs_read(part, base + offset, (uint8_t *)data, len);
+			ufs_var_reads += var;
+		} else {
+			error = ufs_write(part, base + offset, (const uint8_t *)data, len);
+			if (var) {
+				uint64_t deadline;
+
+				ufs_var_writes++;
+				clock_interval_to_deadline(300, NSEC_PER_MSEC, &deadline);
+				(void)thread_call_enter_delayed(ufs_var_restore_call, deadline);
+			}
+		}""")
+sub1(UFSF, """static int
+ufs_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc_t p)
+{
+	uint32_t part = (uint32_t)minor(dev), native;
+""", """/* doha: /dev/ufs_var's answers: userdata from UFS_VAR_AT, written by the filesystem on it */
+static int
+ufs_var_ioctl(u_long cmd, caddr_t data)
+{
+	uint32_t part = (uint32_t)ufs_write_part, native = ufs_page->part[part].block_size;
+	uint64_t size = ufs_part_bytes(part) - UFS_VAR_AT;
+
+	switch (cmd) {
+	case DKIOCGETBLOCKSIZE:
+		*(uint32_t *)data = ufs_var_bsize;
+		return 0;
+	case DKIOCSETBLOCKSIZE:
+		if (*(uint32_t *)data < 512 || *(uint32_t *)data > 4096 || (*(uint32_t *)data & (*(uint32_t *)data - 1)) != 0) {
+			return EINVAL;
+		}
+		ufs_var_bsize = *(uint32_t *)data;
+		return 0;
+	case DKIOCGETPHYSICALBLOCKSIZE:
+		*(uint32_t *)data = native;
+		return 0;
+	case DKIOCGETBLOCKCOUNT:
+		*(uint64_t *)data = size / ufs_var_bsize;
+		return 0;
+	case DKIOCISWRITABLE:
+		*(uint32_t *)data = 1;
+		return 0;
+	case DKIOCGETMAXBLOCKCOUNTREAD:
+	case DKIOCGETMAXBLOCKCOUNTWRITE:
+		*(uint64_t *)data = ufs_buffer_size / ufs_var_bsize;
+		return 0;
+	case DKIOCSYNCHRONIZE:
+	case DKIOCSYNCHRONIZECACHE:
+		return 0;               /* every write is on the flash, and read back, before it answers */
+	case DKIOCISVIRTUAL:
+		*(uint32_t *)data = 0;
+		return 0;
+	default:
+		return ENOTTY;
+	}
+}
+
+static int
+ufs_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc_t p)
+{
+	uint32_t part = (uint32_t)minor(dev), native;
+
+	if (ufs_ready && ufs_var_on && part == UFS_VAR_MINOR) {
+		return ufs_var_ioctl(cmd, data);
+	}
+""")
+sub1(UFSF, """	uint32_t part = (uint32_t)minor(dev);
+
+	return ufs_ready && part < ufs_parts ? (int)ufs_bsize[part] : -1;""", """	uint32_t part = (uint32_t)minor(dev);
+
+	if (ufs_ready && ufs_var_on && part == UFS_VAR_MINOR) {
+		return (int)ufs_var_bsize;
+	}
+	return ufs_ready && part < ufs_parts ? (int)ufs_bsize[part] : -1;""")
+sub1(UFSF, """		} else {
+			printf("ufs: nothing takes writes: no store among the partitions\\n");
+		}
+	}""", """		} else {
+			printf("ufs: nothing takes writes: no store among the partitions\\n");
+		}
+		/* doha, var_disk=1: the data volume's device, userdata from UFS_VAR_AT, a filesystem's */
+		{
+			uint32_t on = 0;
+
+			if (ufs_write_part >= 0 && !ufs_write_fs && strcmp(ufs_store_name, "userdata") == 0 &&
+			    PE_parse_boot_argn("var_disk", &on, sizeof(on)) && on != 0 &&
+			    ufs_part_bytes((uint32_t)ufs_write_part) > UFS_VAR_AT + (1ULL << 30) &&
+			    (ufs_var_restore_call = thread_call_allocate(ufs_var_restore, NULL)) != NULL &&
+			    devfs_make_node(makedev(ufs_bmajor, UFS_VAR_MINOR), DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640,
+			    "ufs_var") != NULL) {
+				ufs_var_on = true;
+				redwood_status(REDWOOD_STATUS_STORAGE, "ok, %u partitions; /var on userdata from 12 GiB", made);
+				printf("ufs: /dev/ufs_var: userdata from byte %llu, %llu MB, for the data volume (var_disk=1)\\n",
+				    UFS_VAR_AT, (ufs_part_bytes((uint32_t)ufs_write_part) - UFS_VAR_AT) >> 20);
+			}
+		}
+	}""")

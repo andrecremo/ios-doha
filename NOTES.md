@@ -1049,3 +1049,25 @@ sysctls que os hooks do `libredwood-sb` devolvem ao UIKit, e a barra de status d
   cinquenta e poucos por cento. Suspeitas: capacidade real bem abaixo dos 4000 mAh nominais (a contagem e a curva OCV
   supõem 4000) e a resistência interna maior que os 150 mΩ (a tensão sob carga cai mais, o nível pela curva oscila).
   Para medir: a capacidade aprendida pelo QG do Android (no SDAM do gauge) e um ciclo de descarga contado.
+
+## /private/var no flash: HFS+ na userdata a partir de 12 GiB (2026-11-19)
+
+O `/private/var` ficava num `ramfs` de um quarto da RAM (menos de 1 GB), que o `var_store` empacotava no flash a cada
+2 minutos. Com 479 MB usados, o iOS acusava armazenamento cheio (110 MB eram o `db/uuidtext` do `logd`). O willow já
+tinha `/private/var` em HFS+ no flash (`ufs_write=data var_disk=1`), mas na `userdata` inteira. No doha ela guarda o
+volume do iOS e os cryptexes (0 a 7,8 GB) e as duas cópias do `var_store` (8 a 12 GB). Sobram ~37,7 GB.
+- Kernel (`redwood_ufs.c`): com `var_disk=1` e o `var_store` na `userdata`, o dispositivo de bloco `/dev/ufs_var` é a
+  `userdata` a partir do byte 12 GiB, gravável para um sistema de arquivos. As gravações passam por `ufs_write`, com o
+  mesmo limite de antes. 300 ms depois de uma rajada, a lista de transferência do driver próprio volta, para as leituras
+  não ficarem todas no loader.
+- Volume: `scripts/mk-varfs.py` faz um HFS+ de 40475016704 bytes (`mkfs.hfsplus -s -J`, HFSX com journal de 8 MB) e
+  empacota o que é preciso gravar: 148 MB de zeros (o flash ali ainda tinha restos do Android) e 48 KB de dados, num
+  pacote de 49 KB que vai na imagem (`~/doha-xnu/var-share`).
+- Init: sem a assinatura `HX` no byte 1024 do volume, grava o pacote por `/dev/rufs_userdata`, sob a trava do
+  `var_store`, e lê de volta cada bloco de dados. Depois monta `/dev/ufs_var` em `/private/var` e, no primeiro boot,
+  desempacota nele o último salvamento do `var_store`, deixando a marca `/private/var/.doha-var-restored`. Com a marca,
+  o `var_store` não salva mais (o `bootok` continua).
+- No aparelho: o primeiro boot levou uns 19 minutos (criar o volume e gravar os ~400 MB). Os dados chegaram (4.160
+  arquivos). O segundo boot foi rápido, com tudo lá, sem recriar nem desempacotar. O aviso de armazenamento cheio sumiu.
+  `VARDISK=1` é o padrão; `VARDISK=0` volta à RAM a partir do último salvamento do `var_store`.
+- A ver: Ajustes > Geral > Armazenamento do iPhone trava ao abrir (não se sabe se abria antes).

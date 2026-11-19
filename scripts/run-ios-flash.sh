@@ -96,6 +96,19 @@ fi
 # NETTEST=1: the job of the demo is rc.jobs.dohanet -- the network tried layer by layer, each result on the panel
 [ "${NETTEST:-0}" = 1 ] && DOHA_RC_JOBS=rc.jobs.dohanet && echo "NETTEST=1: net_test's results on the panel's Keys line"
 # METALTEST=1: the job is rc.jobs.dohametal -- hakios-metal's probe on the GPU, its results on the panel
+# VARDISK=1: /private/var on the flash, an HFS+ volume in userdata from 12 GiB to its end (~37.7 GiB; the kernel's
+# /dev/ufs_var, var_disk=1) instead of a memory filesystem of a quarter of the RAM that var_store packs into the flash
+# every 2 minutes. The init makes the volume the first time, from ~/doha-xnu/var-share/varfs.pack (scripts/mk-varfs.py,
+# made here if it is not there; mkfs.hfsplus of hfsprogs), and fills it once with the last volume var_store kept
+# Default since 2026-11-19 (VARDISK=0: /private/var in RAM again, from var_store's last save, which stops once the
+# volume is in use): on the phone the volume was made, the data moved into it, and the next boot was fast with it all there
+if [ "${VARDISK:-1}" = 1 ]; then
+	[ -f ~/doha-xnu/var-share/varfs.pack ] || python3 $R/scripts/mk-varfs.py ~/doha-xnu/var-share/varfs.pack ~/doha-xnu/var-hfs ||
+		{ echo "VARDISK=1: no pack for the data volume (mkfs.hfsplus: apt install hfsprogs)"; exit 1; }
+	export EXTRA_SHARE="$HOME/doha-xnu/var-share ${EXTRA_SHARE:-}"
+	MOREARGS="var_disk=1 ${MOREARGS:-}"
+	echo "VARDISK=1: /private/var on the flash (userdata from 12 GiB)"
+fi
 # METALCA=1: the window server through Metal -- hakios's plug-in for CoreAnimation over metal2vulkan and Turnip
 # (~/doha-xnu/m2v-out/RedwoodMetal), QuartzCore's default.metallib from ~/doha-xnu/ca-share (hakios's tools/ca-metallib.py);
 # metal=2 camtl=1 metal_m2v=1 tu_debug=noconform gpu_recover=1 metal_fps ca_metallib=/redwood/share/ca-share/QuartzCore-default.metallib

@@ -18,7 +18,7 @@
  *                     into the log every 400 looks (task_for_pid; root)
  *   threads NAME      from then on, while watch runs: every 5 s the threads of process NAME that used the
  *                     processor or sit in the kernel, with their times (proc_pidinfo; root)
- *   du PATH           files and bytes under PATH, and its first 12 entries, into the log
+ *   du PATH           files and bytes under PATH, and its 15 biggest entries, into the log
  *   run A,B,C         program A with arguments B, C: its output into the log
  */
 #include <dirent.h>
@@ -716,13 +716,29 @@ du_walk(const char *path, unsigned depth, uint64_t *files, uint64_t *bytes)
 	closedir(d);
 }
 
+struct du_entry {
+	char name[200];
+	uint64_t files, bytes;
+	int dir;
+};
+
+static int
+du_order(const void *a, const void *b)
+{
+	const struct du_entry *x = a, *y = b;
+
+	return x->bytes < y->bytes ? 1 : x->bytes > y->bytes ? -1 : 0;
+}
+
+/* the entries of PATH, biggest first (the 15 biggest said), and the total */
 static void
 du(const char *path)
 {
+	static struct du_entry entries[1024];
+	unsigned n = 0;
 	uint64_t files = 0, bytes = 0;
 	DIR *d = opendir(path);
 	struct dirent *e;
-	unsigned shown = 0;
 	char line[600];
 
 	if (d == NULL) {
@@ -730,7 +746,7 @@ du(const char *path)
 		log_line(line);
 		return;
 	}
-	while ((e = readdir(d)) != NULL && shown < 12) {
+	while ((e = readdir(d)) != NULL && n < 1024) {
 		char sub[1024];
 		struct stat st;
 		uint64_t f = 0, b = 0;
@@ -748,14 +764,23 @@ du(const char *path)
 			f = 1;
 			b = (uint64_t)st.st_size;
 		}
-		snprintf(line, sizeof(line), "du %s: %s%s: %llu files, %llu KB", path, e->d_name, S_ISDIR(st.st_mode) ? "/" : "",
-		    (unsigned long long)f, (unsigned long long)(b >> 10));
-		log_line(line);
-		shown++;
+		strlcpy(entries[n].name, e->d_name, sizeof(entries[n].name));
+		entries[n].files = f;
+		entries[n].bytes = b;
+		entries[n].dir = S_ISDIR(st.st_mode);
+		files += f;
+		bytes += b;
+		n++;
 	}
 	closedir(d);
-	du_walk(path, 0, &files, &bytes);
-	snprintf(line, sizeof(line), "du %s: in all %llu files, %llu KB", path, (unsigned long long)files, (unsigned long long)(bytes >> 10));
+	qsort(entries, n, sizeof(entries[0]), du_order);
+	for (unsigned i = 0; i < n && i < 15; i++) {
+		snprintf(line, sizeof(line), "du %s: %s%s: %llu files, %llu KB", path, entries[i].name, entries[i].dir ? "/" : "",
+		    (unsigned long long)entries[i].files, (unsigned long long)(entries[i].bytes >> 10));
+		log_line(line);
+	}
+	snprintf(line, sizeof(line), "du %s: in all %llu files, %llu KB (%u entries)", path, (unsigned long long)files,
+	    (unsigned long long)(bytes >> 10), n);
 	log_line(line);
 }
 

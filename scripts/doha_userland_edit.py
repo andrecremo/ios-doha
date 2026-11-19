@@ -1305,3 +1305,210 @@ elif i.count(a_old) != 1 or i.count(b_old) != 1:
 else:
     ij.open('w', encoding='utf-8', newline='').write(i.replace(a_old, a_new).replace(b_old, b_new))
     print('userland/src/inject_sb.c: the battery views of the status bar given the level when it changes (doha)')
+
+# doha: "storage full": /private/var is a ramfs of a quarter of the memory, at 554 MB and growing. rc.jobs.dohaca says
+# first where it goes (hud_test du of /private/var and its biggest parts)
+(tree / 'userland/rc.jobs.dohaca').open('w', encoding='utf-8', newline='\n').write("""# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# doha (RC_JOBS=rc.jobs.dohaca): the lock screen swiped away, then on TCP port 7000: where /private/var's space goes, what
+# the shader cache and var_store's store hold, the window server's log, the kernel's and its threads' time every 5 s
+/redwood/bin/rwtouch wait 32 swipe 0.5 0.985 0.5 0.3 250 &
+/redwood/bin/net_test waitaddr en0 180
+/redwood/bin/hud_test serve 7000 wait 5 du /private/var du /private/var/mobile du /private/var/mobile/Library du /private/var/mobile/Containers/Data/Application du /private/var/containers du /private/var/db du /private/var/root du /private/var/MobileAsset du /private/var/db/m2v run /redwood/bin/var_store,show ps backboardd threads backboardd watch 240 /private/var/tmp/redwood-ws.log crashes watch 3000 /private/var/tmp/redwood-ws.log
+""")
+print('userland/rc.jobs.dohaca: where /private/var goes said first')
+
+# doha: where /private/var's 474 MB go, the biggest first (hud_test du now sorts), deeper into db and mobile/Library
+(tree / 'userland/rc.jobs.dohaca').open('w', encoding='utf-8', newline='\n').write("""# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# doha (RC_JOBS=rc.jobs.dohaca): the lock screen swiped away, then on TCP port 7000: where /private/var's space goes, what
+# the shader cache and var_store's store hold, the window server's log, the kernel's and its threads' time every 5 s
+/redwood/bin/rwtouch wait 32 swipe 0.5 0.985 0.5 0.3 250 &
+/redwood/bin/net_test waitaddr en0 180
+/redwood/bin/hud_test serve 7000 wait 5 du /private/var du /private/var/db du /private/var/mobile du /private/var/mobile/Library du /private/var/mobile/Library/Caches du /private/var/mobile/Containers/Data/Application du /private/var/mobile/Containers/Shared/AppGroup du /private/var/containers/Shared/SystemGroup run /redwood/bin/var_store,show ps backboardd threads backboardd watch 240 /private/var/tmp/redwood-ws.log crashes watch 3000 /private/var/tmp/redwood-ws.log
+""")
+print('userland/rc.jobs.dohaca: where /private/var goes, biggest first')
+
+# doha: /private/var on the flash (var_disk=1, run-ios-flash.sh VARDISK=1). The kernel's /dev/ufs_var is userdata from
+# 12 GiB on; the init puts an HFS+ volume there the first time (the pack of scripts/mk-varfs.py: which blocks of a fresh
+# volume hold data and which are to be zeros -- the flash there still has what Android left), through /dev/rufs_userdata
+# and the claim var_store writes under, every data block read back; mounts it on /private/var; and on its first boot fills
+# it with the last data volume var_store kept (once: a marker says so). var_store saves no more once that marker is there
+ij = tree / 'userland/src/init.c'
+i = ij.open(encoding='utf-8', newline='').read()
+f_old = """static int
+mount_var_disk(void)
+{
+	const char *wanted = boot_arg("var_disk");
+	struct hfs_args args = {
+		.fspec = "/dev/ufs_userdata", .uid = 0xffffffffu, .gid = 0xffffffffu, .mask = 0xffff,
+		.encoding = 0, .timezone = { -1, 0 }, .flags = 0,
+	};
+
+	if (wanted == NULL || strcmp(wanted, "1") != 0) {
+		return 0;
+	}
+	if (mount("hfs", "/private/var", 0, &args) != 0) {"""
+f_new = """/*
+ * doha: the data volume's place, userdata from VAR_DISK_AT (the kernel's /dev/ufs_var), and its making: the pack
+ * (scripts/mk-varfs.py) says which runs of a new HFS+ volume are zeros and which hold data, and they go in through
+ * /dev/rufs_userdata under var_store's claim; the HFS+ signature at byte 1024 says it is there already.
+ */
+#define VAR_DISK_AT        12884901888LL
+#define VAR_DISK_RAW       "/dev/rufs_userdata"
+#define VAR_DISK_MARK      "/private/var/.doha-var-restored"
+static int var_on_disk;
+
+static int
+var_disk_formatted(void)
+{
+	static uint8_t header[512];
+	int fd = open(VAR_DISK_RAW, O_RDONLY, 0), ok;
+
+	if (fd < 0) {
+		return 0;
+	}
+	ok = pread(fd, header, sizeof(header), VAR_DISK_AT + 1024) == (ssize_t)sizeof(header) && header[0] == 'H' &&
+	    (header[1] == 'X' || header[1] == '+');
+	close(fd);
+	return ok;
+}
+
+static int
+var_disk_format(void)
+{
+	static uint8_t zeros[1 << 20], data[1 << 16], back[1 << 16];
+	struct { char magic[8]; uint64_t volume; uint32_t records, reserved; } head;
+	struct { uint64_t offset; uint32_t length, kind; } rec;
+	const char *pack_path = in_image("/share/var-share/varfs.pack");
+	int pack = open(pack_path, O_RDONLY, 0), fd = -1, one = 1, zero = 0, ok = 0;
+	uint64_t zeroed = 0, written = 0;
+	uint32_t n = 0;
+
+	if (pack < 0 || read(pack, &head, sizeof(head)) != (ssize_t)sizeof(head) || memcmp(head.magic, "DOHAVAR1", 8) != 0) {
+		printf("  the data volume: no pack to make it from (%s)\\n", pack_path);
+		goto out;
+	}
+	if (sysctlbyname("kern.redwood.var_busy", NULL, NULL, &one, sizeof(one)) != 0 || (fd = open(VAR_DISK_RAW, O_RDWR, 0)) < 0) {
+		printf("  the data volume: %s cannot be written (%s)\\n", VAR_DISK_RAW, strerror(errno));
+		goto out;
+	}
+	printf("  the data volume: making it, %u runs, %llu MB in all\\n", head.records,
+	    (unsigned long long)(head.volume >> 20));
+	for (n = 0; n < head.records; n++) {
+		if (read(pack, &rec, sizeof(rec)) != (ssize_t)sizeof(rec) || rec.length == 0 || rec.length % 512 != 0 ||
+		    rec.offset % 512 != 0 || rec.offset + rec.length > head.volume) {
+			printf("  the data volume: run %u of the pack is not right\\n", n);
+			goto out;
+		}
+		if (rec.kind == 0) {
+			for (uint64_t at = 0; at < rec.length;) {
+				uint64_t piece = rec.length - at > sizeof(zeros) ? sizeof(zeros) : rec.length - at;
+
+				if (pwrite(fd, zeros, (size_t)piece, VAR_DISK_AT + (off_t)(rec.offset + at)) != (ssize_t)piece) {
+					printf("  the data volume: zeros at %llu: %s\\n", (unsigned long long)(rec.offset + at), strerror(errno));
+					goto out;
+				}
+				at += piece;
+			}
+			zeroed += rec.length;
+		} else {
+			if (rec.length > sizeof(data) || read(pack, data, rec.length) != (ssize_t)rec.length ||
+			    pwrite(fd, data, rec.length, VAR_DISK_AT + (off_t)rec.offset) != (ssize_t)rec.length ||
+			    pread(fd, back, rec.length, VAR_DISK_AT + (off_t)rec.offset) != (ssize_t)rec.length ||
+			    memcmp(data, back, rec.length) != 0) {
+				printf("  the data volume: the data at %llu did not go in as it is (%s)\\n",
+				    (unsigned long long)rec.offset, strerror(errno));
+				goto out;
+			}
+			written += rec.length;
+		}
+	}
+	ok = 1;
+	printf("  the data volume: made, %llu MB of zeros and %llu KB of data written and read back\\n",
+	    (unsigned long long)(zeroed >> 20), (unsigned long long)(written >> 10));
+out:
+	if (fd >= 0) {
+		close(fd);
+	}
+	(void)sysctlbyname("kern.redwood.var_busy", NULL, NULL, &zero, sizeof(zero));
+	if (pack >= 0) {
+		close(pack);
+	}
+	return ok && var_disk_formatted();
+}
+
+static int
+mount_var_disk(void)
+{
+	const char *wanted = boot_arg("var_disk");
+	struct hfs_args args = {
+		.fspec = "/dev/ufs_userdata", .uid = 0xffffffffu, .gid = 0xffffffffu, .mask = 0xffff,
+		.encoding = 0, .timezone = { -1, 0 }, .flags = 0,
+	};
+	struct stat var_st;
+
+	if (wanted == NULL || strcmp(wanted, "1") != 0) {
+		return 0;
+	}
+	/* doha: userdata from 12 GiB on, the kernel's /dev/ufs_var; the volume made there the first time */
+	if (stat("/dev/ufs_var", &var_st) == 0) {
+		args.fspec = "/dev/ufs_var";
+		if (!var_disk_formatted() && !var_disk_format()) {
+			printf("  the data volume could not be made: a memory filesystem instead\\n");
+			return 0;
+		}
+	}
+	if (mount("hfs", "/private/var", 0, &args) != 0) {"""
+m_old = """	printf("  /private/var is the HFS+ volume %s on the flash (var_disk=1)\\n", args.fspec);
+	return 1;"""
+m_new = """	printf("  /private/var is the HFS+ volume %s on the flash (var_disk=1)\\n", args.fspec);
+	var_on_disk = 1;
+	return 1;"""
+r_old = """	if (wanted == NULL || strcmp(wanted, "1") != 0) {
+		return;
+	}
+	printf("\\n-- the data volume of the last boot --\\n");"""
+r_new = """	if (wanted == NULL || strcmp(wanted, "1") != 0) {
+		return;
+	}
+	if (var_on_disk && open(VAR_DISK_MARK, O_RDONLY, 0) >= 0) {
+		printf("\\n-- the data volume is on the flash, as the last boot left it: nothing to unpack --\\n");
+		return;
+	}
+	printf("\\n-- the data volume of the last boot --\\n");"""
+w_old = """	if (pid < 0 || wait4(pid, &status, 0, NULL) != pid || !WIFEXITED(status)) {
+		printf("  var_store did not run\\n");
+	}
+}"""
+w_new = """	if (pid < 0 || wait4(pid, &status, 0, NULL) != pid || !WIFEXITED(status)) {
+		printf("  var_store did not run\\n");
+	} else if (var_on_disk) {
+		/* doha: unpacked into the volume on the flash once; from now on it is the volume itself that keeps */
+		int fd = open(VAR_DISK_MARK, O_WRONLY | O_CREAT, 0644);
+
+		if (fd >= 0) {
+			close(fd);
+		}
+		printf("  the data volume of the last boot is on the flash now (var_store exit %d)\\n", WEXITSTATUS(status));
+	}
+}"""
+if 'var_disk_format' in i:
+    print('userland/src/init.c: the data volume on the flash already')
+elif i.count(f_old) != 1 or i.count(m_old) != 1 or i.count(r_old) != 1 or i.count(w_old) != 1:
+    raise SystemExit('userland/src/init.c: mount_var_disk / restore_var are not where expected')
+else:
+    ij.open('w', encoding='utf-8', newline='').write(i.replace(f_old, f_new).replace(m_old, m_new).replace(r_old, r_new).replace(w_old, w_new))
+    print('userland/src/init.c: /private/var on the flash from 12 GiB of userdata (doha)')
+vs = tree / 'userland/src/var_store.c'
+v = vs.open(encoding='utf-8', newline='').read()
+v_old = """			int ok = save_once();
+"""
+v_new = """			/* doha: with /private/var on the flash (init's marker) there is nothing to keep: the volume keeps itself */
+			int ok = open("/private/var/.doha-var-restored", O_RDONLY, 0) >= 0 ? 1 : save_once();
+"""
+if '.doha-var-restored' in v:
+    print('userland/src/var_store.c: no saves with /private/var on the flash already')
+elif v.count(v_old) != 1:
+    raise SystemExit('userland/src/var_store.c: the watcher save is not where expected')
+else:
+    vs.open('w', encoding='utf-8', newline='').write(v.replace(v_old, v_new))
+    print('userland/src/var_store.c: no saves with /private/var on the flash (doha)')
